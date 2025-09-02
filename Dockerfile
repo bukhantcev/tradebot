@@ -1,22 +1,18 @@
-# (relative path: Dockerfile)
 FROM python:3.12-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
-# Базовые пакеты + git
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git ca-certificates tzdata bash \
+    git ca-certificates tzdata bash file \
     && rm -rf /var/lib/apt/lists/*
 
-# Рабочая папка под код
 WORKDIR /app
 
-# Скрипт запуска
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+# Срежем CRLF, проверим тип, дадим права
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh && file /entrypoint.sh
 
-# Таймзона по умолчанию (можно переопределить .env)
 ENV TZ=Europe/Moscow
 
-ENTRYPOINT ["/entrypoint.sh"]
+# ВАЖНО: используем bash как интерпретатор, а не полагаемся на shebang
+ENTRYPOINT ["bash","/entrypoint.sh"]
