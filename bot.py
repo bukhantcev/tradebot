@@ -43,7 +43,7 @@ PID_FILE = os.path.join(WORK_DIR, "strategy.pid")
 
 OUT_LOG_FILE = os.path.join(WORK_DIR, os.getenv("OUT_LOG_FILE", "strategy.out.log"))
 
-TG_TOKEN = os.getenv("TG_TOKEN", "").strip()
+TG_TOKEN = (os.getenv("TG_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()  # optional allowlist single chat
 
 logger = logging.getLogger("tg-bot")
