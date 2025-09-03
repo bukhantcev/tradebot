@@ -1,23 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-LIVE bot for Bybit TESTNET executing the same bar-based counter-trend Bollinger strategy
-from the backtester, with ATR-based risk management and bar-open execution.
+LIVE bot for Bybit TESTNET with ADAPTIVE multi-strategy controller.
 
-Key points:
-- Uses Bybit v5 TESTNET REST API for order execution (category=linear)
-- Stores and maintains kline history in a local SQLite database (sqlite3)
-- Computes indicators from stored candles; acts strictly on bar boundaries
-- Entries on next bar open after a signal; exits via TP (middle band) or bar-open stops
-- Trailing stop updates each bar by ATR * TRAIL_MULT; enforcement at next bar open
-- Position sizing: risk % of equity (wallet balance) / initial stop distance
-- Logging mirrors the backtester (console + file, optional JSON); .env-driven
+What it does (short):
+- Keeps local SQLite with klines for multiple intervals.
+- On each new bar of the *execution* timeframe, fetches/updates data for needed TFs.
+- Determines market regime on a higher TF: trend_up / trend_down / range / breakout.
+- Picks a strategy:
+    • trend_ma_pullback (trend-following pullback to EMA with ATR filter)
+    • range_bb (counter-trend from Bollinger bands)
+    • breakout (simple HH/LL breakout with ATR/volatility gate)
+- May switch execution timeframe depending on regime (e.g. range -> faster TF).
+- Uses ATR-based initial stop and trailing stop; TP depends on strategy.
+- Places market orders on bar open (next bar after signal).
 
 Environment (.env) variables (defaults in parentheses):
     # Market & timeframe
     SYMBOL=BTCUSDT
-    INTERVAL_MIN=60                # 1,3,5,15,60,240,1440 ... — Bybit v5 minutes
-    DAYS=30                        # how much history to keep/fetch for indicators
-    CATEGORY=linear                # Bybit v5 category
+    CATEGORY=linear
+    INTERVAL_MIN=60                      # default execution TF if ADAPTIVE=0
+    MULTI_INTERVALS=15,60,240            # used when ADAPTIVE=1 (min, base, higher)
+    DAYS=45
+    ADAPTIVE=1                           # 1 enables adaptive controller
 
     # Account / API (TESTNET)
     API_KEY=<your_key>
@@ -26,26 +30,35 @@ Environment (.env) variables (defaults in parentheses):
     RECV_WINDOW=5000
 
     # Risk & fees
-    START_BALANCE=1000             # used as fallback if wallet call fails
-    RISK_PCT=0.05                  # 5% of equity per trade
-    COMMISSION_PCT=0.0             # additional commission modeling (optional)
-    SLIPPAGE_USDT=0.0              # slippage cushion per side (applied to entry/exit)
+    START_BALANCE=1000
+    RISK_PCT=0.05
+    COMMISSION_PCT=0.0
+    SLIPPAGE_USDT=0.0
 
-    # Strategy params (identical to backtester defaults)
-    BB_WINDOW=10
-    BB_STD=1.5
-    ATR_WINDOW=10
+    # Strategy params
+    # Bollinger (range)
+    BB_WINDOW=20
+    BB_STD=2.0
+    # ATR & EMA (shared)
+    ATR_WINDOW=14
+    EMA_FAST=20
+    EMA_SLOW=50
     STOP_MULT=2.0
-    TRAIL_MULT=1.5
+    TRAIL_MULT=1.0
+
+    # Adaptive detector thresholds
+    SLOPE_THR=0.0                        # ema50 slope thr in price units per bar (0 = auto via ATR%)
+    ATR_PCT_THR=0.006                    # ATR/price to decide range vs trend (~0.6%)
+    BB_BW_THR=0.02                       # Bollinger bandwidth (% of price) for range
 
     # Storage
     DB_PATH=candles.db
 
     # Looping
-    POLL_SECONDS=5                 # check for new bars / progress every N seconds
+    POLL_SECONDS=5
 
     # Logging
-    LOG_LEVEL=INFO                 # DEBUG|INFO|WARNING|ERROR
+    LOG_LEVEL=INFO
     LOG_FILE=tradebot.log
     LOG_JSON=0
     LOG_BAR_DETAILS=0
@@ -64,7 +77,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import datetime as dt
 from dataclasses import dataclass
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 import threading
 import urllib.parse
 
@@ -74,7 +87,7 @@ import requests
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------
-# Command input loop (CLI)
+# CLI (stdin commands)
 # ---------------------------------------------------------------------
 
 def input_loop(client):
@@ -164,7 +177,7 @@ def equality_fmt(x: float) -> str:
     return f"{x:.2f} USDT"
 
 # ---------------------------------------------------------------------
-# SQLite storage (candles)
+# SQLite storage (multi-interval candles)
 # ---------------------------------------------------------------------
 
 class CandleStore:
@@ -196,6 +209,8 @@ class CandleStore:
             con.execute("CREATE INDEX IF NOT EXISTS idx_candles_ts ON candles(symbol, interval_min, ts)")
 
     def upsert_klines(self, symbol: str, interval_min: int, rows: List[Dict]):
+        if not rows:
+            return
         with self._conn() as con:
             con.executemany(
                 """
@@ -240,23 +255,37 @@ class CandleStore:
         return df[["ts","datetime","open","high","low","close","volume","turnover"]]
 
 # ---------------------------------------------------------------------
-# Indicators (same as backtester)
+# Indicators
 # ---------------------------------------------------------------------
 
-def bollinger_bands(close: pd.Series, window: int = 10, num_std: float = 1.5):
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+def bollinger_bands(close: pd.Series, window: int = 20, num_std: float = 2.0):
     ma = close.rolling(window=window, min_periods=window).mean()
     std = close.rolling(window=window, min_periods=window).std(ddof=0)
     upper = ma + num_std * std
     lower = ma - num_std * std
     return ma, upper, lower
 
-def atr(df: pd.DataFrame, window: int = 10) -> pd.Series:
+def atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
     high = df["high"].astype(float)
     low = df["low"].astype(float)
     close = df["close"].astype(float)
     prev_close = close.shift(1)
     tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     return tr.rolling(window=window, min_periods=window).mean()
+
+def add_indicators(df: pd.DataFrame, bb_window: int, bb_std: float, atr_window: int, ema_fast: int, ema_slow: int) -> pd.DataFrame:
+    out = df.copy()
+    out["ema_fast"] = ema(out["close"], ema_fast)
+    out["ema_slow"] = ema(out["close"], ema_slow)
+    ma, up, lo = bollinger_bands(out["close"], bb_window, bb_std)
+    out["bb_ma"], out["bb_upper"], out["bb_lower"] = ma, up, lo
+    out["atr"] = atr(out, atr_window)
+    # bandwidth in % of price
+    out["bb_bw_pct"] = (out["bb_upper"] - out["bb_lower"]) / out["close"]
+    return out
 
 # ---------------------------------------------------------------------
 # Bybit v5 REST client (TESTNET)
@@ -481,20 +510,21 @@ class BybitClient:
         return "\n".join(lines)
 
 # ---------------------------------------------------------------------
-# Strategy state / trade record
+# Strategy state
 # ---------------------------------------------------------------------
 
 @dataclass
-class Trade:
-    entry_time: pd.Timestamp
-    exit_time: Optional[pd.Timestamp]
-    side: str            # 'long' or 'short'
+class PositionState:
+    side: str              # "long" / "short"
     entry: float
-    exit: Optional[float]
-    size: float          # asset units
-    strategy: str = "bb_countertrend"
-    regime: str = "single"
-    tf: str = ""
+    size: float
+    stop: float
+    trail: float
+    tp: Optional[float]
+    strategy: str
+    regime: str
+    tf: str
+    entry_bar_ts: int
 
 # ---------------------------------------------------------------------
 # Utility: rounding to exchange step
@@ -510,6 +540,114 @@ def round_qty(qty: float, qty_step: float, min_qty: float) -> float:
     return float(f"{rounded:.12f}")
 
 # ---------------------------------------------------------------------
+# Utility
+# ---------------------------------------------------------------------
+
+def parse_intervals_csv(s: str) -> List[int]:
+    try:
+        arr = [int(x.strip()) for x in s.split(",") if x.strip()]
+        arr = sorted(set(arr))
+        return arr
+    except Exception:
+        return [15, 60, 240]
+
+# ---------------------------------------------------------------------
+# Adaptive controller
+# ---------------------------------------------------------------------
+
+def detect_regime(higher: pd.DataFrame, atr_pct_thr: float, bb_bw_thr: float, slope_thr: float) -> str:
+    """Return one of: trend_up, trend_down, range, breakout."""
+    if len(higher) < 60:
+        return "range"
+    df = higher.copy()
+    price = float(df["close"].iloc[-2])
+    ema_slow = float(df["ema_slow"].iloc[-2])
+    ema_slow_prev = float(df["ema_slow"].iloc[-3])
+    slope = ema_slow - ema_slow_prev
+    atr_val = float(df["atr"].iloc[-2])
+    atr_pct = atr_val / price if price > 0 else 0.0
+    bb_bw = float(df["bb_bw_pct"].iloc[-2])
+
+    # auto slope threshold if not provided
+    if slope_thr <= 0:
+        slope_thr = atr_pct * price * 0.10  # 10% of ATR as slope gate (heuristic)
+
+    if bb_bw < bb_bw_thr and atr_pct < atr_pct_thr:
+        return "range"
+    if slope > slope_thr and price > ema_slow:
+        return "trend_up"
+    if slope < -slope_thr and price < ema_slow:
+        return "trend_down"
+
+    # else, potential breakout if bandwidth expanding and price outside bands
+    up = float(df["bb_upper"].iloc[-2]); lo = float(df["bb_lower"].iloc[-2])
+    prev_bw = float(df["bb_bw_pct"].iloc[-3]) if not math.isnan(df["bb_bw_pct"].iloc[-3]) else bb_bw
+    if bb_bw > prev_bw * 1.2 and (price > up or price < lo):
+        return "breakout"
+    return "range"
+
+def choose_exec_tf(regime: str, intervals: List[int]) -> int:
+    intervals = sorted(intervals)
+    if len(intervals) == 0:
+        return 60
+    if regime == "range":
+        return intervals[0]                 # fastest TF
+    elif regime in ("trend_up", "trend_down"):
+        return intervals[min(1, len(intervals)-1)]  # base TF
+    else:
+        return intervals[min(1, len(intervals)-1)]
+
+def generate_signal(base_df: pd.DataFrame, regime: str, params: Dict) -> Tuple[Optional[str], str, Optional[float]]:
+    """
+    Returns (side, strategy_name, tp_level)
+    side in {"long","short", None}
+    """
+    last = base_df.iloc[-2]
+    open_bar = base_df.iloc[-1]  # current forming bar (exec @ open)
+    atr_now = float(last["atr"]) if not math.isnan(last["atr"]) else 0.0
+    if atr_now <= 0:
+        return None, "", None
+
+    if regime in ("trend_up", "trend_down"):
+        # Trend pullback: enter in direction of ema_slow slope when price pulls to ema_fast ± k*ATR
+        k = params.get("PULL_K_ATR", 0.5)
+        ema_fast = float(last["ema_fast"]); ema_slow = float(last["ema_slow"])
+        slope = ema_slow - float(base_df["ema_slow"].iloc[-3])
+        if regime == "trend_up" and slope >= 0:
+            trigger = ema_fast - k * atr_now
+            if float(last["close"]) <= trigger:
+                return "long", "trend_ma_pullback", float(last["ema_fast"])
+        if regime == "trend_down" and slope <= 0:
+            trigger = ema_fast + k * atr_now
+            if float(last["close"]) >= trigger:
+                return "short", "trend_ma_pullback", float(last["ema_fast"])
+        return None, "", None
+
+    if regime == "range":
+        # Counter-trend Bollinger: touch outer band -> revert to mid
+        lower = float(last["bb_lower"]); upper = float(last["bb_upper"]); mid = float(last["bb_ma"])
+        if not any(map(math.isnan, [lower, upper, mid])):
+            if float(last["close"]) <= lower:
+                return "long", "range_bb", mid
+            if float(last["close"]) >= upper:
+                return "short", "range_bb", mid
+        return None, "", None
+
+    if regime == "breakout":
+        # Simple HH/LL breakout over N bars with ATR gate
+        N = params.get("BRK_N", 20)
+        recent = base_df.iloc[-(N+1):-1]
+        hi = float(recent["high"].max()); lo = float(recent["low"].min())
+        c = float(last["close"])
+        if c > hi and atr_now / c > 0.004:
+            return "long", "breakout", None
+        if c < lo and atr_now / c > 0.004:
+            return "short", "breakout", None
+        return None, "", None
+
+    return None, "", None
+
+# ---------------------------------------------------------------------
 # Core bot loop
 # ---------------------------------------------------------------------
 
@@ -519,9 +657,11 @@ def run_bot():
 
     # ENV
     symbol = os.getenv("SYMBOL", "BTCUSDT")
-    interval_min = int(os.getenv("INTERVAL_MIN", "60"))
-    days = int(os.getenv("DAYS", "30"))
     category = os.getenv("CATEGORY", "linear")
+    adaptive = os.getenv("ADAPTIVE", "1").strip().lower() in ("1","true","yes","y")
+    multi_intervals = parse_intervals_csv(os.getenv("MULTI_INTERVALS", "15,60,240"))
+    interval_min = int(os.getenv("INTERVAL_MIN", "60"))  # used if adaptive==False
+    days = int(os.getenv("DAYS", "45"))
 
     api_key = os.getenv("API_KEY", "").strip()
     api_secret = os.getenv("API_SECRET", "").strip()
@@ -533,11 +673,17 @@ def run_bot():
     commission_pct = float(os.getenv("COMMISSION_PCT", "0.0"))
     slippage_usdt = float(os.getenv("SLIPPAGE_USDT", "0.0"))
 
-    bb_window = int(os.getenv("BB_WINDOW", "10"))
-    bb_std = float(os.getenv("BB_STD", "1.5"))
-    atr_window = int(os.getenv("ATR_WINDOW", "10"))
+    bb_window = int(os.getenv("BB_WINDOW", "20"))
+    bb_std = float(os.getenv("BB_STD", "2.0"))
+    atr_window = int(os.getenv("ATR_WINDOW", "14"))
+    ema_fast_n = int(os.getenv("EMA_FAST", "20"))
+    ema_slow_n = int(os.getenv("EMA_SLOW", "50"))
     stop_mult = float(os.getenv("STOP_MULT", "2.0"))
-    trail_mult = float(os.getenv("TRAIL_MULT", "1.5"))
+    trail_mult = float(os.getenv("TRAIL_MULT", "1.0"))
+
+    slope_thr = float(os.getenv("SLOPE_THR", "0.0"))
+    atr_pct_thr = float(os.getenv("ATR_PCT_THR", "0.006"))
+    bb_bw_thr = float(os.getenv("BB_BW_THR", "0.02"))
 
     poll_seconds = int(os.getenv("POLL_SECONDS", "5"))
     db_path = os.getenv("DB_PATH", "candles.db")
@@ -546,27 +692,24 @@ def run_bot():
         log.error("[SETUP] Missing API_KEY or API_SECRET in environment.")
         raise SystemExit(1)
 
-    log.info(
-        f"[SETUP] LIVE TESTNET | symbol={symbol} tf={interval_min}m days={days} risk={risk_pct} "
-        f"bb={bb_window},{bb_std} atr={atr_window} stop={stop_mult} trail={trail_mult}"
-    )
-    print(f"[MAIN] SETUP OK | symbol={symbol} tf={interval_min}m days={days} risk={risk_pct}", flush=True)
+    log.info(f"[SETUP] symbol={symbol} adaptive={adaptive} tfs={','.join(map(str,multi_intervals))} days={days} risk={risk_pct} "
+             f"stopATRx={stop_mult} trailATRx={trail_mult}")
+    print(f"[MAIN] SETUP OK | symbol={symbol} adaptive={adaptive} tfs={multi_intervals} days={days} risk={risk_pct}", flush=True)
 
     store = CandleStore(db_path)
     client = BybitClient(api_key, api_secret, base_url, recv_window)
 
-    # --- One-time API key self-check (more verbose) ---
-    log.info(f"[CHECK] Using BASE_URL={base_url} | key={api_key[:4]}…{api_key[-4:] if len(api_key)>8 else ''}")
+    # One-time auth check
     try:
         test_eq = client.wallet_balance("USDT")
-        log.info(f"[CHECK] API auth OK. Wallet equity (auto acct type): {test_eq:.2f} USDT")
+        log.info(f"[CHECK] API auth OK. Wallet equity: {test_eq:.2f} USDT")
         print(f"[MAIN] API auth OK | equity={test_eq:.2f} USDT", flush=True)
     except Exception as e:
         diag = client.diagnose_auth(symbol, category)
         log.error("[CHECK] API auth FAILED. Details:\n" + diag)
-        print("[MAIN] API auth FAILED (see logs for details)", flush=True)
+        print("[MAIN] API auth FAILED (see logs)", flush=True)
 
-    # CLI always enabled via ENABLE_CLI toggle
+    # CLI thread
     ENABLE_CLI = True
     if ENABLE_CLI:
         try:
@@ -574,7 +717,7 @@ def run_bot():
         except Exception:
             pass
 
-    # Instruments info (qty step)
+    # Instrument info
     ins = client.get_instrument(symbol, category)
     lot = ins.get("lotSizeFilter", {})
     qty_step = float(lot.get("qtyStep", 0.001))
@@ -582,172 +725,185 @@ def run_bot():
     log.info(f"[INFO] qty_step={qty_step} min_qty={min_qty}")
     print(f"[MAIN] Instrument loaded | qty_step={qty_step} min_qty={min_qty}", flush=True)
 
-    # Bootstrap history into DB
-    end = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
-    start = end - dt.timedelta(days=days + 1)
-    log.info("[DATA] Bootstrapping history from Bybit -> SQLite …")
-    rows = client.get_klines(symbol, interval_min, to_ms(start), to_ms(end), category)
-    if rows:
-        store.upsert_klines(symbol, interval_min, rows)
-        log.info(f"[DATA] History upserted: {len(rows)} bars")
-        print(f"[MAIN] History loaded | bars={len(rows)}", flush=True)
-    else:
-        log.warning("[DATA] No initial klines loaded from API")
+    # Bootstrap history for all required TFs
+    def bootstrap_tf(tf_min: int):
+        end = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
+        start = end - dt.timedelta(days=days + 1)
+        rows = client.get_klines(symbol, tf_min, to_ms(start), to_ms(end), category)
+        if rows:
+            store.upsert_klines(symbol, tf_min, rows)
+            log.info(f"[DATA] History upserted: tf={tf_min} bars={len(rows)}")
 
-    # Position/strategy runtime state
-    position = None  # dict: side, entry, size, stop, trail, tp, entry_bar_ts
-    last_bar_ts = None
+    if adaptive:
+        for tf in multi_intervals:
+            bootstrap_tf(tf)
+    else:
+        bootstrap_tf(interval_min)
+
+    position: Optional[PositionState] = None
+    last_open_ts_by_tf: Dict[int, int] = {}
+
+    # Strategy params bag
+    strat_params = {"PULL_K_ATR": 0.5, "BRK_N": 20}
+
+    log.info(f"[ADAPT] Start | tfs={multi_intervals} risk={risk_pct} stopATRx={stop_mult} trailATRx={trail_mult}")
 
     while True:
         try:
-            # 1) Pull latest klines segment (only recent window) and upsert
             now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
-            fetch_start = to_ms(now - dt.timedelta(days=3))  # small rolling window
-            fetch_end = to_ms(now)
-            new_rows = client.get_klines(symbol, interval_min, fetch_start, fetch_end, category)
-            if new_rows:
-                store.upsert_klines(symbol, interval_min, new_rows)
 
-            # 2) Load frame for indicators (full DAYS window)
-            frame_since = to_ms(now - dt.timedelta(days=days))
-            df = store.load_frame(symbol, interval_min, frame_since)
-            if len(df) < max(bb_window, atr_window) + 3:
+            # Update recent candles for all needed TFs
+            tfs_needed = multi_intervals if adaptive else [interval_min]
+            for tf in tfs_needed:
+                fetch_start = to_ms(now - dt.timedelta(days=3))
+                fetch_end = to_ms(now)
+                new_rows = client.get_klines(symbol, tf, fetch_start, fetch_end, category)
+                if new_rows:
+                    store.upsert_klines(symbol, tf, new_rows)
+
+            # Build frames with indicators
+            frames: Dict[int, pd.DataFrame] = {}
+            for tf in tfs_needed:
+                frame_since = to_ms(now - dt.timedelta(days=days))
+                df = store.load_frame(symbol, tf, frame_since)
+                if len(df) == 0:
+                    continue
+                df = add_indicators(df, bb_window, bb_std, atr_window, ema_fast_n, ema_slow_n)
+                frames[tf] = df
+
+            if not frames:
                 time.sleep(poll_seconds); continue
 
-            # 3) Build indicators
-            df = df.copy().reset_index(drop=True)
-            for c in ("open","high","low","close"):
-                df[c] = df[c].astype(float)
-            ma, upper, lower = bollinger_bands(df["close"], bb_window, bb_std)
-            atr_s = atr(df, atr_window)
-            df["bb_ma"] = ma; df["bb_upper"] = upper; df["bb_lower"] = lower; df["atr"] = atr_s
+            # Decide regime & execution TF
+            if adaptive:
+                higher_tf = max(tfs_needed)
+                if higher_tf not in frames or len(frames[higher_tf]) < max(atr_window, ema_slow_n) + 3:
+                    time.sleep(poll_seconds); continue
+                regime = detect_regime(frames[higher_tf], atr_pct_thr, bb_bw_thr, slope_thr)
+                exec_tf = choose_exec_tf(regime, tfs_needed)
+            else:
+                regime = "range"  # legacy default makes BB-driven
+                exec_tf = interval_min
 
-            # 4) Detect bar change
-            last_closed_idx = len(df) - 2  # last fully closed bar index
-            last_closed = df.iloc[last_closed_idx]
-            this_open_bar = df.iloc[-1]    # current forming bar
+            base_df = frames.get(exec_tf)
+            if base_df is None or len(base_df) < max(atr_window, ema_slow_n, bb_window) + 3:
+                time.sleep(poll_seconds); continue
 
-            if last_bar_ts is None:
-                last_bar_ts = int(this_open_bar["ts"])  # initialize on first loop
+            # Bar change detection on execution TF
+            open_ts = int(base_df.iloc[-1]["ts"])
+            if last_open_ts_by_tf.get(exec_tf) is None:
+                last_open_ts_by_tf[exec_tf] = open_ts
 
-            # If a NEW bar just started (open bar ts changed), then we execute the actions
-            if int(this_open_bar["ts"]) != last_bar_ts:
-                # A new bar opened at this_open_bar.open; we execute actions based on last_closed signal/state
-                new_bar_open = float(this_open_bar["open"])  # execution price baseline
-                print(f"[MAIN] New {interval_min}m bar: {this_open_bar['datetime']} open={new_bar_open:.2f}", flush=True)
+            if open_ts != last_open_ts_by_tf[exec_tf]:
+                # New bar opened on execution TF
+                new_open = float(base_df.iloc[-1]["open"])
+                print(f"[MAIN] New {exec_tf}m bar: {base_df.iloc[-1]['datetime']} open={new_open:.2f} regime={regime}", flush=True)
 
-                # Fetch equity (wallet balance) to size trades
+                # equity for sizing
                 try:
                     equity = float(client.wallet_balance("USDT"))
                 except Exception as e:
-                    log.warning(f"[API] wallet_balance failed (check TESTNET keys/base URL, IP whitelist, permissions). Fallback START_BALANCE. Err={e}")
+                    log.warning(f"[API] wallet_balance failed, fallback START_BALANCE. Err={e}")
                     equity = start_balance_fallback
 
-                # Update trailing stop and check exits at bar open
+                # Exits first (stop/trail/TP)
                 if position is not None:
+                    last_closed = base_df.iloc[-2]
                     atr_now = float(last_closed["atr"]) if not math.isnan(last_closed["atr"]) else None
                     if atr_now and atr_now > 0:
-                        if position["side"] == "long":
-                            new_trail = new_bar_open - trail_mult * atr_now
-                            position["trail"] = max(position["trail"], new_trail)
-                            stop_level = max(position["stop"], position["trail"])
-                            if new_bar_open <= stop_level:
-                                qty = round_qty(position["size"], qty_step, min_qty)
+                        if position.side == "long":
+                            new_trail = new_open - trail_mult * atr_now
+                            position.trail = max(position.trail, new_trail)
+                            stop_level = max(position.stop, position.trail)
+                            if new_open <= stop_level:
+                                qty = round_qty(position.size, qty_step, min_qty)
                                 if qty > 0:
                                     client.place_order(category=category, symbol=symbol, side="Sell", qty=str(qty), reduceOnly=True)
-                                log.info(f"[EXIT] long STOP t={this_open_bar['datetime']} entry={position['entry']:.2f} open={new_bar_open:.2f} stop={stop_level:.2f}")
-                                print(f"[MAIN] EXIT long STOP | t={this_open_bar['datetime']} entry={position['entry']:.2f} open={new_bar_open:.2f} stop={stop_level:.2f}", flush=True)
+                                log.info(f"[ADAPT][EXIT] long STOP t={base_df.iloc[-1]['datetime']} regime={position.regime} strat={position.strategy} tf={position.tf} entry={position.entry:.2f} exit={new_open:.2f}")
                                 position = None
                         else:
-                            new_trail = new_bar_open + trail_mult * atr_now
-                            position["trail"] = min(position["trail"], new_trail)
-                            stop_level = min(position["stop"], position["trail"])
-                            if new_bar_open >= stop_level:
-                                qty = round_qty(position["size"], qty_step, min_qty)
+                            new_trail = new_open + trail_mult * atr_now
+                            position.trail = min(position.trail, new_trail)
+                            stop_level = min(position.stop, position.trail)
+                            if new_open >= stop_level:
+                                qty = round_qty(position.size, qty_step, min_qty)
                                 if qty > 0:
                                     client.place_order(category=category, symbol=symbol, side="Buy", qty=str(qty), reduceOnly=True)
-                                log.info(f"[EXIT] short STOP t={this_open_bar['datetime']} entry={position['entry']:.2f} open={new_bar_open:.2f} stop={stop_level:.2f}")
-                                print(f"[MAIN] EXIT short STOP | t={this_open_bar['datetime']} entry={position['entry']:.2f} open={new_bar_open:.2f} stop={stop_level:.2f}", flush=True)
+                                log.info(f"[ADAPT][EXIT] short STOP t={base_df.iloc[-1]['datetime']} regime={position.regime} strat={position.strategy} tf={position.tf} entry={position.entry:.2f} exit={new_open:.2f}")
                                 position = None
 
-                # If still in position, check TP at middle band (basis) from signal bar
-                if position is not None:
-                    tp = float(position.get("tp", float("nan")))
-                    if not math.isnan(tp):
-                        if position["side"] == "long" and new_bar_open >= tp:
-                            qty = round_qty(position["size"], qty_step, min_qty)
-                            if qty > 0:
-                                client.place_order(category=category, symbol=symbol, side="Sell", qty=str(qty), reduceOnly=True)
-                            log.info(f"[EXIT] long TP t={this_open_bar['datetime']} entry={position['entry']:.2f} tp={tp:.2f} open={new_bar_open:.2f}")
-                            print(f"[MAIN] EXIT long TP | t={this_open_bar['datetime']} entry={position['entry']:.2f} tp={tp:.2f} open={new_bar_open:.2f}", flush=True)
-                            position = None
-                        elif position["side"] == "short" and new_bar_open <= tp:
-                            qty = round_qty(position["size"], qty_step, min_qty)
-                            if qty > 0:
-                                client.place_order(category=category, symbol=symbol, side="Buy", qty=str(qty), reduceOnly=True)
-                            log.info(f"[EXIT] short TP t={this_open_bar['datetime']} entry={position['entry']:.2f} tp={tp:.2f} open={new_bar_open:.2f}")
-                            print(f"[MAIN] EXIT short TP | t={this_open_bar['datetime']} entry={position['entry']:.2f} tp={tp:.2f} open={new_bar_open:.2f}", flush=True)
-                            position = None
+                # TP at target (if defined)
+                if position is not None and position.tp is not None:
+                    if position.side == "long" and new_open >= position.tp:
+                        qty = round_qty(position.size, qty_step, min_qty)
+                        if qty > 0:
+                            client.place_order(category=category, symbol=symbol, side="Sell", qty=str(qty), reduceOnly=True)
+                        log.info(f"[ADAPT][EXIT] long TP t={base_df.iloc[-1]['datetime']} strat={position.strategy} tf={position.tf} tp={position.tp:.2f} open={new_open:.2f}")
+                        position = None
+                    elif position.side == "short" and new_open <= position.tp:
+                        qty = round_qty(position.size, qty_step, min_qty)
+                        if qty > 0:
+                            client.place_order(category=category, symbol=symbol, side="Buy", qty=str(qty), reduceOnly=True)
+                        log.info(f"[ADAPT][EXIT] short TP t={base_df.iloc[-1]['datetime']} strat={position.strategy} tf={position.tf} tp={position.tp:.2f} open={new_open:.2f}")
+                        position = None
 
-                # If flat, evaluate entry signals from last_closed and execute at new bar open
+                # Entries
                 if position is None:
-                    lower_band = float(last_closed["bb_lower"])
-                    upper_band = float(last_closed["bb_upper"])
-                    mid = float(last_closed["bb_ma"])
+                    side, strategy_name, tp_level = generate_signal(base_df, regime, strat_params)
+                    last_closed = base_df.iloc[-2]
                     atr_now = float(last_closed["atr"]) if not math.isnan(last_closed["atr"]) else 0.0
-
-                    if atr_now > 0 and not any(map(math.isnan, [lower_band, upper_band, mid])):
-                        if last_closed["close"] <= lower_band:
-                            stop_dist = stop_mult * atr_now
-                            size = (equity * risk_pct) / stop_dist if stop_dist > 0 else 0.0
-                            entry_price = new_bar_open + slippage_usdt
-                            qty = round_qty(size, qty_step, min_qty)
-                            if qty > 0:
+                    if side and atr_now > 0:
+                        stop_dist = stop_mult * atr_now
+                        size_usdt = (equity * risk_pct)
+                        size = size_usdt / stop_dist if stop_dist > 0 else 0.0
+                        entry_price = new_open + (slippage_usdt if side == "long" else -slippage_usdt)
+                        qty = round_qty(size, qty_step, min_qty)
+                        if qty > 0:
+                            if side == "long":
                                 client.place_order(category=category, symbol=symbol, side="Buy", qty=str(qty), reduceOnly=False)
-                                position = {
-                                    "side": "long",
-                                    "entry": entry_price * (1 + commission_pct),
-                                    "size": qty,
-                                    "stop": (entry_price * (1 + commission_pct)) - stop_dist,
-                                    "trail": (entry_price * (1 + commission_pct)) - stop_dist,
-                                    "tp": mid,
-                                    "entry_bar_ts": int(this_open_bar["ts"]),
-                                }
-                                log.info(f"[ENTRY] long t={this_open_bar['datetime']} reason=bb_lower_touch entry={entry_price:.2f} size={qty:.6f} stop_dist={stop_dist:.2f} eq={equality_fmt(equity)}")
-                                print(f"[MAIN] ENTRY long | t={this_open_bar['datetime']} entry={entry_price:.2f} qty={qty:.6f} stop_dist={stop_dist:.2f}", flush=True)
-
-                        elif last_closed["close"] >= upper_band:
-                            stop_dist = stop_mult * atr_now
-                            size = (equity * risk_pct) / stop_dist if stop_dist > 0 else 0.0
-                            entry_price = new_bar_open - slippage_usdt
-                            qty = round_qty(size, qty_step, min_qty)
-                            if qty > 0:
+                                entry = entry_price * (1 + commission_pct)
+                                position = PositionState(
+                                    side="long",
+                                    entry=entry,
+                                    size=qty,
+                                    stop=entry - stop_dist,
+                                    trail=entry - stop_dist,
+                                    tp=tp_level,
+                                    strategy=strategy_name,
+                                    regime=regime,
+                                    tf=str(exec_tf),
+                                    entry_bar_ts=open_ts
+                                )
+                            else:
                                 client.place_order(category=category, symbol=symbol, side="Sell", qty=str(qty), reduceOnly=False)
-                                position = {
-                                    "side": "short",
-                                    "entry": entry_price * (1 - commission_pct),
-                                    "size": qty,
-                                    "stop": (entry_price * (1 - commission_pct)) + stop_dist,
-                                    "trail": (entry_price * (1 - commission_pct)) + stop_dist,
-                                    "tp": mid,
-                                    "entry_bar_ts": int(this_open_bar["ts"]),
-                                }
-                                log.info(f"[ENTRY] short t={this_open_bar['datetime']} reason=bb_upper_touch entry={entry_price:.2f} size={qty:.6f} stop_dist={stop_dist:.2f} eq={equality_fmt(equity)}")
-                                print(f"[MAIN] ENTRY short | t={this_open_bar['datetime']} entry={entry_price:.2f} qty={qty:.6f} stop_dist={stop_dist:.2f}", flush=True)
+                                entry = entry_price * (1 - commission_pct)
+                                position = PositionState(
+                                    side="short",
+                                    entry=entry,
+                                    size=qty,
+                                    stop=entry + stop_dist,
+                                    trail=entry + stop_dist,
+                                    tp=tp_level,
+                                    strategy=strategy_name,
+                                    regime=regime,
+                                    tf=str(exec_tf),
+                                    entry_bar_ts=open_ts
+                                )
+                            log.info(f"[ADAPT][ENTRY] {position.side} t={base_df.iloc[-1]['datetime']} regime={regime} strat={strategy_name} tf={exec_tf} entry={entry_price:.2f} size={qty:.6f} stop_dist={stop_dist:.2f} eq={equality_fmt(equity)}")
+                            print(f"[MAIN] ENTRY {position.side.upper()} | tf={exec_tf} regime={regime} strat={strategy_name} entry={entry_price:.2f} qty={qty:.6f}", flush=True)
 
-                # mark current open bar as observed
-                last_bar_ts = int(this_open_bar["ts"])
+                # Mark bar observed
+                last_open_ts_by_tf[exec_tf] = open_ts
 
-            # Optional very verbose per-bar log
+            # Optional per-bar logs
             if LOG_BAR_DETAILS and not LOG_TRADES_ONLY:
-                log.debug(f"[BAR] t={last_closed['datetime']} close={last_closed['close']:.2f} "
-                          f"bb_ma={last_closed['bb_ma']:.2f} atr={last_closed['atr']:.2f} "
-                          f"pos={'None' if position is None else position['side']}")
+                for tf, df in frames.items():
+                    lc = df.iloc[-2]
+                    log.debug(f"[BAR] tf={tf} t={lc['datetime']} close={lc['close']:.2f} ema_fast={lc['ema_fast']:.2f} ema_slow={lc['ema_slow']:.2f} atr={lc['atr']:.2f}")
 
         except Exception as e:
             log.error(f"[LOOP] Error: {e}")
         time.sleep(poll_seconds)
-
 
 if __name__ == "__main__":
     run_bot()

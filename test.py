@@ -1,61 +1,92 @@
 # -*- coding: utf-8 -*-
 """
-Backtest for a counter-trend Bollinger Bands strategy with ATR-based risk management.
-Exchange: Bybit (public kline fetch). Env-configurable.
+Adaptive multi-strategy backtester for Bybit klines.
 
-Strategy (from user brief):
-- Bollinger Bands window = 10 (on hourly data), stdev = 1.5
-- Entries:
-    Long  when close <= lower band
-    Short when close >= upper band
-- Exits:
-    Take profit at middle band (basis)
-    Initial stop = 2.0 * ATR(10)
-    Trailing stop = 1.5 * ATR(10) in the trade direction (bars after entry)
-- Position sizing: risk % of current equity per trade (default 5%).
-    size = risk_amount / distance_to_initial_stop
-- Executions at next bar's open to avoid look-ahead.
-- Optional fees/slippage via ENV (default 0).
+What this script does
+---------------------
+• Analyzes market *trendiness*, *volatility* and *EMA slope* on a higher timeframe to detect a regime:
+    - TREND_UP / TREND_DOWN
+    - RANGE
+    - BREAKOUT (post-squeeze expansion)
+    - SCALP (low-trend, noisy/volatile conditions suited to quick mean-revert trades)
 
-Outputs:
-- Summary printed to stdout
-- Trade log CSV saved as ./best_family_trades.csv
+• Automatically CHOOSES a strategy per regime:
+    - trend_ma_pullback  → trades pullbacks in trend (EMA10/30 + RSI filter)
+    - range_bb           → counter-trend at Bollinger bands, TP at basis
+    - breakout_donchian  → classic Donchian breakout
+    - scalp_meanrevert   → short swings around EMA on a lower TF with tight ATR stops
 
-.env variables supported (with defaults shown):
-    SYMBOL=BTCUSDT
-    INTERVAL_MIN=60
-    DAYS=30
-    START_BALANCE=1000
-    RISK_PCT=0.05
-    COMMISSION_PCT=0.0
-    SLIPPAGE_USDT=0.0
-    DATA_CSV=
-    OPTIMIZE=1
-    BB_WINDOWS=10,14,20
-    BB_STDS=1.0,1.5,2.0
-    ATR_WINDOWS=10,14,20
-    STOP_MULTS=1.5,2.0,2.5
-    TRAIL_MULTS=1.0,1.5,2.0
-    RISK_PCTS=0.02,0.03,0.05
+• Dynamically SWITCHES timeframe used for signal generation, per regime, for example:
+    RANGE → use a *higher* TF (e.g., 1h base → 4h) to avoid chop,
+    SCALP → use a *lower* TF (e.g., 15m) to catch micro swings.
+  The mapping is configurable via ENV (see REGIME_TF_* variables below).
 
-    # Adaptive controller (regime switching)
-    ADAPTIVE=1
-    MULTI_INTERVALS=15,60,240
-    ADX_WINDOW=14
-    ADX_TREND=25
-    ADX_RANGE=18
-    REGIME_BB_WINDOW=20
-    REGIME_BB_STD=2.0
-    BB_SQUEEZE_PCT=0.06
-    STOP_MULT_ATR=2.0
-    TRAIL_MULT_ATR=1.0
+• Risk management is ATR-based with per-strategy multipliers + position sizing by risk %.
 
-    # Logging
-    LOG_LEVEL=INFO               # DEBUG|INFO|WARNING|ERROR
-    LOG_FILE=tradebot.log
-    LOG_JSON=0                   # 1 -> JSON lines
-    LOG_BAR_DETAILS=0            # 1 -> per-bar regime/signal logs (verbose)
-    LOG_TRADES_ONLY=0            # 1 -> only trade open/close logs
+Outputs
+-------
+- Console summary and logs
+- CSV with individual trades at ./best_family_trades.csv
+
+Environment (.env) variables
+----------------------------
+# Data / run
+SYMBOL=BTCUSDT
+INTERVAL_MIN=60          # base timeframe in minutes (used as scheduling spine)
+DAYS=45                  # how many recent days to fetch
+CATEGORY=linear          # Bybit v5 category: linear|inverse|spot
+DATA_CSV=                # optional path to CSV with columns ts, open, high, low, close, volume
+
+# Fees & risk
+START_BALANCE=1000
+RISK_PCT=0.05
+COMMISSION_PCT=0.0
+SLIPPAGE_USDT=0.0
+
+# Multi-TF fetch (used when ADAPTIVE=1)
+ADAPTIVE=1
+MULTI_INTERVALS=15,60,240  # list of TFs to download (minutes). Should include INTERVAL_MIN.
+# Which TF to use for signals in each regime. Allowed values: lower|base|higher
+REGIME_TF_TREND=base
+REGIME_TF_RANGE=higher
+REGIME_TF_BREAKOUT=base
+REGIME_TF_SCALP=lower
+
+# Regime detection tuning (computed on the *higher* TF stream)
+ADX_WINDOW=14
+ADX_TREND=25
+ADX_RANGE=18
+REGIME_BB_WINDOW=20
+REGIME_BB_STD=2.0
+BB_SQUEEZE_PCT=0.06
+BREAKOUT_BBW_EXPAND=1.35     # factor vs previous bar BBW to call expansion
+SCALP_ADX_MAX=20             # max ADX for scalp regime
+SCALP_BBW_MIN=0.07           # minimum BBW to ensure some noise/vol for scalping
+EMA_SLOPE_MIN=0.0004         # min absolute EMA slope (pct per bar) to call trend
+
+# Strategy params (shared/defaults)
+STOP_MULT_ATR=2.0
+TRAIL_MULT_ATR=1.0
+
+# Strategy-specific (scalp)
+SCALP_ENTRY_ATR=0.6          # entry threshold: distance from EMA10 in ATR units
+SCALP_STOP_ATR=0.9
+SCALP_TRAIL_ATR=0.6
+SCALP_TP_ATR=0.8
+
+# Strategy-specific (range BB)
+RANGE_BB_WINDOW=20
+RANGE_BB_STD=2.0
+
+# Strategy-specific (breakout)
+DONCHIAN=20
+
+# Logging
+LOG_LEVEL=INFO               # DEBUG|INFO|WARNING|ERROR
+LOG_FILE=tradebot.log
+LOG_JSON=0
+LOG_BAR_DETAILS=0
+LOG_TRADES_ONLY=0
 """
 
 from __future__ import annotations
@@ -1013,9 +1044,9 @@ def main():
     print(f"Trades:        {n_trades} | Win rate: {win_rate:.2f}% | Max DD: {max_dd_pct:.2f}%")
     print(f"Trades CSV:    {out_path}")
     if adaptive and len(dfs) >= 2:
-        print("Adaptive multi-strategy run (regime-based switching across TFs). ENV: ADAPTIVE=1, MULTI_INTERVALS=15,60,240")
-    elif os.getenv("OPTIMIZE", "1").strip().lower() in ("1","true","yes","y"):
-        print("Grid results saved to: best_family_search.csv (top results by final equity).")
+        print("Adaptive multi-strategy run. ENV: ADAPTIVE=1, MULTI_INTERVALS=15,60,240")
+    else:
+        print("Single-strategy Bollinger mean-reversion run. Set ADAPTIVE=1 for regime switching.")
 
 if __name__ == "__main__":
     main()
