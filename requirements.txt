@@ -4,3 +4,4 @@ aiogram==3.*
 python-dotenv
 aiohttp
 certifi
+numpy
