@@ -4,4 +4,5 @@ aiogram==3.*
 python-dotenv
 aiohttp
 certifi
-numpy
+numpy>=1.26
+pandas>=2.2
