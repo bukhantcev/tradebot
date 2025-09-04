@@ -1,69 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-LIVE bot for Bybit TESTNET with ADAPTIVE multi-strategy controller.
-
-What it does (short):
-- Keeps local SQLite with klines for multiple intervals.
-- On each new bar of the *execution* timeframe, fetches/updates data for needed TFs.
-- Determines market regime on a higher TF: trend_up / trend_down / range / breakout.
-- Picks a strategy:
-    • trend_ma_pullback (trend-following pullback to EMA with ATR filter)
-    • range_bb (counter-trend from Bollinger bands)
-    • breakout (simple HH/LL breakout with ATR/volatility gate)
-- May switch execution timeframe depending on regime (e.g. range -> faster TF).
-- Uses ATR-based initial stop and trailing stop; TP depends on strategy.
-- Places market orders on bar open (next bar after signal).
-
-Environment (.env) variables (defaults in parentheses):
-    # Market & timeframe
-    SYMBOL=BTCUSDT
-    CATEGORY=linear
-    INTERVAL_MIN=60                      # default execution TF if ADAPTIVE=0
-    MULTI_INTERVALS=15,60,240            # used when ADAPTIVE=1 (min, base, higher)
-    DAYS=45
-    ADAPTIVE=1                           # 1 enables adaptive controller
-
-    # Account / API (TESTNET)
-    API_KEY=<your_key>
-    API_SECRET=<your_secret>
-    BASE_URL=https://api-testnet.bybit.com
-    RECV_WINDOW=5000
-
-    # Risk & fees
-    START_BALANCE=1000
-    RISK_PCT=0.05
-    COMMISSION_PCT=0.0
-    SLIPPAGE_USDT=0.0
-
-    # Strategy params
-    # Bollinger (range)
-    BB_WINDOW=20
-    BB_STD=2.0
-    # ATR & EMA (shared)
-    ATR_WINDOW=14
-    EMA_FAST=20
-    EMA_SLOW=50
-    STOP_MULT=2.0
-    TRAIL_MULT=1.0
-
-    # Adaptive detector thresholds
-    SLOPE_THR=0.0                        # ema50 slope thr in price units per bar (0 = auto via ATR%)
-    ATR_PCT_THR=0.006                    # ATR/price to decide range vs trend (~0.6%)
-    BB_BW_THR=0.02                       # Bollinger bandwidth (% of price) for range
-
-    # Storage
-    DB_PATH=candles.db
-
-    # Looping
-    POLL_SECONDS=5
-
-    # Logging
-    LOG_LEVEL=INFO
-    LOG_FILE=tradebot.log
-    LOG_JSON=0
-    LOG_BAR_DETAILS=0
-    LOG_TRADES_ONLY=0
-"""
 
 from __future__ import annotations
 import os
@@ -454,6 +388,30 @@ class BybitClient:
                 last_err = e
         raise last_err if last_err else RuntimeError("wallet_balance failed")
 
+    def available_balance(self, coin: str = "USDT", accountType: str | None = None) -> float:
+        """Return available balance (not total equity). Uses totalAvailableBalance if present, else availableBalance, else 0."""
+        types_to_try = [accountType] if accountType else ["UNIFIED", "CONTRACT"]
+        last_err = None
+        for acct in types_to_try:
+            try:
+                params = {"accountType": acct, "coin": coin}
+                data = self._signed_get("/v5/account/wallet-balance", params)
+                if data.get("retCode") != 0:
+                    last_err = RuntimeError(str(data)); continue
+                lst = (data.get("result", {}) or {}).get("list", [])
+                if not lst:
+                    continue
+                item = lst[0]
+                # Bybit v5 returns strings
+                val = item.get("totalAvailableBalance") or item.get("availableBalance") or "0"
+                try:
+                    return float(val)
+                except Exception:
+                    return 0.0
+            except Exception as e:
+                last_err = e
+        raise last_err if last_err else RuntimeError("available_balance failed")
+
     def get_positions(self, category: str, symbol: str) -> List[Dict]:
         data = self._signed_get("/v5/position/list", {"category": category, "symbol": symbol})
         if data.get("retCode") != 0:
@@ -688,6 +646,14 @@ def run_bot():
     poll_seconds = int(os.getenv("POLL_SECONDS", "5"))
     db_path = os.getenv("DB_PATH", "candles.db")
 
+    # Risk circuit breakers / caps
+    equity_cap = float(os.getenv("EQUITY_CAP", "0"))
+    daily_max_dd_pct = float(os.getenv("DAILY_MAX_DRAWDOWN_PCT", "0"))
+    max_consec_stops = int(os.getenv("MAX_CONSECUTIVE_STOPS", "0"))
+    cooldown_bars_after_stop = int(os.getenv("COOLDOWN_BARS_AFTER_STOP", "0"))
+    max_trade_notional_usdt = float(os.getenv("MAX_TRADE_NOTIONAL_USDT", "0"))
+    atr_pos_cap_pct = float(os.getenv("ATR_POS_CAP_PCT", "0"))
+
     if not api_key or not api_secret:
         log.error("[SETUP] Missing API_KEY or API_SECRET in environment.")
         raise SystemExit(1)
@@ -742,6 +708,12 @@ def run_bot():
 
     position: Optional[PositionState] = None
     last_open_ts_by_tf: Dict[int, int] = {}
+
+    # Risk/guard state
+    day_anchor_date: Optional[dt.date] = None
+    day_start_equity: Optional[float] = None
+    consecutive_stops: int = 0
+    cooldown_bars_left: int = 0
 
     # Strategy params bag
     strat_params = {"PULL_K_ATR": 0.5, "BRK_N": 20}
@@ -799,6 +771,18 @@ def run_bot():
                 new_open = float(base_df.iloc[-1]["open"])
                 print(f"[MAIN] New {exec_tf}m bar: {base_df.iloc[-1]['datetime']} open={new_open:.2f} regime={regime}", flush=True)
 
+                # Daily anchor & reset
+                bar_date = base_df.iloc[-1]['datetime'].date()
+                try:
+                    current_equity = float(client.wallet_balance("USDT"))
+                except Exception:
+                    current_equity = start_balance_fallback
+                if day_anchor_date != bar_date:
+                    day_anchor_date = bar_date
+                    day_start_equity = current_equity
+                    consecutive_stops = 0
+                    # cooldown carries over but can be reduced one step on bar change below
+
                 # equity for sizing
                 try:
                     equity = float(client.wallet_balance("USDT"))
@@ -820,6 +804,9 @@ def run_bot():
                                 if qty > 0:
                                     client.place_order(category=category, symbol=symbol, side="Sell", qty=str(qty), reduceOnly=True)
                                 log.info(f"[ADAPT][EXIT] long STOP t={base_df.iloc[-1]['datetime']} regime={position.regime} strat={position.strategy} tf={position.tf} entry={position.entry:.2f} exit={new_open:.2f}")
+                                consecutive_stops += 1
+                                if cooldown_bars_after_stop > 0:
+                                    cooldown_bars_left = max(cooldown_bars_left, cooldown_bars_after_stop)
                                 position = None
                         else:
                             new_trail = new_open + trail_mult * atr_now
@@ -830,6 +817,9 @@ def run_bot():
                                 if qty > 0:
                                     client.place_order(category=category, symbol=symbol, side="Buy", qty=str(qty), reduceOnly=True)
                                 log.info(f"[ADAPT][EXIT] short STOP t={base_df.iloc[-1]['datetime']} regime={position.regime} strat={position.strategy} tf={position.tf} entry={position.entry:.2f} exit={new_open:.2f}")
+                                consecutive_stops += 1
+                                if cooldown_bars_after_stop > 0:
+                                    cooldown_bars_left = max(cooldown_bars_left, cooldown_bars_after_stop)
                                 position = None
 
                 # TP at target (if defined)
@@ -839,13 +829,42 @@ def run_bot():
                         if qty > 0:
                             client.place_order(category=category, symbol=symbol, side="Sell", qty=str(qty), reduceOnly=True)
                         log.info(f"[ADAPT][EXIT] long TP t={base_df.iloc[-1]['datetime']} strat={position.strategy} tf={position.tf} tp={position.tp:.2f} open={new_open:.2f}")
+                        consecutive_stops = 0
                         position = None
                     elif position.side == "short" and new_open <= position.tp:
                         qty = round_qty(position.size, qty_step, min_qty)
                         if qty > 0:
                             client.place_order(category=category, symbol=symbol, side="Buy", qty=str(qty), reduceOnly=True)
                         log.info(f"[ADAPT][EXIT] short TP t={base_df.iloc[-1]['datetime']} strat={position.strategy} tf={position.tf} tp={position.tp:.2f} open={new_open:.2f}")
+                        consecutive_stops = 0
                         position = None
+
+                # Cooldown management (decrement per new bar on exec TF)
+                if cooldown_bars_left > 0:
+                    cooldown_bars_left -= 1
+
+                # Daily max drawdown guard
+                if day_start_equity is not None and daily_max_dd_pct > 0:
+                    loss_pct = 0.0
+                    if current_equity > 0:
+                        loss_pct = (day_start_equity - current_equity) / day_start_equity * 100.0
+                    if loss_pct >= daily_max_dd_pct:
+                        log.warning(f"[GUARD] Daily DD reached: {loss_pct:.2f}% >= {daily_max_dd_pct}%. Skipping entries for today.")
+                        # Mark bar observed and continue
+                        last_open_ts_by_tf[exec_tf] = open_ts
+                        continue
+
+                # Stop streak guard
+                if max_consec_stops > 0 and consecutive_stops >= max_consec_stops:
+                    log.warning(f"[GUARD] Consecutive stops = {consecutive_stops} >= {max_consec_stops}. Skipping entry.")
+                    last_open_ts_by_tf[exec_tf] = open_ts
+                    continue
+
+                # Cooldown guard
+                if cooldown_bars_left > 0:
+                    log.info(f"[GUARD] Cooldown active: {cooldown_bars_left} bars left. Skipping entry.")
+                    last_open_ts_by_tf[exec_tf] = open_ts
+                    continue
 
                 # Entries
                 if position is None:
@@ -854,10 +873,44 @@ def run_bot():
                     atr_now = float(last_closed["atr"]) if not math.isnan(last_closed["atr"]) else 0.0
                     if side and atr_now > 0:
                         stop_dist = stop_mult * atr_now
-                        size_usdt = (equity * risk_pct)
+                        # Base equity for sizing with optional cap
+                        equity_for_risk = equity
+                        if equity_cap and equity_cap > 0:
+                            equity_for_risk = min(equity_for_risk, equity_cap)
+                        size_usdt = equity_for_risk * risk_pct
+
+                        # Volatility cap: if ATR% exceeds threshold, halve position
+                        atr_pct_now = (atr_now / float(last_closed["close"])) if float(last_closed["close"]) > 0 else 0.0
+                        if atr_pos_cap_pct and atr_pos_cap_pct > 0 and atr_pct_now * 100 >= atr_pos_cap_pct:
+                            size_usdt *= 0.5
+                            log.info(f"[GUARD] ATR% {atr_pct_now*100:.2f}% >= {atr_pos_cap_pct}%. Halving size.")
+
+                        # Convert to qty via stop distance (risk per trade)
                         size = size_usdt / stop_dist if stop_dist > 0 else 0.0
                         entry_price = new_open + (slippage_usdt if side == "long" else -slippage_usdt)
-                        qty = round_qty(size, qty_step, min_qty)
+
+                        # Notional cap
+                        if max_trade_notional_usdt and max_trade_notional_usdt > 0:
+                            max_qty_by_notional = max_trade_notional_usdt / entry_price
+                        else:
+                            max_qty_by_notional = float("inf")
+
+                        # Available balance cap (conservative: assume 1x if leverage unknown)
+                        try:
+                            avail = float(client.available_balance("USDT"))
+                        except Exception:
+                            avail = equity  # fallback
+                        max_qty_by_avail = (avail * 0.9) / entry_price  # keep some buffer
+
+                        # Apply all caps and round
+                        raw_qty = min(size, max_qty_by_notional, max_qty_by_avail)
+                        qty = round_qty(raw_qty, qty_step, min_qty)
+
+                        if qty <= 0:
+                            log.warning(f"[GUARD] Computed qty <= 0 after caps (size={size:.6f}, notional_cap={max_trade_notional_usdt}, avail={avail:.2f}). Skipping entry.")
+                            last_open_ts_by_tf[exec_tf] = open_ts
+                            continue
+
                         if qty > 0:
                             if side == "long":
                                 client.place_order(category=category, symbol=symbol, side="Buy", qty=str(qty), reduceOnly=False)
@@ -891,6 +944,13 @@ def run_bot():
                                 )
                             log.info(f"[ADAPT][ENTRY] {position.side} t={base_df.iloc[-1]['datetime']} regime={regime} strat={strategy_name} tf={exec_tf} entry={entry_price:.2f} size={qty:.6f} stop_dist={stop_dist:.2f} eq={equality_fmt(equity)}")
                             print(f"[MAIN] ENTRY {position.side.upper()} | tf={exec_tf} regime={regime} strat={strategy_name} entry={entry_price:.2f} qty={qty:.6f}", flush=True)
+
+                # Lightweight balance debug
+                try:
+                    avail_dbg = client.available_balance("USDT")
+                    log.debug(f"[BAL] equity={equality_fmt(equity)} avail={avail_dbg:.2f} USDT")
+                except Exception:
+                    pass
 
                 # Mark bar observed
                 last_open_ts_by_tf[exec_tf] = open_ts
