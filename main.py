@@ -14,6 +14,13 @@ from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple
 import threading
 import urllib.parse
+import sys
+import signal
+from requests.adapters import HTTPAdapter
+try:
+    from urllib3.util.retry import Retry
+except Exception:
+    Retry = None  # fallback if urllib3 Retry is unavailable
 
 import numpy as np
 import pandas as pd
@@ -53,6 +60,8 @@ def input_loop(client):
                 except Exception as e:
                     print(f"[COMMAND] Positions failed: {e}")
         except EOFError:
+            break
+        except KeyboardInterrupt:
             break
 
 # ---------------------------------------------------------------------
@@ -232,6 +241,16 @@ class BybitClient:
         self.base_url = base_url.rstrip("/")
         self.recv_window = str(int(recv_window))
         self.session = requests.Session()
+        if Retry is not None:
+            retries = Retry(
+                total=3,
+                backoff_factor=0.5,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["GET", "POST"],
+            )
+            adapter = HTTPAdapter(max_retries=retries)
+            self.session.mount("https://", adapter)
+            self.session.mount("http://", adapter)
         # approximate server time offset
         try:
             st = self._server_time_ms()
@@ -606,12 +625,24 @@ def generate_signal(base_df: pd.DataFrame, regime: str, params: Dict) -> Tuple[O
     return None, "", None
 
 # ---------------------------------------------------------------------
+# Process signals / graceful shutdown
+# ---------------------------------------------------------------------
+RUNNING = True
+
+def _graceful_exit(signum, frame):
+    global RUNNING
+    RUNNING = False
+    log.info(f"[SYS] Signal {signum} received. Stopping loop…")
+
+# ---------------------------------------------------------------------
 # Core bot loop
 # ---------------------------------------------------------------------
 
 def run_bot():
     load_dotenv()
     print("[MAIN] Strategy starting…", flush=True)
+    signal.signal(signal.SIGINT, _graceful_exit)
+    signal.signal(signal.SIGTERM, _graceful_exit)
 
     # ENV
     symbol = os.getenv("SYMBOL", "BTCUSDT")
@@ -676,12 +707,14 @@ def run_bot():
         print("[MAIN] API auth FAILED (see logs)", flush=True)
 
     # CLI thread
-    ENABLE_CLI = True
-    if ENABLE_CLI:
+    ENABLE_CLI = os.getenv("ENABLE_CLI", "0").strip().lower() in ("1", "true", "yes", "y")
+    if ENABLE_CLI and sys.stdin and sys.stdin.isatty():
         try:
             threading.Thread(target=input_loop, args=(client,), daemon=True).start()
         except Exception:
             pass
+    else:
+        log.info("[CLI] Disabled (ENABLE_CLI=0 or no TTY)")
 
     # Instrument info
     ins = client.get_instrument(symbol, category)
@@ -720,7 +753,7 @@ def run_bot():
 
     log.info(f"[ADAPT] Start | tfs={multi_intervals} risk={risk_pct} stopATRx={stop_mult} trailATRx={trail_mult}")
 
-    while True:
+    while RUNNING:
         try:
             now = dt.datetime.now(dt.timezone.utc).replace(second=0, microsecond=0)
 
@@ -906,10 +939,16 @@ def run_bot():
                         raw_qty = min(size, max_qty_by_notional, max_qty_by_avail)
                         qty = round_qty(raw_qty, qty_step, min_qty)
 
+                        # Debug log for entry block reason
+                        log.info(f"[DEBUG] Entry blocked | side={side} regime={regime} strat={strategy_name} atr={atr_now:.2f} stop_dist={stop_dist:.2f} size={size:.6f} avail={avail:.2f} raw_qty={raw_qty:.6f} qty={qty:.6f}")
                         if qty <= 0:
-                            log.warning(f"[GUARD] Computed qty <= 0 after caps (size={size:.6f}, notional_cap={max_trade_notional_usdt}, avail={avail:.2f}). Skipping entry.")
-                            last_open_ts_by_tf[exec_tf] = open_ts
-                            continue
+                            if raw_qty > 0 and min_qty > 0:
+                                qty = min_qty
+                                log.info(f"[DEBUG] Forcing min_qty entry | side={side} raw_qty={raw_qty:.6f} min_qty={min_qty}")
+                            else:
+                                log.warning(f"[GUARD] Computed qty <= 0 after caps (size={size:.6f}, notional_cap={max_trade_notional_usdt}, avail={avail:.2f}). Skipping entry.")
+                                last_open_ts_by_tf[exec_tf] = open_ts
+                                continue
 
                         if qty > 0:
                             if side == "long":
@@ -961,9 +1000,18 @@ def run_bot():
                     lc = df.iloc[-2]
                     log.debug(f"[BAR] tf={tf} t={lc['datetime']} close={lc['close']:.2f} ema_fast={lc['ema_fast']:.2f} ema_slow={lc['ema_slow']:.2f} atr={lc['atr']:.2f}")
 
+        except KeyboardInterrupt:
+            log.info("[SYS] KeyboardInterrupt – stopping main loop…")
+            break
         except Exception as e:
             log.error(f"[LOOP] Error: {e}")
         time.sleep(poll_seconds)
+
+    try:
+        client.session.close()
+    except Exception:
+        pass
+    print("[MAIN] Stopped", flush=True)
 
 if __name__ == "__main__":
     run_bot()
