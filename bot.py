@@ -52,6 +52,42 @@ handler = RotatingFileHandler("tg_bot.log", maxBytes=3_000_000, backupCount=2, e
 handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
 logger.addHandler(handler)
 
+# Runtime subscribers & forwarders
+SUB_CHATS: set[int] = set()
+FORWARDER_TASKS: dict[int, list[asyncio.Task]] = {}
+
+def _paths_to_tail() -> list[str]:
+    paths = [
+        os.path.join(WORK_DIR, LOG_FILE) if not os.path.isabs(LOG_FILE) else LOG_FILE,
+        OUT_LOG_FILE,
+    ]
+    # Keep only existing/unique paths; missing ones will be retried by task itself
+    seen, uniq = set(), []
+    for p in paths:
+        if p not in seen:
+            uniq.append(p)
+            seen.add(p)
+    return uniq
+
+async def start_forwarders_for_chat(bot: Bot, chat_id: int):
+    # If already running for this chat — skip
+    if chat_id in FORWARDER_TASKS:
+        return
+    tasks: list[asyncio.Task] = []
+    for pth in _paths_to_tail():
+        tasks.append(asyncio.create_task(log_forwarder_task(bot, chat_id, pth)))
+    FORWARDER_TASKS[chat_id] = tasks
+    logger.info(f"Log forwarders started for chat {chat_id}")
+
+async def stop_forwarders_for_chat(chat_id: int):
+    tasks = FORWARDER_TASKS.pop(chat_id, [])
+    for t in tasks:
+        t.cancel()
+    for t in tasks:
+        with contextlib.suppress(Exception):
+            await t
+    logger.info(f"Log forwarders stopped for chat {chat_id}")
+
 # SSL context for aiohttp (fixes CERTIFICATE_VERIFY_FAILED on some macOS/Python installs)
 if BYBIT_VERIFY_SSL:
     SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
@@ -275,10 +311,21 @@ async def get_orders_text(session: aiohttp.ClientSession) -> str:
 # Log forwarder (tail LOG_FILE)
 # ----------------------------
 
-EVENT_TAGS = ("[ENTRY]", "[EXIT]", "[ORDER]", "[ADAPT]", "[STOP]", "[START]", "[IO]", "[BT]", "[ADAPT][ENTRY]", "[ADAPT][EXIT]")
+EVENT_TAGS = (
+    "[SCALP]",
+    "[SCALP][ENTRY]",
+    "[SCALP][EXIT]",
+    "[SCALP][STOP]",
+    "[SCALP][TP]",
+    "[LEVELS]",
+    "[TREND]",
+    "[RISK]",
+    "[STAT]",
+)
 
 async def log_forwarder_task(bot: Bot, chat_id: int, log_path: str):
     pos = 0
+    primed = False
     while True:
         try:
             if not os.path.exists(log_path):
@@ -286,7 +333,17 @@ async def log_forwarder_task(bot: Bot, chat_id: int, log_path: str):
                 continue
             with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
                 if pos > 0:
-                    f.seek(pos)
+                    try:
+                        f.seek(pos)
+                    except Exception:
+                        pos = 0
+                if pos == 0 and not primed:
+                    try:
+                        f.seek(0, os.SEEK_END)
+                        pos = f.tell()
+                        primed = True
+                    except Exception:
+                        pass
                 for line in f:
                     pos = f.tell()
                     if any(tag in line for tag in EVENT_TAGS):
@@ -308,23 +365,65 @@ KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="▶️ Запуск"), KeyboardButton(text="⏹ Стоп")],
         [KeyboardButton(text="💰 Баланс"), KeyboardButton(text="📜 Ордера")],
+        [KeyboardButton(text="📊 Статус")],
     ],
     resize_keyboard=True
 )
 
 def allowed_chat(message: types.Message) -> bool:
+    global TG_CHAT_ID
     if TG_CHAT_ID:
         return str(message.chat.id) == TG_CHAT_ID
+    # First chat becomes the default; remember only in-memory
+    TG_CHAT_ID = str(message.chat.id)
     return True
 
-async def on_start(message: types.Message):
+async def on_start(message: types.Message, bot: Bot):
     if not allowed_chat(message):
         return
-    await message.answer("Готов к работе. Кнопки ниже:\n• ▶️ Запуск — стартует стратегию\n• ⏹ Стоп — останавливает стратегию\n• 💰 Баланс — читает UTA баланс\n• 📜 Ордера — открытые ордера\n\nВывод стратегии будет писаться в файл и пересылаться сюда автоматически.", reply_markup=KB)
+    await message.answer(
+        "Готов к работе. Кнопки ниже:\n"
+        "• ▶️ Запуск — запускает СКАЛЬПИНГ-стратегию\n"
+        "• ⏹ Стоп — останавливает стратегию\n"
+        "• 💰 Баланс — читает UTA баланс\n"
+        "• 📜 Ордера — открытые ордера\n"
+        "• 📊 Статус — последние события скальпинга (входы/выходы, тренд, уровни)\n\n"
+        "Логи стратегии (теги [SCALP], [ENTRY]/[EXIT]/[STOP]/[TP], [LEVELS], [TREND]) будут автоматически пересылаться сюда.",
+        reply_markup=KB,
+    )
+    # subscribe this chat for log streaming
+    await start_forwarders_for_chat(bot, message.chat.id)
 
-async def on_text(message: types.Message, session: aiohttp.ClientSession):
+# ----------------------------
+# Status snippet helper
+# ----------------------------
+
+async def get_status_snippet(max_lines: int = 25) -> str:
+    path = OUT_LOG_FILE
+    try:
+        if not os.path.exists(path):
+            return "Статус: лог-файл ещё не создан. Нажмите ▶️ Запуск."
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            try:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - 100_000))  # последние ~100КБ
+            except Exception:
+                pass
+            lines = f.read().splitlines()
+        tags = set(EVENT_TAGS)
+        filtered = [ln for ln in lines if any(tag in ln for tag in tags)]
+        if not filtered:
+            return "Статус: пока нет событий скальпинга."
+        return "\n".join(filtered[-max_lines:])
+    except Exception as e:
+        return f"Статус: ошибка чтения лога — {e}"
+
+async def on_text(message: types.Message, session: aiohttp.ClientSession, bot: Bot):
     if not allowed_chat(message):
         return
+    # Ensure logs are forwarded to this chat
+    await start_forwarders_for_chat(bot, message.chat.id)
     text = (message.text or "").strip().lower()
 
     if text.startswith("▶️".lower()) or text.startswith("запуск"):
@@ -346,7 +445,11 @@ async def on_text(message: types.Message, session: aiohttp.ClientSession):
         await message.answer(await get_orders_text(session))
         return
 
-    await message.answer("Не понял команду. Используйте кнопки ниже.", reply_markup=KB)
+    if text.startswith("📊".lower()) or "статус" in text:
+        await message.answer(await get_status_snippet())
+        return
+
+    await message.answer("Не понял команду. Используйте кнопки ниже (добавлен 📊 Статус).", reply_markup=KB)
 
 async def main():
     if not TG_TOKEN:
@@ -359,26 +462,12 @@ async def main():
     session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=SSL_CONTEXT))
 
     # Handlers
-    dp.message.register(on_start, CommandStart())
+    dp.message.register(lambda m: on_start(m, bot), CommandStart())
+
     async def _on_text_wrapper(message: types.Message):
-        await on_text(message, session)
+        await on_text(message, session, bot)
 
     dp.message.register(_on_text_wrapper, F.text & ~F.via_bot)
-
-    # Start log forwarders if TG_CHAT_ID provided (tail both app log and strategy stdout/stderr)
-    forwarders: list[asyncio.Task] = []
-    if TG_CHAT_ID:
-        try:
-            chat_id = int(TG_CHAT_ID)
-            paths_to_tail = [
-                os.path.join(WORK_DIR, LOG_FILE) if not os.path.isabs(LOG_FILE) else LOG_FILE,
-                OUT_LOG_FILE,
-            ]
-            for pth in paths_to_tail:
-                forwarders.append(asyncio.create_task(log_forwarder_task(bot, chat_id, pth)))
-            logger.info("Log forwarders started")
-        except Exception as e:
-            logger.warning(f"Log forwarders not started: {e}")
 
     logger.info("Telegram bot polling (aiogram) …")
     try:
@@ -386,11 +475,9 @@ async def main():
     finally:
         # stop all forwarders
         try:
-            for t in forwarders:
-                t.cancel()
-            for t in forwarders:
-                with contextlib.suppress(Exception):
-                    await t
+            chats = list(FORWARDER_TASKS.keys())
+            for cid in chats:
+                await stop_forwarders_for_chat(cid)
         except Exception:
             pass
         await session.close()
