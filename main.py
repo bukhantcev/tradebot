@@ -33,7 +33,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 RISK_PCT = float(os.getenv("RISK_PCT", "0.01"))
 MAX_RISK_USDT = float(os.getenv("MAX_RISK_USDT", "10"))
 
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
 SECONDS = int(os.getenv("SECONDS", "5"))
 
 
