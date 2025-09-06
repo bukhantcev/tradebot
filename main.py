@@ -752,6 +752,7 @@ def choose_strategy_via_openai(features: Dict) -> Dict:
                 logger.warning("[DUMP][OPENAI][RESP] error: %s", e)
         data = resp.json()
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        print(content, flush=True)
         logger.debug("[AI:OpenAI][CHOICE_RAW] %s", content)
         # Try to extract JSON (strip code fences)
         txt = content.strip()
