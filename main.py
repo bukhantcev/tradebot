@@ -47,8 +47,6 @@ SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.0"))
 TP_R_MULT = float(os.getenv("TP_R_MULT", "1.0"))
 
 # --- AI/Strategy selection ---
-AI_URL = os.getenv("AI_URL", "")
-AI_AUTH = os.getenv("AI_AUTH", "")
 AI_TIMEOUT = int(os.getenv("AI_TIMEOUT", "10"))
 STRATEGY_DEFAULT = os.getenv("STRATEGY_DEFAULT", "breakout")  # knife|density|breakout|momentum
 
@@ -782,62 +780,25 @@ def choose_strategy_via_openai(features: Dict) -> Dict:
 
 
 def choose_strategy_via_ai(features: Dict) -> Dict:
-    """Send features to external AI to get strategy choice.
+    """Pick strategy via OpenAI only (no external AI_URL path).
     Expected response: {"strategy": "knife|density|breakout|momentum", "reason": str, "confidence": 0..1}
     """
-    if not AI_URL:
-        if OPENAI_API_KEY:
-            pick = choose_strategy_via_openai(features)
-            if pick:
-                return pick
-        logger.debug("[AI:PICK] fallback heuristic: no AI_URL and OpenAI unavailable or failed")
-        # Fallback simple heuristic when neither AI_URL nor OpenAI is configured
-        choice = "breakout"
+    # Prefer OpenAI if key is present
+    if OPENAI_API_KEY:
+        pick = choose_strategy_via_openai(features)
+        if pick:
+            return pick
+        # If choose_strategy_via_openai returned {}, fall through to heuristic.
+
+    logger.debug("[AI:PICK] fallback heuristic: OpenAI unavailable or failed")
+    # Fallback simple heuristic when OpenAI is not configured or failed
+    choice = "breakout"
+    try:
         if features.get("orderbook", {}).get("imbalance_bp", 0) > 0.4:
             choice = "momentum"
-        return {"strategy": choice, "reason": "fallback heuristic (no AI_URL)", "confidence": 0.5}
-    try:
-        logger.debug("[AI:HTTP] POST %s", AI_URL)
-        headers = {"Content-Type": "application/json"}
-        if AI_AUTH:
-            headers["Authorization"] = AI_AUTH
-        headers_log = dict(headers)
-        if "Authorization" in headers_log:
-            headers_log["Authorization"] = "***redacted***"
-        logger.debug("[AI:HTTP][HEADERS] %s", headers_log)
-        if DUMP_AI:
-            try:
-                os.makedirs(DUMPS_DIR, exist_ok=True)
-                ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-                req_path = os.path.join(DUMPS_DIR, f"httpai_req_{SYMBOL}_{ts}.json")
-                with open(req_path, "w", encoding="utf-8") as f:
-                    to_dump = {"url": AI_URL, "headers": {k:("***redacted***" if k.lower()=="authorization" else v) for k,v in headers.items()}, "payload": features}
-                    json.dump(to_dump, f, ensure_ascii=False, indent=2)
-                print(f"[DUMP][HTTPAI][REQ] -> {req_path}")
-            except Exception as e:
-                logger.warning("[DUMP][HTTPAI][REQ] error: %s", e)
-        resp = requests.post(AI_URL, headers=headers, data=json.dumps(features), timeout=AI_TIMEOUT)
-        resp.raise_for_status()
-        logger.debug("[AI:HTTP][STATUS] %s", resp.status_code)
-        logger.debug("[AI:HTTP][RESP] %s", resp.text)
-        if DUMP_AI:
-            try:
-                ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-                resp_path = os.path.join(DUMPS_DIR, f"httpai_resp_{SYMBOL}_{ts}.json")
-                with open(resp_path, "w", encoding="utf-8") as f:
-                    f.write(resp.text)
-                print(f"[DUMP][HTTPAI][RESP] -> {resp_path}")
-            except Exception as e:
-                logger.warning("[DUMP][HTTPAI][RESP] error: %s", e)
-        data = resp.json()
-        st = data.get("strategy")
-        if st not in STRATEGY_MODULES:
-            raise ValueError(f"AI returned unsupported strategy: {st}")
-        logger.debug("[AI:HTTP][RES] %s conf=%s", st, data.get("confidence"))
-        return {"strategy": st, "reason": data.get("reason", ""), "confidence": float(data.get("confidence", 0.0))}
-    except Exception as e:
-        logger.warning("[AI] choose error: %s", e)
-        return {"strategy": STRATEGY_DEFAULT, "reason": f"AI error: {e}", "confidence": 0.0}
+    except Exception:
+        pass
+    return {"strategy": choice, "reason": "fallback heuristic (OpenAI unavailable or failed)", "confidence": 0.5}
 
 
 # -----------------------
