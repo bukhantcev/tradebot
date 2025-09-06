@@ -126,6 +126,42 @@ def run_once(filters, context) -> None:
     try:
         res = place_market_order(entry_side, qty, stop_loss=sl_price, take_profit=tp_price, reduce_only=False)
         oid = res["result"]["orderId"]
+        # ---- Strategy callbacks (optional) ----
+        # Build compact indicator summary for journaling
+        indicator_summary = (
+            f"trend5={trend_m5}; buy={buy_ratio:.2f}; tick={tick_rate:.0f}/m; "
+            f"dS={d_sup if d_sup is not None else 'na'}; "
+            f"dR={d_res if d_res is not None else 'na'}; "
+            f"ATR5={atr_m5:.2f}"
+        )
+
+        # Try to infer fill/entry price from response
+        fill_price = None
+        try:
+            rr = res.get("result") or {}
+            # Common fields that Bybit may return depending on endpoint
+            for k in ("avgPrice", "cumExecAvgPrice", "orderPrice", "price"):
+                if k in rr and rr[k] not in (None, ""):
+                    fill_price = float(rr[k])
+                    break
+        except Exception:
+            fill_price = None
+        if not fill_price:
+            fill_price = float(price)
+
+        # Fire on_entry callback if provided by main
+        on_entry_cb = context.get("on_entry")
+        if callable(on_entry_cb):
+            try:
+                on_entry_cb(
+                    strategy="breakout",
+                    side=entry_side,
+                    indicator=indicator_summary,
+                    qty=qty,
+                    price=fill_price,
+                )
+            except Exception as _cb_err:
+                logger.debug("[BRK][CB] on_entry failed: %s", _cb_err)
         tg_send(
             f"🚀 <b>BREAKOUT</b> {SYMBOL}\n"
             f"Side: <b>{entry_side.upper()}</b> | Qty: <code>{qty}</code>\n"
@@ -135,5 +171,9 @@ def run_once(filters, context) -> None:
         logger.info("[BRK][ORDER] %s qty=%.6f @%.2f SL=%.2f TP=%.2f id=%s",
                     entry_side, qty, price, sl_price, tp_price, oid)
     except Exception as e:
+        logger.debug(
+            "[BRK][ORDER] context | side=%s qty=%.6f price=%.2f dS=%s dR=%s buy=%.2f tick=%.1f atr5=%.2f",
+            entry_side, qty, price, d_sup, d_res, buy_ratio, tick_rate, atr_m5,
+        )
         logger.error("[BRK][ORDER] failed: %s", e)
         tg_send(f"❌ <b>BREAKOUT order failed</b> {SYMBOL}\n<code>{e}</code>")

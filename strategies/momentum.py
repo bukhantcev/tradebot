@@ -114,6 +114,19 @@ def run_once(filters, context) -> None:
     try:
         res = place_market_order(entry_side, qty, stop_loss=sl_price, take_profit=tp_price, reduce_only=False)
         oid = res["result"]["orderId"]
+        # Unified entry callback (if provided by main)
+        on_entry = context.get("on_entry") if isinstance(context, dict) else None
+        if callable(on_entry):
+            try:
+                on_entry(
+                    strategy="momentum",
+                    side=entry_side,
+                    indicator="tape+imbalance",
+                    qty=qty,
+                    price=price,
+                )
+            except Exception as cb_err:
+                logger.error("[MOM][CB][on_entry] %s", cb_err)
         tg_send(
             f"⚡ <b>MOMENTUM</b> {SYMBOL}\n"
             f"Side: <b>{entry_side.upper()}</b> | Qty: <code>{qty}</code>\n"

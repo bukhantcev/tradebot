@@ -1,5 +1,3 @@
-
-
 from typing import Dict
 import math
 
@@ -13,6 +11,7 @@ def run_once(filters, context) -> None:
     Требуется окружение из main.py: logger, tg_send, place_market_order, get_open_position,
     close_position_market, get_wallet_balance, SYMBOL, RISK_PCT, MAX_RISK_USDT, SL_ATR_MULT, TP_R_MULT.
     Чтобы избежать циклического импорта, импортируем внутри функции.
+    Вызывает context["on_entry"] после успешного размещения ордера.
     """
 
     # Late imports to avoid circular deps
@@ -153,6 +152,19 @@ def run_once(filters, context) -> None:
             f"Price: <code>{price:.2f}</code> | SL: <code>{sl_price:.2f}</code> | TP: <code>{tp_price:.2f}</code>\n"
             f"buy_ratio={buy_ratio:.2f} tick={tick_rate:.0f}/m imb={imb:.2f}"
         )
+        # Strategy-level on-entry callback for unified TG/reporting pipeline
+        cb = context.get("on_entry") if isinstance(context, dict) else None
+        if callable(cb):
+            try:
+                cb(
+                    strategy="knife",
+                    side=entry_side,
+                    indicator="SR-density+flow",
+                    qty=qty,
+                    price=price,
+                )
+            except Exception as cb_e:
+                logger.error("[KNIFE][CB][on_entry] failed: %s", cb_e)
     except Exception as e:
         logger.error("[KNIFE][ORDER] failed: %s", e)
         tg_send(f"❌ <b>KNIFE order failed</b> {SYMBOL}\n<code>{e}</code>")

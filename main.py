@@ -1,33 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Scalping strategy from scratch:
-1) Load 1D candles for last 7 days -> detect trend
-2) Load 1H candles for last 72 hours -> confirm trend + detect S/R levels
-3) Trade only in the direction of the trend, entries near levels, always with SL (and optional TP)
-4) Send Telegram notifications for each trade / important event
-
-Bybit v5 REST (linear USDT-margined). Tested on testnet. Requires env:
-  BASE_URL=https://api-testnet.bybit.com
-  API_KEY=...
-  API_SECRET=...
-  SYMBOL=BTCUSDT
-  CATEGORY=linear
-  TELEGRAM_BOT_TOKEN=...
-  TELEGRAM_CHAT_ID=...
-Optional:
-  RISK_PCT=0.01
-  MAX_RISK_USDT=10
-  POLL_SECONDS=10
-  SR_WINDOW=6
-  SR_MIN_TOUCHES=2
-  ATR_WINDOW=14
-  EMA_FAST=20
-  EMA_SLOW=50
-  ENTRY_ATR_THRESH=0.25
-  SL_ATR_MULT=1.0
-  TP_R_MULT=1.0
-"""
 
 import os
 import hmac
@@ -40,6 +10,9 @@ import importlib
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime, timezone
+#
+# Runtime shared context holder so helpers (like close_position_market) can emit notifications
+_RUNTIME_CTX: Dict = {}
 
 import requests
 
@@ -61,6 +34,8 @@ RISK_PCT = float(os.getenv("RISK_PCT", "0.01"))
 MAX_RISK_USDT = float(os.getenv("MAX_RISK_USDT", "10"))
 
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
+SECONDS = int(os.getenv("SECONDS", "5"))
+
 
 SR_WINDOW = int(os.getenv("SR_WINDOW", "6"))           # pivots: neighbors on each side
 SR_MIN_TOUCHES = int(os.getenv("SR_MIN_TOUCHES", "2")) # keep levels with >= touches
@@ -494,6 +469,88 @@ def tg_send(text: str) -> None:
     except Exception as e:
         logger.warning("[TG] send error: %s", e)
 
+# -----------------------
+# Trade lifecycle helpers (for strategies)
+# -----------------------
+def _fmt_ts(ts: Optional[float] = None) -> str:
+    if ts is None:
+        ts = time.time()
+    return datetime.utcfromtimestamp(ts).replace(tzinfo=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+def _last_price() -> float:
+    try:
+        tk = get_ticker(CATEGORY, SYMBOL)
+        # Bybit v5 ticker uses 'lastPrice' for linear
+        p = tk.get("lastPrice") or tk.get("last_price") or tk.get("markPrice") or tk.get("indexPrice")
+        return float(p) if p is not None else 0.0
+    except Exception:
+        return 0.0
+
+def on_strategy_entry(ctx: Dict, strategy: str, side: str, indicator: str, qty: float, price: Optional[float] = None) -> None:
+    """
+    Strategies should call this when they OPEN a position.
+    Records the trade in ctx["current_trade"] and sends a Telegram message.
+    """
+    if price is None or price <= 0:
+        price = _last_price()
+    now_ts = time.time()
+    ctx["current_trade"] = {
+        "strategy": strategy,
+        "side": side,            # 'long' or 'short'
+        "indicator": indicator,  # e.g. 'SR-breakout', 'EMA-pullback'
+        "qty": float(qty),
+        "entry_price": float(price),
+        "entry_ts": now_ts,
+    }
+    msg = (
+        f"🚀 <b>ENTRY</b> {SYMBOL}\n"
+        f"strat: <b>{strategy}</b>\n"
+        f"side: <b>{side.upper()}</b> qty: <code>{qty:.6f}</code>\n"
+        f"price: <code>{price:.2f}</code>\n"
+        f"by: <i>{indicator}</i>\n"
+        f"time: <code>{_fmt_ts(now_ts)}</code>"
+    )
+    tg_send(msg)
+    logger.info("[TRADE][ENTRY] strat=%s side=%s qty=%.6f price=%.2f by=%s", strategy, side, qty, price, indicator)
+
+def on_strategy_exit(ctx: Dict, price: Optional[float] = None, reason: str = "exit") -> None:
+    """
+    Strategies should call this when they CLOSE a position (TP/SL/manual).
+    Computes naive PnL in USDT for USDT-margined linear contracts.
+    """
+    trade = ctx.get("current_trade")
+    if not trade:
+        logger.debug("[TRADE][EXIT] skip: no current_trade in ctx")
+        return
+    if price is None or price <= 0:
+        price = _last_price()
+    now_ts = time.time()
+
+    entry_price = float(trade.get("entry_price", 0.0) or 0.0)
+    qty = float(trade.get("qty", 0.0) or 0.0)
+    side = trade.get("side", "long")
+    strategy = trade.get("strategy", "?")
+    indicator = trade.get("indicator", "?")
+
+    # PnL ≈ (exit - entry) * qty for long; inverse for short (USDT linear)
+    direction = 1.0 if side == "long" else -1.0
+    pnl_usdt = (float(price) - entry_price) * qty * direction
+    pnl_pct = ((float(price) / entry_price - 1.0) * (1 if side == "long" else -1)) * 100.0 if entry_price > 0 else 0.0
+
+    msg = (
+        f"✅ <b>EXIT</b> {SYMBOL} ({reason})\n"
+        f"strat: <b>{strategy}</b> · by: <i>{indicator}</i>\n"
+        f"side: <b>{side.upper()}</b> qty: <code>{qty:.6f}</code>\n"
+        f"entry: <code>{entry_price:.2f}</code> @ {_fmt_ts(trade.get('entry_ts'))}\n"
+        f"exit:  <code>{float(price):.2f}</code> @ {_fmt_ts(now_ts)}\n"
+        f"PnL: <b>{pnl_usdt:+.2f} USDT</b> (<code>{pnl_pct:+.2f}%</code>)"
+    )
+    tg_send(msg)
+    logger.info("[TRADE][EXIT] strat=%s side=%s qty=%.6f entry=%.2f exit=%.2f pnl=%.4f USDT (%+.2f%%) reason=%s",
+                strategy, side, qty, entry_price, float(price), pnl_usdt, pnl_pct, reason)
+    # clear current trade
+    ctx.pop("current_trade", None)
+
 
 # -----------------------
 # Trading helpers
@@ -537,6 +594,12 @@ def place_market_order(side: str, qty: float, stop_loss: Optional[float], take_p
     if res.get("retCode") != 0:
         raise RuntimeError(f"order error: {res}")
     logger.debug("[ORD][OK] id=%s ret=%s", res.get("result", {}).get("orderId"), res.get("retCode"))
+    try:
+        ct = _RUNTIME_CTX.get("current_trade")
+        if ct and not ct.get("entry_price"):
+            ct["entry_price"] = _last_price()
+    except Exception:
+        pass
     return res
 
 
@@ -588,6 +651,11 @@ def close_position_market(side: str, qty: float) -> Optional[str]:
             logger.error("[CLOSE] error: %s", res)
             return None
         logger.debug("[CLOSE][OK] id=%s", res.get("result", {}).get("orderId"))
+        try:
+            if _RUNTIME_CTX.get("current_trade"):
+                on_strategy_exit(_RUNTIME_CTX, price=None, reason="manual/close")
+        except Exception as _e:
+            logger.debug("[CLOSE][NOTICE] on_strategy_exit failed: %s", _e)
         return res.get("result", {}).get("orderId")
     except Exception as e:
         logger.error("[CLOSE] exception: %s", e)
@@ -777,6 +845,9 @@ def choose_strategy_via_ai(features: Dict) -> Dict:
 # -----------------------
 
 def run_once_active_strategy(filters: MarketFilters, active_strategy: str, shared_context: Dict) -> None:
+    # NOTE for strategy authors:
+    # Call shared_context["on_entry"](strategy="name", side="long|short", indicator="...", qty=..., price=optional_fill_price)
+    # and shared_context["on_exit"](price=optional_exit_price, reason="tp|sl|exit") to emit Telegram trade reports.
     logger.debug("[STRAT] tick using %s", active_strategy)
     try:
         runner = _load_strategy_runner(active_strategy)
@@ -795,11 +866,30 @@ def build_shared_context() -> Dict:
     feats = collect_features()
     logger.debug("[CTX] features ready")
     # Keep context minimal but useful to strategies
-    return {
+    ctx = {
         "features": feats,
         "symbol": SYMBOL,
         "category": CATEGORY,
+        # will be filled below
     }
+    # bind entry/exit callbacks for strategies
+    def _on_entry(*, strategy: str, side: str, indicator: str, qty: float, price: Optional[float] = None):
+        return on_strategy_entry(ctx, strategy=strategy, side=side, indicator=indicator, qty=qty, price=price)
+
+    def _on_exit(*, price: Optional[float] = None, reason: str = "exit"):
+        return on_strategy_exit(ctx, price=price, reason=reason)
+
+    ctx["on_entry"] = _on_entry
+    ctx["on_exit"] = _on_exit
+
+    # expose filters & math shortcuts if strategies want them
+    ctx["ema"] = ema
+    ctx["atr"] = atr
+
+    # publish to runtime holder so other helpers (like close_position_market) can notify
+    _RUNTIME_CTX.clear()
+    _RUNTIME_CTX.update(ctx)
+    return ctx
 
 
 def main():
@@ -862,7 +952,7 @@ def main():
         except Exception as e:
             logger.exception("[LOOP] exception: %s", e)
             tg_send(f"⚠️ <b>Loop error</b>\n<code>{e}</code>")
-        time.sleep(POLL_SECONDS)
+        time.sleep(SECONDS)
 
 
 if __name__ == "__main__":

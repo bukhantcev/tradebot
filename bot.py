@@ -462,7 +462,7 @@ async def main():
     session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=SSL_CONTEXT))
 
     # Handlers
-    dp.message.register(lambda m: on_start(m, bot), CommandStart())
+    dp.message.register(on_start, CommandStart())
 
     async def _on_text_wrapper(message: types.Message):
         await on_text(message, session, bot)
