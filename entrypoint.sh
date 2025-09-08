@@ -31,5 +31,5 @@ if [ -f "/app/.env.example" ] && [ ! -f "/app/.env" ]; then
 fi
 
 cd /app
-echo "[ENTRYPOINT] starting bot.py ..."
-exec python bot.py
+echo "[ENTRYPOINT] starting main.py ..."
+exec python main.py
