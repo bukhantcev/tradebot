@@ -95,8 +95,9 @@ def run_once(Filters, ctx: Dict[str, Any]):
         side = "short"; reason = ["vol_ok","near_high","trend_up","overbought"]
 
     if not side:
-        _n(f"🧪 [knife] no-entry: vol_ok={vol_ok} near_low={near_low} near_high={near_high} "
-           f"t1={t1} t5={t5} buy_ratio={buy_ratio:.2f} atr1={atr1:.4f}")
+        # Removed verbose no-entry notification to reduce spam
+        # _n(f"🧪 [knife] no-entry: vol_ok={vol_ok} near_low={near_low} near_high={near_high} "
+        #    f"t1={t1} t5={t5} buy_ratio={buy_ratio:.2f} atr1={atr1:.4f}")
         return
 
     # Risk & sizing
