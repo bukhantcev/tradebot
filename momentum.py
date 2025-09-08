@@ -44,7 +44,6 @@ def run_once(Filters, ctx: Dict[str, Any]):
     # базовые проверки
     if price <= 0 or atr1 <= 0 or atr5 <= 0:
         log.debug("[MOM][no-entry] invalid data price/atr: price=%.4f atr1=%.4f atr5=%.4f", price, atr1, atr5)
-        notify("[momentum] пропуск: некорректные данные (price/ATR).")
         return
 
     # Условия импульса: согласованный тренд M1+M5 и достаточная волатильность
@@ -69,7 +68,6 @@ def run_once(Filters, ctx: Dict[str, Any]):
     equity = float(ctx["get_wallet_balance"]() or 0.0)
     if equity <= 0:
         log.debug("[MOM][no-entry] equity<=0")
-        notify("[momentum] пропуск: equity <= 0.")
         return
 
     risk_usdt = min(p["max_risk_usdt"], max(1.0, equity * p["risk_pct"]))
@@ -94,7 +92,6 @@ def run_once(Filters, ctx: Dict[str, Any]):
 
     if qty < Filters.min_qty and not p.get("allow_min_qty_entry", True):
         log.debug("[MOM][no-entry] qty below min and min-lot not allowed: qty=%.6f min_qty=%.6f", qty, Filters.min_qty)
-        notify(f"[momentum] пропуск: qty<{Filters.min_qty} и запрещён min-лот.")
         return
 
     side = "long" if up else "short"

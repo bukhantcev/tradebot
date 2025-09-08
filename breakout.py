@@ -46,7 +46,6 @@ def run_once(Filters, ctx: Dict[str, Any]):
 
     # ----- базовые проверки -----
     if price <= 0 or atr5 <= 0 or hi is None or lo is None:
-        notify("[BRK][no-entry] пропуск: нет price/ATR5/SR.")
         log.debug("skip: price=%s atr5=%s hi=%s lo=%s", price, atr5, hi, lo)
         return
 
@@ -55,7 +54,6 @@ def run_once(Filters, ctx: Dict[str, Any]):
     short_setup = (price < float(lo) and t1 == "down" and t5 == "down" and atr5 >= p["entry_atr_thresh"])
 
     if not (long_setup or short_setup):
-        notify(f"[BRK][no-entry] нет сетапа. price={price:.2f} hi={float(hi):.2f} lo={float(lo):.2f} trends m1/m5={t1}/{t5} ATR5={atr5:.3f} th={p['entry_atr_thresh']}")
         log.debug("no setup: price=%.4f hi=%.4f lo=%.4f t1=%s t5=%s atr5=%.4f th=%.4f",
                   price, float(hi), float(lo), t1, t5, atr5, float(p["entry_atr_thresh"]))
         return
@@ -66,21 +64,18 @@ def run_once(Filters, ctx: Dict[str, Any]):
         side_now = "long" if pos.get("size", 0) > 0 else "short"
         want = "long" if long_setup else "short"
         if side_now == want:
-            notify(f"[BRK][no-entry] уже в позиции {side_now}, добавление запрещено.")
             log.debug("same-side position: side_now=%s want=%s pos=%s", side_now, want, pos)
             return
 
     # риск и размер
     equity = float(ctx["get_wallet_balance"]() or 0.0)
     if equity <= 0:
-        notify("[BRK][no-entry] equity<=0.")
         log.debug("equity<=0: equity=%s", equity)
         return
 
     risk_usdt = min(p["max_risk_usdt"], max(1.0, equity * p["risk_pct"]))
     sl_dist = atr5 * float(p["sl_atr_mult"])
     if sl_dist <= 0:
-        notify("[BRK][no-entry] sl_dist<=0.")
         log.debug("sl_dist<=0: atr5=%s sl_atr_mult=%s", atr5, p["sl_atr_mult"])
         return
 
@@ -96,7 +91,6 @@ def run_once(Filters, ctx: Dict[str, Any]):
         qty = max(qty, adj_qty)
 
     if qty < min_qty and not p.get("allow_min_qty_entry", True):
-        notify(f"[BRK][no-entry] qty<{min_qty} и min-лот запрещён.")
         log.debug("qty below min and not allowed: qty=%.8f min_qty=%.8f", qty, min_qty)
         return
 
@@ -112,7 +106,6 @@ def run_once(Filters, ctx: Dict[str, Any]):
 
     # финальная проверка минимального нотионала после возможных округлений
     if qty * price < min_notional and not p.get("allow_min_qty_entry", True):
-        notify(f"[BRK][no-entry] после округления qty*price<{min_notional}$, вход запрещён.")
         log.debug("post-round notional too small: qty=%.8f price=%.4f notional=%.4f", qty, price, qty * price)
         return
 
