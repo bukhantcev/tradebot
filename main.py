@@ -160,26 +160,27 @@ def place_market_order(side: str, qty: float, stop_loss: float, take_profit: flo
         "symbol": SYMBOL,
         "side": side_bybit,
         "orderType": "Market",
-        "qty": f"{qty:.6f}",
-        "timeInForce": "GoodTillCancel",
+        "qty": f"{qty:.6f}",          # строкой с 6 знаками ок
+        "timeInForce": "IOC",         # для Market лучше IOC
         "reduceOnly": "true" if reduce_only else "false",
-        "isLeverage": "1",
-        "positionIdx": "0",
+        "positionIdx": "0",           # 0 — one-way; 1/2 — hedge
     }
-    if stop_loss and stop_loss > 0:
-        params["slPrice"] = f"{stop_loss:.2f}"
+    # v5: takeProfit/stopLoss вместо tpPrice/slPrice
     if take_profit and take_profit > 0:
-        params["tpPrice"] = f"{take_profit:.2f}"
+        params["takeProfit"] = f"{take_profit:.2f}"
+        params["tpTriggerBy"] = "MarkPrice"
+    if stop_loss and stop_loss > 0:
+        params["stopLoss"] = f"{stop_loss:.2f}"
+        params["slTriggerBy"] = "MarkPrice"
+
     resp = _private_post("/v5/order/create", params)
     try:
         log.debug("[ORDER][req] %s", params)
         log.debug("[ORDER][resp] %s", resp)
         if (resp or {}).get("retCode", 0) != 0:
-            # bubble up error details in logs so hidden failures are visible
             log.warning("[ORDER][error] retCode=%s retMsg=%s",
                         (resp or {}).get("retCode"), (resp or {}).get("retMsg"))
     except Exception:
-        # never crash on logging
         pass
     return resp
 

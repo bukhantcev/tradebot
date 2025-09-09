@@ -107,18 +107,21 @@ def run_once(Filters, ctx: Dict[str, Any]):
     except Exception:
         pass
 
-    # Нотификация перед отправкой
-    notify(
-        f"🟢 [momentum] entry signal: {side}\n"
-        f"price={price:.2f}  qty={qty}\n"
-        f"ATR1={atr1:.2f} ATR5={atr5:.2f}  buy_ratio={buy_ratio:.2f}  tick_rate={tick_rate:.0f}\n"
-        f"SL={sl_price:.2f}  TP={tp_price:.2f}  risk≈{risk_usdt:.2f}$"
-    )
-
-    log.debug("[MOM] FINAL: side=%s qty=%.6f price=%.2f sl=%.2f tp=%.2f", side, qty, price, sl_price, tp_price)
     # Отправка ордера
     try:
         resp = ctx["place_order"](side, qty, stop_loss=sl_price, take_profit=tp_price, reduce_only=False)
+        # Явно проверяем успешность ответа Bybit v5
+        ret = None
+        try:
+            ret = resp.get("retCode") if isinstance(resp, dict) else None
+        except Exception:
+            pass
+        if ret is None:
+            # Если структура другая, оставим поведение как успешное, но залогируем
+            log.debug("[MOM][order-raw] %s", resp)
+        elif ret != 0:
+            raise RuntimeError(f"retCode={ret} retMsg={getattr(resp, 'get', lambda *_: None)('retMsg')}")
+
         log.debug("[MOM][order-ok] %s", resp)
         notify(f"✅ [momentum] ордер отправлен ok: {resp}")
         ctx["on_entry"](strategy="momentum", side=side, indicator="impulse", qty=qty, price=price)
