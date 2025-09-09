@@ -17,6 +17,34 @@ from core.strategies.knife import Knife
 
 log = logging.getLogger("LOOP")
 
+# --- WATCHDOG STATE (strict) ---
+_last_entry_ts = 0.0
+_last_signal_ts = 0.0
+_last_exit_ts = 0.0
+
+def _wd_mark_signal(now_ts: float):
+    global _last_signal_ts
+    _last_signal_ts = now_ts
+
+def _wd_mark_entry(now_ts: float):
+    global _last_entry_ts
+    _last_entry_ts = now_ts
+
+def _wd_mark_exit(now_ts: float):
+    global _last_exit_ts
+    _last_exit_ts = now_ts
+
+def _wd_now():
+    import time
+    return time.time()
+
+def _wd_idle_seconds() -> int:
+    import time
+    last = max(_last_entry_ts, _last_signal_ts, _last_exit_ts)
+    if last <= 0:
+        return 10**9
+    return int(time.time() - last)
+
 # Глобальная ссылка на последнее состояние для сервисных задач завершения
 LAST_STATE = None
 
@@ -111,6 +139,7 @@ def setup_routes(dp, cfg):
                 except Exception as e:
                     log.warning("[STOP] cancel_trading_stop error: %s", e)
                 await state["pm"].close_all(state["ws"].last_price if state["ws"] else None)
+                _wd_mark_exit(_wd_now())
         finally:
             if state["ws"]:
                 await state["ws"].stop()
@@ -118,33 +147,40 @@ def setup_routes(dp, cfg):
 
     async def _idle_watchdog(bot: Bot, chat_id: int):
         cfg = state["cfg"]
-        import time
-        log.info("[WATCHDOG] started (idle=%ds, loss_streak=%d)", cfg["no_trade_timeout_sec"], cfg["loss_streak_requery"])
+        import asyncio, logging
+        log = logging.getLogger("WATCHDOG")
+        ttl = int(cfg["no_trade_timeout_sec"])
+        loss_requery = int(cfg["loss_streak_requery"])
+        log.info("[WATCHDOG] armed (timeout=%ds, loss_streak=%d)", ttl, loss_requery)
+
         while True:
             try:
-                await asyncio.sleep(60)
-                now = time.time()
-                base_ts = state.get("last_trade_ts") or state.get("last_activity_ts") or state.get("ws_start_ts")
-                # Heartbeat
+                await asyncio.sleep(10)
                 pm = state.get("pm")
-                open_flag = pm.is_open() if pm else None
+                open_flag = pm.is_open() if pm else False
                 loss_streak = pm.loss_streak if pm else 0
-                idle = int(now - base_ts) if base_ts else -1
+                idle = _wd_idle_seconds()
                 log.info("[WATCHDOG] tick idle=%ds open=%s loss_streak=%d", idle, open_flag, loss_streak)
 
-                # Idle re-query
-                if base_ts and idle >= cfg["no_trade_timeout_sec"] and (not open_flag):
-                    log.warning("[WATCHDOG] idle %ds >= %d -> requery AI", idle, cfg["no_trade_timeout_sec"])
+                # Idle re-query: только когда FLAT
+                if not open_flag and idle >= ttl:
+                    log.warning("[WATCHDOG] idle timeout %ds reached → rotate strategy", idle)
                     await _rotate_strategy("idle_timeout", bot, chat_id)
-                    state["last_activity_ts"] = now  # reset idle baseline
+                    # Сбросить idle‑счётчик: считаем, что активность была
+                    _wd_mark_exit(_wd_now())
 
                 # Loss streak re-query
-                if pm and pm.loss_streak >= cfg["loss_streak_requery"]:
-                    log.warning("[WATCHDOG] loss streak %d -> requery AI", pm.loss_streak)
+                if open_flag is False and loss_streak >= loss_requery:
+                    log.warning("[WATCHDOG] loss streak %d → rotate strategy", loss_streak)
                     await _rotate_strategy("loss_streak", bot, chat_id)
-                    pm.loss_streak = 0
-            except Exception as e:
-                log.exception("[WATCHDOG] error: %s", e)
+                    if pm:
+                        pm.loss_streak = 0
+                    _wd_mark_exit(_wd_now())
+            except asyncio.CancelledError:
+                log.info("[WATCHDOG] cancelled")
+                break
+            except Exception:
+                log.exception("[WATCHDOG] error loop iteration")
 
     async def _tick_loop(bot: Bot, chat_id: int):
         q = state["ws"].queue()
@@ -160,6 +196,7 @@ def setup_routes(dp, cfg):
                     closed = await state["pm"].check_sl_tp(last)
                     if closed:
                         state["last_trade_ts"] = time.time()
+                        _wd_mark_exit(_wd_now())
                         await bot.send_message(chat_id, f"Позиция закрыта по {'SL' if state['pm'].loss_streak>0 else 'TP'} @ {last:.2f}")
 
                 continue
@@ -185,6 +222,7 @@ def setup_routes(dp, cfg):
                     log.info("[SIGNAL] %s -> %s", state["strategy_name"], signal)
                     # Исполнение: только если FLAT и сигнал enter_*
                     if signal in ("enter_long", "enter_short") and state["pm"] and (not state["pm"].is_open()):
+                        _wd_mark_signal(_wd_now())
                         px = float(d.get("close") or d.get("c") or 0)
                         if signal == "enter_long":
                             await state["pm"].open_long(px)
@@ -193,6 +231,7 @@ def setup_routes(dp, cfg):
                             await state["pm"].open_short(px)
                             await bot.send_message(chat_id, f"Открыт <b>SHORT</b> @ {px:.2f}", parse_mode="HTML")
                         state["last_trade_ts"] = time.time()
+                        _wd_mark_entry(_wd_now())
 
     @router.message(CommandStart())
     async def cmd_start(message: types.Message):
