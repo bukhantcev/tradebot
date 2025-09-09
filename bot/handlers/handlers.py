@@ -17,6 +17,9 @@ from core.strategies.knife import Knife
 
 log = logging.getLogger("LOOP")
 
+# Глобальная ссылка на последнее состояние для сервисных задач завершения
+LAST_STATE = None
+
 def setup_routes(dp, cfg):
     router = Router()
     state = {
@@ -32,18 +35,25 @@ def setup_routes(dp, cfg):
         "idle_task": None,
         "loss_streak": 0,
         "stats": {"recent_high": 0, "recent_low": 0, "atr": 1.0},
+        "ws_start_ts": None,
+        "last_activity_ts": None,
     }
+
+    # Сохраняем ссылку на state для shutdown_cleanup
+    global LAST_STATE
+    LAST_STATE = state
 
     async def _rotate_strategy(reason: str, bot: Bot, chat_id: int):
         cfg = state["cfg"]
-        bybit = state["bybit"]
-        cat = cfg["category"]; sym = cfg["symbol"]
+        import time
+        client = state["bybit"]
         log.info("[ROTATE] reason=%s -> collecting snapshot…", reason)
+        state["last_activity_ts"] = time.time()
 
-        j1 = await bybit.klines(cat, sym, "1", cfg["snap_1m"])
-        j5 = await bybit.klines(cat, sym, "5", cfg["snap_5m"])
-        ob = await bybit.orderbook(cat, sym, 50)
-        bal = await bybit.wallet_balance(cfg["account_type"])
+        j1 = await client.klines(cfg["category"], cfg["symbol"], "1", cfg["snap_1m"])
+        j5 = await client.klines(cfg["category"], cfg["symbol"], "5", cfg["snap_5m"])
+        ob = await client.orderbook(cfg["category"], cfg["symbol"], 50)
+        bal = await client.wallet_balance(cfg["account_type"])
 
         snapshot = {
             "kline_1m": j1,
@@ -61,6 +71,7 @@ def setup_routes(dp, cfg):
         # сброс внутренней метрики
         state["loss_streak"] = 0
         state["last_trade_ts"] = None
+        state["last_activity_ts"] = time.time()
 
     def _make_strategy(name: str, params: dict):
         name = name.strip()
@@ -79,38 +90,61 @@ def setup_routes(dp, cfg):
 
     async def _start_ws(bot: Bot, chat_id: int):
         cfg = state["cfg"]
+        import time
         cat = cfg["category"]; sym = cfg["symbol"]
         state["executor"] = Executor(state["bybit"], cat, sym)
         state["pm"] = PositionManager(sym, cfg["base_order_usdt"], cfg["max_loss_usdt"], state["executor"], cat)
         state["ws"] = BybitPublicStream(sym, cfg["ws_kline_interval"], cfg["testnet"])
         await state["ws"].start()
+        state["ws_start_ts"] = time.time()
+        state["last_activity_ts"] = state["ws_start_ts"]
+        log.info("[WATCHDOG] WS started, timestamps initialized")
         asyncio.create_task(_tick_loop(bot, chat_id))
 
     async def _stop_all(bot: Bot, chat_id: int):
         try:
             if state["pm"] and state["pm"].is_open():
+                # Сначала снимаем биржевые SL/TP, затем закрываем позицию маркетом
+                try:
+                    await state["pm"].ex.cancel_trading_stop()
+                    log.info("[STOP] Exchange SL/TP cancelled")
+                except Exception as e:
+                    log.warning("[STOP] cancel_trading_stop error: %s", e)
                 await state["pm"].close_all(state["ws"].last_price if state["ws"] else None)
         finally:
             if state["ws"]:
                 await state["ws"].stop()
-            await bot.send_message(chat_id, "Торговля остановлена, позиции закрыты.", parse_mode="HTML")
+            await bot.send_message(chat_id, "Торговля остановлена. Все позиции закрыты.", parse_mode="HTML")
 
     async def _idle_watchdog(bot: Bot, chat_id: int):
         cfg = state["cfg"]
+        import time
+        log.info("[WATCHDOG] started (idle=%ds, loss_streak=%d)", cfg["no_trade_timeout_sec"], cfg["loss_streak_requery"])
         while True:
-            await asyncio.sleep(60)
-            if state["pm"] and not state["pm"].is_open():
-                # нет сделок 5 минут?
-                import time
-                if state["last_trade_ts"] and time.time() - state["last_trade_ts"] >= cfg["no_trade_timeout_sec"]:
-                    log.info("[WATCHDOG] idle %ds -> requery AI", cfg["no_trade_timeout_sec"])
-                    await _rotate_strategy("idle_5m", bot, chat_id)
+            try:
+                await asyncio.sleep(60)
+                now = time.time()
+                base_ts = state.get("last_trade_ts") or state.get("last_activity_ts") or state.get("ws_start_ts")
+                # Heartbeat
+                pm = state.get("pm")
+                open_flag = pm.is_open() if pm else None
+                loss_streak = pm.loss_streak if pm else 0
+                idle = int(now - base_ts) if base_ts else -1
+                log.info("[WATCHDOG] tick idle=%ds open=%s loss_streak=%d", idle, open_flag, loss_streak)
 
-            # 2 убыточные подряд
-            if state["pm"] and state["pm"].loss_streak >= cfg["loss_streak_requery"]:
-                log.info("[WATCHDOG] loss streak %d -> requery AI", state["pm"].loss_streak)
-                await _rotate_strategy("loss_streak", bot, chat_id)
-                state["pm"].loss_streak = 0
+                # Idle re-query
+                if base_ts and idle >= cfg["no_trade_timeout_sec"] and (not open_flag):
+                    log.warning("[WATCHDOG] idle %ds >= %d -> requery AI", idle, cfg["no_trade_timeout_sec"])
+                    await _rotate_strategy("idle_timeout", bot, chat_id)
+                    state["last_activity_ts"] = now  # reset idle baseline
+
+                # Loss streak re-query
+                if pm and pm.loss_streak >= cfg["loss_streak_requery"]:
+                    log.warning("[WATCHDOG] loss streak %d -> requery AI", pm.loss_streak)
+                    await _rotate_strategy("loss_streak", bot, chat_id)
+                    pm.loss_streak = 0
+            except Exception as e:
+                log.exception("[WATCHDOG] error: %s", e)
 
     async def _tick_loop(bot: Bot, chat_id: int):
         q = state["ws"].queue()
@@ -139,6 +173,10 @@ def setup_routes(dp, cfg):
                 s["recent_high"] = max(s.get("recent_high", 0), h)
                 s["recent_low"] = min(s.get("recent_low", h), l) if s.get("recent_low") else l
                 s["atr"] = 0.9 * s.get("atr", 1.0) + 0.1 * (h - l)
+
+                import time
+                state["last_activity_ts"] = time.time()
+                log.debug("[WATCHDOG] activity at bar close ts=%s", d.get("start") or d.get("timestamp"))
 
                 # стратегия даёт сигнал
                 strat = state["strategy"]
@@ -169,6 +207,16 @@ def setup_routes(dp, cfg):
         await _start_ws(message.bot, message.chat.id)
         if not state["idle_task"] or state["idle_task"].done():
             state["idle_task"] = asyncio.create_task(_idle_watchdog(message.bot, message.chat.id))
+            log.info("[WATCHDOG] task launched")
+
+    @router.message(Command("старт"))
+    async def cmd_trade_start_ru(message: types.Message):
+        await message.answer("Запускаю торговлю…")
+        await _rotate_strategy("manual_start", message.bot, message.chat.id)
+        await _start_ws(message.bot, message.chat.id)
+        if not state["idle_task"] or state["idle_task"].done():
+            state["idle_task"] = asyncio.create_task(_idle_watchdog(message.bot, message.chat.id))
+            log.info("[WATCHDOG] task launched")
 
     @router.message(F.text.lower() == "стоп")
     async def cmd_stop(message: types.Message):
@@ -216,3 +264,35 @@ def setup_routes(dp, cfg):
 
     dp.include_router(router)
     log.info("[ROUTES] handlers registered")
+
+async def shutdown_cleanup(bot: Bot):
+    """Грациозная остановка при завершении процесса: снять биржевые SL/TP, закрыть позицию и остановить WS.
+    Ничего не отправляет в Telegram.
+    """
+    state = LAST_STATE
+    if not state:
+        logging.getLogger("LOOP").info("[SHUTDOWN] no state to cleanup")
+        return
+    try:
+        pm = state.get("pm")
+        ws = state.get("ws")
+        if pm and pm.is_open():
+            try:
+                await pm.ex.cancel_trading_stop()
+                log.info("[SHUTDOWN] Exchange SL/TP cancelled")
+            except Exception as e:
+                log.warning("[SHUTDOWN] cancel_trading_stop error: %s", e)
+            try:
+                await pm.close_all(ws.last_price if ws else None)
+                log.info("[SHUTDOWN] Position closed by market")
+            except Exception as e:
+                log.warning("[SHUTDOWN] close_all error: %s", e)
+    finally:
+        try:
+            ws = state.get("ws")
+            if ws:
+                await ws.stop()
+                log.info("[SHUTDOWN] WS stopped")
+        except Exception as e:
+            log.warning("[SHUTDOWN] WS stop error: %s", e)
+        log.info("[SHUTDOWN] cleanup done")

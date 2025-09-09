@@ -4,6 +4,7 @@ import hashlib
 import httpx
 import logging
 import json
+from urllib.parse import urlencode
 
 log = logging.getLogger("BYBIT")
 
@@ -18,38 +19,78 @@ class BybitClient:
         self.http = httpx.AsyncClient(timeout=15)
 
     async def _signed(self, method: str, path: str, params: dict | None = None, body: dict | None = None):
+        method_u = method.upper()
         params = params or {}
         body = body or {}
+
         ts = str(int(time.time() * 1000))
         recv = "5000"
-        # Build string to sign per Bybit v5: ts + api_key + recv_window + (query_string OR body_json)
-        query_string = str(httpx.QueryParams(params)) if params else ""
-        body_json = json.dumps(body, separators=(",", ":"), ensure_ascii=False) if body else ""
-        to_sign = query_string if method.upper() == "GET" else body_json
-        payload = ts + self.api_key + recv + to_sign
-        sign = hmac.new(self.api_secret, payload.encode(), hashlib.sha256).hexdigest()
+
+        # Canonical query (lexicographically sorted, urlencoded, no leading '?')
+        canonical_query = urlencode(sorted(params.items()), doseq=True) if params else ""
+
+        # Canonical body (sorted keys, compact separators) only for methods with body
+        if method_u in {"POST", "PUT", "PATCH", "DELETE"} and body:
+            canonical_body = json.dumps(body, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        else:
+            canonical_body = ""
+
+        # Sign payload: ts + api_key + recv_window + query + body
+        payload = ts + self.api_key + recv + canonical_query + canonical_body
+        sign = hmac.new(self.api_secret, payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+        # ---- debug snapshot for 10004 diagnostics
+        _dbg = {
+            "ts": ts,
+            "api_key_prefix": (self.api_key[:6] + "…"),
+            "recv": recv,
+            "canonical_query": canonical_query,
+            "canonical_body": canonical_body,
+            "payload_preview": (payload[:200] + ("…[truncated]" if len(payload) > 200 else "")),
+            "signature": sign,
+        }
+
+        log.debug(
+            "[BYBIT SIGN] %s %s | qs='%s' body_len=%d",
+            method_u, path, canonical_query, len(canonical_body)
+        )
 
         headers = {
             "X-BAPI-API-KEY": self.api_key,
             "X-BAPI-TIMESTAMP": ts,
             "X-BAPI-RECV-WINDOW": recv,
             "X-BAPI-SIGN": sign,
+            "X-BAPI-SIGN-TYPE": "2",
             "Content-Type": "application/json",
         }
-        headers["X-BAPI-SIGN-TYPE"] = "2"
-        url = self.base + path
+
+        # Build URL with canonical query to ensure it matches the signed string
+        url = self.base + path + (("?" + canonical_query) if canonical_query else "")
         req_kwargs = {"headers": headers}
-        if method.upper() == "GET":
-            req_kwargs["params"] = params
-        else:
-            req_kwargs["json"] = body
-        r = await self.http.request(method, url, **req_kwargs)
+        # For signed POST-like calls, send the exact canonical body bytes (sorted keys, compact) to match signature
+        if method_u in {"POST", "PUT", "PATCH", "DELETE"} and canonical_body:
+            req_kwargs["content"] = canonical_body.encode("utf-8")
+
+        log.debug("[BYBIT REQ] %s %s | url=%s | body='%s'", method_u, path, url, canonical_body if canonical_body else "")
+
+        r = await self.http.request(method_u, url, **req_kwargs)
         r.raise_for_status()
         j = r.json()
         if j.get("retCode") != 0:
-            log.error("Bybit error %s %s: %s", method, path, j)
+            # Extra diagnostics for signature issues
+            if j.get("retCode") == 10004:
+                log.error("Bybit SIGNATURE MISMATCH (%s %s): %s | debug=%s", method_u, path, j, _dbg)
+            else:
+                log.error("Bybit error %s %s: %s", method_u, path, j)
             raise RuntimeError(j)
         return j
+
+    async def query_api_key(self):
+        """
+        Helper for debugging: signed GET to Bybit to verify that keys, recvWindow and signature formatting are valid.
+        Docs: GET /v5/user/query-api
+        """
+        return await self._signed("GET", "/v5/user/query-api")
 
     async def public(self, path: str, params: dict | None = None):
         url = self.base + path

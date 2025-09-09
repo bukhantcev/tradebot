@@ -12,7 +12,8 @@ You are a quant trading assistant. You must pick exactly ONE strategy name based
 - Knife
 
 Return ONLY a strict JSON:
-{"strategy": "<one_of_the_above>", "reason": "<short_reason>"}"""
+{"strategy": "<one_of_the_above>", "reason": "<short_reason>"}
+учти что я торгую скальпингом на минутных свечах. short_reason на русском языке. """
 
 def _build_user_prompt(snapshot: dict) -> str:
     # компактный снапшот: цены, волатильность, объемы, стакан

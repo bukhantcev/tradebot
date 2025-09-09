@@ -1,4 +1,4 @@
-from bot.handlers.handlers import setup_routes
+from bot.handlers.handlers import setup_routes, shutdown_cleanup
 import asyncio
 import logging
 from aiogram import Bot, Dispatcher, __version__ as aiogram_version
@@ -9,7 +9,6 @@ async def main():
 
     cfg = load_config()
     logger.info("[MAIN] Bot starting…")
-    print("[MAIN] Bot starting…")
     logger.info("[MAIN] aiogram=%s", aiogram_version)
 
     # Basic config sanity
@@ -42,6 +41,10 @@ async def main():
     except Exception:
         logger.exception("[MAIN] start_polling failed")
     finally:
+        try:
+            await shutdown_cleanup(bot)
+        except Exception:
+            logger.exception("[MAIN] shutdown_cleanup error")
         await bot.session.close()
 
 if __name__ == "__main__":
