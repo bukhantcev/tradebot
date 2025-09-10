@@ -105,7 +105,7 @@ class PositionManager:
             sl = await self._round_to_tick(last_price - R)
             tp_virtual = await self._round_to_tick(last_price + 2 * R)
 
-            ok_sl = await self.ex.set_stop_loss(stop_loss=sl)
+            ok_sl = await self.ex.set_stop_loss(stop_loss=sl, desired_side="LONG")
 
             self.state.sl_price = sl                 # реальный SL (биржа)
             self.state.tp_price = tp_virtual         # виртуальный TP
@@ -135,7 +135,7 @@ class PositionManager:
             sl = await self._round_to_tick(last_price + R)
             tp_virtual = await self._round_to_tick(last_price - 2 * R)
 
-            ok_sl = await self.ex.set_stop_loss(stop_loss=sl)
+            ok_sl = await self.ex.set_stop_loss(stop_loss=sl, desired_side="SHORT")
 
             self.state.sl_price = sl                 # реальный SL (биржа)
             self.state.tp_price = tp_virtual         # виртуальный TP
@@ -167,7 +167,7 @@ class PositionManager:
         # 1) Виртуальный TP сработал → трейлим SL на TP и считаем следующий виртуальный TP.
         if side == "LONG" and tp is not None and last_price >= tp:
             new_sl = await self._round_to_tick(max(sl if sl is not None else tp, tp))
-            ok = await self.ex.set_stop_loss(stop_loss=new_sl)
+            ok = await self.ex.set_stop_loss(stop_loss=new_sl, desired_side="LONG")
             next_tp = await self._round_to_tick(tp + R)
             self.state.sl_price = new_sl
             self.state.tp_price = next_tp
@@ -177,7 +177,7 @@ class PositionManager:
 
         if side == "SHORT" and tp is not None and last_price <= tp:
             new_sl = await self._round_to_tick(min(sl if sl is not None else tp, tp))
-            ok = await self.ex.set_stop_loss(stop_loss=new_sl)
+            ok = await self.ex.set_stop_loss(stop_loss=new_sl, desired_side="SHORT")
             next_tp = await self._round_to_tick(tp - R)
             self.state.sl_price = new_sl
             self.state.tp_price = next_tp
