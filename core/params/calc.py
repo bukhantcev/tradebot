@@ -40,8 +40,8 @@ def build_params() -> dict:
             "imbalance_threshold": 1.5,
         },
         "Knife": {
-            "impulse_atr_mult": 2.0,
-            "volume_spike_mult": 2.0,
-            "cooldown_bars": 1,
+            "impulse_atr_mult": 1.4,   # было 2.0 — ниже порог импульса по ATR
+            "volume_spike_mult": 1.5,  # было 2.0 — чаще допускаем вход по объёму
+            "cooldown_bars": 0,        # было 1 — можно входить подряд без паузы
         }
     }
