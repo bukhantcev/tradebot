@@ -1,51 +1,29 @@
-from bot.handlers.handlers import setup_routes, shutdown_cleanup
 import asyncio
-import logging
-from aiogram import Bot, Dispatcher, __version__ as aiogram_version
-from config import load_config
-from logger import logger
+from config import CFG
+from log import log
+from bot import dp, bot, trader
 
 async def main():
+    log("=== Scalper bot starting ===")
 
-    cfg = load_config()
-    logger.info("[MAIN] Bot starting…")
-    logger.info("[MAIN] aiogram=%s", aiogram_version)
-
-    # Basic config sanity
-    if not cfg.get("telegram_token"):
-        logger.error("[MAIN] TELEGRAM_BOT_TOKEN is empty. Check your .env")
+    if not CFG.tg_token:
+        log("[FATAL] TG_BOT_TOKEN не задан — бот не сможет запуститься.")
         return
+    if CFG.tg_chat_id == 0:
+        log("[WARN] TG_CHAT_ID=0 — привяжу автоматически при /start_trade.")
+    if not CFG.bybit_key or not CFG.bybit_secret:
+        log("[WARN] BYBIT ключи не заданы — /balance и торговля не будут работать до их установки.")
 
-    bot = Bot(token=cfg["telegram_token"])
-    dp = Dispatcher()
-
-    # Ensure polling gets updates if a webhook was set earlier
+    # прединициализация фильтров/плеча
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        logger.info("[MAIN] Webhook deleted (drop_pending_updates=True)")
-    except Exception:
-        logger.exception("[MAIN] Failed to delete webhook")
+        await trader.load_filters_and_set_leverage()
+    except Exception as e:
+        await trader.notify(f"⚠️ Ошибка инициализации Bybit: {e}")
 
-    # Try to validate token early
-    try:
-        me = await bot.get_me()
-        logger.info("[MAIN] Authorized as @%s id=%s", me.username, me.id)
-    except Exception:
-        logger.exception("[MAIN] Telegram token validation failed (get_me)")
-        return
-
-    setup_routes(dp, cfg)
-
-    try:
-        await dp.start_polling(bot)
-    except Exception:
-        logger.exception("[MAIN] start_polling failed")
-    finally:
-        try:
-            await shutdown_cleanup(bot)
-        except Exception:
-            logger.exception("[MAIN] shutdown_cleanup error")
-        await bot.session.close()
+    await dp.start_polling(bot, allowed_updates=["message"])
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
