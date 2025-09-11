@@ -31,8 +31,22 @@ async def cmd_start(message: types.Message):
 
 @dp.message(Command("stop"))
 async def cmd_stop(message: types.Message):
-    await trader.stop()
-    await message.answer("Trader stopped")
+    await message.answer("⏹ Останавливаюсь…")
+    # Останавливаем трейдер и закрываем всё, затем ЖЁСТКО завершаем процесс
+    try:
+        await trader.stop()
+    except Exception as e:
+        log.error(f"[TG]/stop trader.stop() error={e}")
+    try:
+        # Закрываем HTTP-сессию бота, чтобы не висели коннекты
+        await bot.session.close()
+    except Exception as e:
+        log.error(f"[TG]/stop bot.session.close error={e}")
+    # Небольшая пауза, чтобы логи успели записаться
+    await asyncio.sleep(0.2)
+    # Жёстко завершаем процесс, чтобы гарантированно перезапуститься извне (systemd/pm2/docker и т.п.)
+    import os
+    os._exit(0)
 
 @dp.message(Command("status"))
 async def cmd_status(message: types.Message):
