@@ -1,29 +1,25 @@
 import asyncio
-from config import CFG
+import signal
 from log import log
-from bot import dp, bot, trader
+from bot import dp, bot
+from trader import trader
 
 async def main():
-    log("=== Scalper bot starting ===")
+    log.info("[LIFECYCLE] trader loop starting")
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
 
-    if not CFG.tg_token:
-        log("[FATAL] TG_BOT_TOKEN не задан — бот не сможет запуститься.")
-        return
-    if CFG.tg_chat_id == 0:
-        log("[WARN] TG_CHAT_ID=0 — привяжу автоматически при /start_trade.")
-    if not CFG.bybit_key or not CFG.bybit_secret:
-        log("[WARN] BYBIT ключи не заданы — /balance и торговля не будут работать до их установки.")
+    def _stop():
+        log.info("[LIFECYCLE] stopping")
+        stop_event.set()
 
-    # прединициализация фильтров/плеча
-    try:
-        await trader.load_filters_and_set_leverage()
-    except Exception as e:
-        await trader.notify(f"⚠️ Ошибка инициализации Bybit: {e}")
+    loop.add_signal_handler(signal.SIGINT, _stop)
+    loop.add_signal_handler(signal.SIGTERM, _stop)
 
-    await dp.start_polling(bot, allowed_updates=["message"])
+    asyncio.create_task(trader.start())
+    await dp.start_polling(bot, handle_signals=False, stop_event=stop_event)
+    await trader.stop()
+    await bot.session.close()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(main())

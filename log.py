@@ -1,28 +1,13 @@
 import logging
-from typing import Any
+import sys
 
-logger = logging.getLogger("scalper")
-if not logger.handlers:
+def setup_logger() -> logging.Logger:
+    logger = logging.getLogger("scalper")
     logger.setLevel(logging.INFO)
-    _h = logging.StreamHandler()
-    _h.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s"))
-    logger.addHandler(_h)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", "%Y-%m-%d %H:%M:%S"))
+    if not logger.handlers:
+        logger.addHandler(handler)
+    return logger
 
-def log(msg: str):
-    try:
-        logger.info(msg)
-    except Exception:
-        print(msg)
-
-def mask(s: str, keep: int = 4) -> str:
-    if not s:
-        return "<empty>"
-    if len(s) <= keep:
-        return "*" * len(s)
-    return s[:keep] + "*" * (len(s) - keep)
-
-def trunc(obj: Any, limit: int = 800) -> str:
-    s = str(obj)
-    if len(s) > limit:
-        return s[:limit] + "…(trunc)"
-    return s
+log = setup_logger()
