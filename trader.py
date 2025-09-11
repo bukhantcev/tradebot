@@ -184,9 +184,9 @@ class Trader:
         while self.running:
             try:
                 await asyncio.sleep(2.0)
-                if time.time() < self.cooldown_until:
-                    await self._manage_open_position()
-                    continue
+                # if time.time() < self.cooldown_until:
+                #     await self._manage_open_position()
+                #     continue
                 if len(self.ind.closes) < max(self.cfg.ema_slow, self.cfg.atr_len) + 5:
                     continue
 
@@ -401,8 +401,9 @@ class Trader:
                     await self.notify(f"⛔ Позиция закрыта (вероятно SL) @ {exit_px:.2f} | pnl/px={pnl:.2f}")
                     self._clear_position()
                     if self.loss_streak >= 2:
-                        self.cooldown_until = time.time() + 60 * self.cfg.cooldown_after_2_losses_min
-                        await self.notify(f"🧊 Кулдаун {self.cfg.cooldown_after_2_losses_min} мин после {self.loss_streak} стопов.")
+                        # self.cooldown_until = time.time() + 60 * self.cfg.cooldown_after_2_losses_min
+                        # await self.notify(f"🧊 Кулдаун {self.cfg.cooldown_after_2_losses_min} мин после {self.loss_streak} стопов.")
+                        pass
 
             except Exception:
                 pass
