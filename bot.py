@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
@@ -23,30 +24,53 @@ kb = ReplyKeyboardMarkup(
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    asyncio.create_task(trader.start())
-    await message.answer(
-        "🚀 Трейдер запущен.\nДоступные кнопки ниже.",
-        reply_markup=kb
-    )
+    # Полный перезапуск трейдера: если уже запущен — аккуратно останавливаем и запускаем заново
+    await message.answer("♻️ Полный перезапуск…", reply_markup=kb)
+    try:
+        # Снимаем возможную ручную паузу
+        try:
+            if getattr(trader, "manual_paused", False):
+                setattr(trader, "manual_paused", False)
+        except Exception:
+            pass
+        if getattr(trader, "is_running", False):
+            try:
+                await trader.stop()
+            except Exception as e:
+                log.error(f"[TG]/start trader.stop() error={e}")
+            # короткая пауза, чтобы освободились ресурсы
+            await asyncio.sleep(0.2)
+        # Стартуем новый цикл трейдера
+        asyncio.create_task(trader.start())
+        await message.answer("🚀 Трейдер запущен. Доступные кнопки ниже.", reply_markup=kb)
+    except Exception as e:
+        log.error(f"[TG]/start error={e}")
+        await message.answer(f"⚠️ Не смог запустить: {e}")
 
 @dp.message(Command("stop"))
 async def cmd_stop(message: types.Message):
-    await message.answer("⏹ Останавливаюсь…")
-    # Останавливаем трейдер и закрываем всё, затем ЖЁСТКО завершаем процесс
+    await message.answer("⏹ Останавливаюсь: закрываю позиции и стоплю цикл…")
+    # 1) Попытаться закрыть все открытые позиции/ордера (best-effort)
     try:
-        await trader.stop()
+        if hasattr(trader, "close_all_positions") and callable(getattr(trader, "close_all_positions")):
+            await trader.close_all_positions()
+        elif hasattr(trader, "close_all") and callable(getattr(trader, "close_all")):
+            await trader.close_all()
+        elif hasattr(trader, "flatten") and callable(getattr(trader, "flatten")):
+            await trader.flatten()
+    except Exception as e:
+        log.error(f"[TG]/stop close_all error={e}")
+    # 2) Остановить торговый цикл
+    try:
+        if hasattr(trader, "stop") and callable(getattr(trader, "stop")):
+            await trader.stop()
+        setattr(trader, "is_running", False)
+        # Флаг ручной паузы, чтобы по /start снова запуститься явным действием
+        setattr(trader, "manual_paused", True)
     except Exception as e:
         log.error(f"[TG]/stop trader.stop() error={e}")
-    try:
-        # Закрываем HTTP-сессию бота, чтобы не висели коннекты
-        await bot.session.close()
-    except Exception as e:
-        log.error(f"[TG]/stop bot.session.close error={e}")
-    # Небольшая пауза, чтобы логи успели записаться
-    await asyncio.sleep(0.2)
-    # Жёстко завершаем процесс, чтобы гарантированно перезапуститься извне (systemd/pm2/docker и т.п.)
-    import os
-    os._exit(0)
+    # 3) НИЧЕГО не перезапускаем и процесс не завершаем — ждём явной /start
+    await message.answer("🛑 Бот остановлен. Позиции закрыты (если были). Для запуска нажми /start.")
 
 @dp.message(Command("status"))
 async def cmd_status(message: types.Message):
@@ -60,7 +84,11 @@ async def cmd_balance(message: types.Message):
     text = None
     try:
         if hasattr(trader, "wallet_text"):
-            text = await trader.wallet_text()  # предполагается корутина
+            fn = getattr(trader, "wallet_text")
+            if inspect.iscoroutinefunction(fn):
+                text = await fn()
+            else:
+                text = fn()
         elif hasattr(trader, "wallet_snapshot"):
             snap = await trader.wallet_snapshot()  # ожидаем dict/str
             text = f"💰 Баланс: {snap}"

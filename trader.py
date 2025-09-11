@@ -50,8 +50,19 @@ class Trader:
                 log.error(f"[LOOP] error={e}")
             await asyncio.sleep(CFG.loop_delay_sec)
 
+    def reset_state(self):
+        """Полный сброс внутренних флагов, чтобы после /start можно было заново входить."""
+        self._last_exec_signal = None
+        self._last_exec_ts = 0.0
+        self._open_sides.clear()
+        self.support = None
+        self.resistance = None
+        self.mode = "FLAT"
+        log.info("[STATE] reset done")
+
     async def stop(self):
         self.running = False
+        self.reset_state()
         log.info("[LIFECYCLE] trader stopping")
 
     def _calc_stop_loss(self, side: str, price: float) -> Optional[float]:
@@ -201,6 +212,83 @@ class Trader:
         except Exception as e:
             log.error(f"[BALANCE] failed: {e}")
             return "n/a"
+
+    async def close_all_positions(self) -> None:
+        """Закрывает все открытые позиции рыночными приказами и шлёт нотификации.
+        - one-way: одна позиция -> отправляем противоположный рыночный ордер на её размер
+        - hedge: закрываем отдельно Buy/Sell через positionIdx (1/2)
+        """
+        try:
+            pos = await bybit.get_positions()
+        except Exception as e:
+            log.error(f"[CLOSEALL] fetch failed: {e}")
+            return
+
+        # Универсальный парсинг списка позиций
+        items = []
+        if isinstance(pos, dict):
+            res = pos.get("result") or {}
+            items = res.get("list") or res.get("positions") or []
+        elif isinstance(pos, list):
+            items = pos
+
+        if not items:
+            log.info("[CLOSEALL] no open positions on exchange")
+            return
+
+        hedge = bool(getattr(CFG, "hedge_mode", False))
+        closed_any = False
+
+        for it in items:
+            try:
+                size = float(str(it.get("size") or it.get("qty") or 0))
+                if size == 0:
+                    continue
+
+                # Определяем сторону текущей позиции
+                side = (it.get("side") or "").strip()
+                if not side:
+                    # fallback по positionIdx
+                    pidx_raw = int(str(it.get("positionIdx") or it.get("position_index") or 0))
+                    side = "Buy" if pidx_raw == 1 else ("Sell" if pidx_raw == 2 else "")
+                if side not in ("Buy", "Sell"):
+                    continue
+
+                opp = "Sell" if side == "Buy" else "Buy"
+                qty = abs(size)
+
+                # В hedge, чтобы закрыть Buy, кладём positionIdx=1 (а не 2), и наоборот
+                if hedge:
+                    pidx = 1 if side == "Buy" else 2
+                else:
+                    pidx = 0
+
+                log.info(f"[CLOSEALL] closing {side} -> mkt {opp} qty={qty} pidx={pidx}")
+                try:
+                    _ = await bybit.place_market_order(
+                        side=opp,
+                        qty=qty,
+                        position_idx=pidx,
+                    )
+                    closed_any = True
+                    await self._safe_call(
+                        self._notify_close,
+                        symbol=CFG.symbol,
+                        side=side,
+                        reason="ручное закрытие через команду /stop"
+                    )
+                except Exception as e:
+                    log.error(f"[CLOSEALL] failed to close {side}: {e}")
+                    continue
+            except Exception:
+                continue
+
+        if closed_any:
+            # локально обнуляем трекинг открытых сторон
+            self._open_sides.clear()
+            log.info("[CLOSEALL] requested for all open sides; local state cleared")
+        else:
+            log.info("[CLOSEALL] nothing to close")
 
 
     async def _current_open_sides(self) -> set:
