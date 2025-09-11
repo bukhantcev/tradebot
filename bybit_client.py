@@ -235,6 +235,7 @@ class BybitClient:
         self,
         sl: Optional[float] = None,
         take_profit: Optional[str] = None,
+        takeProfit: Optional[str] = None,
         trailing_activation: Optional[str] = None,
         trailing_distance: Optional[str] = None,
         position_idx: Optional[int] = None,
@@ -249,6 +250,11 @@ class BybitClient:
         - Если use_trailing == True — отправляем activePrice и trailingStop, значения приходят уже округлёнными строками извне (из trader.py), без пересчёта здесь.
         - take_profit, если передан, уходит как takeProfit.
         """
+        # --- Aliases ---
+        # Allow calling set_trading_stop(takeProfit="...") in addition to take_profit
+        if take_profit is None and takeProfit is not None:
+            take_profit = takeProfit
+
         # use_trailing по умолчанию берём из конфига, если он не задан явно
         if use_trailing is None:
             use_trailing = bool(getattr(self.cfg, "use_trailing", False))
@@ -270,12 +276,11 @@ class BybitClient:
         # Stop Loss
         if sl is not None:
             try:
-                # Нормализация к тик-сайзу, если знаем его
                 v = float(sl)
                 t = float(getattr(self, "tick_size", 0) or 0)
                 if t > 0:
-                    v = round(v / t) * t
-                params["stopLoss"] = ("%.12f" % v).rstrip('0').rstrip('.')
+                    v = fmt_to_step(v, t)
+                params["stopLoss"] = ("%.12f" % float(v)).rstrip('0').rstrip('.')
             except Exception:
                 params["stopLoss"] = str(sl)
 
