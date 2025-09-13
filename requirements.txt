@@ -2,6 +2,6 @@ python-telegram-bot==20.8
 python-dotenv==1.0.1
 pandas==2.2.2
 numpy==1.26.4
-TA-Lib==0.4.32
+TA-Lib==0.6.7
 apscheduler==3.10.4
 pybit==5.7.0
