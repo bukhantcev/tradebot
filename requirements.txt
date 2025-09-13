@@ -1,4 +1,7 @@
-aiogram==3.18.0
-aiohttp==3.9.5
-aiosqlite==0.20.0
+python-telegram-bot==20.8
 python-dotenv==1.0.1
+pandas==2.2.2
+numpy==1.26.4
+TA-Lib==0.4.32
+apscheduler==3.10.4
+pybit==5.7.0
