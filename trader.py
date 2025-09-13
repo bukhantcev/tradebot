@@ -1,450 +1,276 @@
-import time
 import asyncio
-from typing import Optional, Tuple
-
-from config import CFG
+from typing import Optional
 from log import log
+from config import CFG
+from db import db
 from bybit_client import bybit
-from sr import find_sr
-from strategy import detect_mode, trade_signal
+import strategy as strat
 
-
-def _round_to_tick(value: float, tick: float) -> float:
-    if tick <= 0:
-        return value
-    # округляем вниз для лонга (ниже цены) и вверх для шорта будем делать снаружи
-    return (int(value / tick)) * tick
-
+from aiogram import Bot
 
 class Trader:
-    def __init__(self):
-        self.running: bool = False
-        self.support: Optional[float] = None
-        self.resistance: Optional[float] = None
-        self.mode: str = "FLAT"
+    def __init__(self, bot: Bot):
+        self.bot = bot
+        self.running = False
+        self.tasks: list[asyncio.Task] = []
+        self.last_1m_close_ts: int | None = None
+        self.last_5m_close_ts: int | None = None
+        self.tick_size: float = 0.1
+        self.s5: float | None = None
+        self.r5: float | None = None
 
-        # анти-спам по входам: исполняем только на смене сигнала + пауза
-        self._last_exec_signal: Optional[str] = None
-        self._last_exec_ts: float = 0.0
 
-        # трекинг факта открытой позиции на бирже (для синхронизации и нотификаций о внешнем закрытии)
-        self._open_sides = set()  # hedge: {'Buy','Sell'}, one-way: {'ONEWAY'}
+    async def preload(self):
+        # meta
+        meta = await bybit.instruments_info(CFG.symbol)
+        try:
+            price_filter = meta["result"]["list"][0]["priceFilter"]
+            self.tick_size = float(price_filter["tickSize"])
+        except Exception:
+            self.tick_size = 0.1
+        log.info("[META] tickSize=%s", self.tick_size)
 
-        # настройки с дефолтами, если нет в CFG
-        self._entry_cooldown_sec: float = float(getattr(CFG, "min_entry_interval_sec", 20))
-        self._sl_offset_ticks: int = int(getattr(CFG, "sl_offset_ticks", 5))  # на сколько тиков за SR ставить SL
-        self._sl_pct: float = float(getattr(CFG, "sl_pct", 0.0))              # если >0, стоп по % от цены
-        self._notify_open = None
-        self._notify_close = None
+        # set leverage (ignore "not modified")
+        await bybit.set_leverage(CFG.leverage)
+
+        # preload candles
+        k5 = await bybit.kline("5", 200)
+        k1 = await bybit.kline("1", 300)
+        rows5 = []
+        for r in k5["result"]["list"]:
+            ts, o,h,l,c,v = int(r[0]), float(r[1]),float(r[2]),float(r[3]),float(r[4]),float(r[5])
+            rows5.append((ts,o,h,l,c,v))
+        rows1 = []
+        for r in k1["result"]["list"]:
+            ts, o,h,l,c,v = int(r[0]), float(r[1]),float(r[2]),float(r[3]),float(r[4]),float(r[5])
+            rows1.append((ts,o,h,l,c,v))
+        await db.upsert_candles("5", rows5)
+        await db.upsert_candles("1", rows1)
+        await db.trim_to("5", 200)
+        await db.trim_to("1", 300)
+        if rows1:
+            self.last_1m_close_ts = rows1[-1][0]
+        if rows5:
+            self.last_5m_close_ts = rows5[-1][0]
+        log.info("[PRELOAD] 5m=%s 1m=%s", len(rows5), len(rows1))
+
+        # initialize 5m SR once after preload
+        candles5_for_sr = await db.fetch_last_n("5", 200)
+        try:
+            s5_init, r5_init, tick_init = strat.calc_sr_5m(candles5_for_sr, CFG.sr5_left, CFG.sr5_right)
+            self.s5, self.r5 = s5_init, r5_init
+            if tick_init:
+                self.tick_size = tick_init
+            log.info("[SR-5m][INIT] support=%s resistance=%s tick=%s", self.s5, self.r5, self.tick_size)
+        except Exception as e:
+            log.warning("[SR-5m][INIT] failed: %s", e)
+
+    async def _candles_updater(self):
+        """
+        Каждые ~10с обновляем 1m, каждые ~60с обновляем 5m. Поддерживаем объём 200/300.
+        """
+        try:
+            while self.running:
+                # 1m
+                k1 = await bybit.kline("1", 5)
+                rows1 = []
+                for r in k1["result"]["list"]:
+                    ts, o,h,l,c,v = int(r[0]), float(r[1]),float(r[2]),float(r[3]),float(r[4]),float(r[5])
+                    rows1.append((ts,o,h,l,c,v))
+                await db.upsert_candles("1", rows1)
+                await db.trim_to("1", 300)
+
+                # 5m каждую минуту
+                if int(asyncio.get_event_loop().time()) % 60 < 10:
+                    k5 = await bybit.kline("5", 5)
+                    rows5 = []
+                    for r in k5["result"]["list"]:
+                        ts, o,h,l,c,v = int(r[0]), float(r[1]),float(r[2]),float(r[3]),float(r[4]),float(r[5])
+                        rows5.append((ts,o,h,l,c,v))
+                    await db.upsert_candles("5", rows5)
+                    await db.trim_to("5", 200)
+
+                await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.exception("[CANDLES] updater crashed: %s", e)
+
+    async def _strategy_loop(self):
+        """
+        Ждём закрытие новой 1m — считаем сигнал.
+        """
+        try:
+            while self.running:
+                candles1 = await db.fetch_last_n("1", 3)
+                # Fetch latest 5m candles for SR change detection
+                candles5_latest = await db.fetch_last_n("5", 3)
+                if candles1:
+                    log.debug("[STRAT] fetched candles -> 1m=%s 5m_last_ts=%s", len(candles1), (candles5_latest[-1][0] if candles5_latest else None))
+                    last_ts = candles1[-1][0]
+                    # Если появился новый закрытый бар (в клайне Bybit list всегда закрытые бары)
+                    if self.last_1m_close_ts is None:
+                        self.last_1m_close_ts = last_ts
+                    elif last_ts != self.last_1m_close_ts:
+                        self.last_1m_close_ts = last_ts
+
+                        # Detect new 5m close and (re)compute 5m SR ONLY on 5m close
+                        if candles5_latest:
+                            last_5m_ts_now = candles5_latest[-1][0]
+                            if self.last_5m_close_ts is None:
+                                self.last_5m_close_ts = last_5m_ts_now
+                            elif last_5m_ts_now != self.last_5m_close_ts:
+                                self.last_5m_close_ts = last_5m_ts_now
+                                candles5_for_sr = await db.fetch_last_n("5", 200)
+                                s5, r5, tick = strat.calc_sr_5m(candles5_for_sr, CFG.sr5_left, CFG.sr5_right)
+                                self.s5, self.r5 = s5, r5
+                                if tick:
+                                    self.tick_size = tick
+                                log.info("[SR-5m] 5m closed -> support=%s resistance=%s tick=%s", s5, r5, self.tick_size)
+
+                        # Compute 1m SR on EVERY 1m close for signals
+                        candles1_for_sr = await db.fetch_last_n("1", 300)
+                        s1, r1 = strat.calc_sr_1m(candles1_for_sr, CFG.sr1_left, CFG.sr1_right)
+
+                        # Minute regime
+                        mode = strat.regime_1m(candles1_for_sr)
+                        log.info("[REGIME-1m] mode=%s price=%s s1=%s r1=%s 1m_close_ts=%s", mode, candles1[-1][4], s1, r1, self.last_1m_close_ts)
+
+                        # Signal on 1m close near 1m levels
+                        sig = strat.signal_on_1m_close(
+                            candles1_for_sr, mode, s1, r1,
+                            touch_pct=CFG.sr1_touch_pct, break_pct=CFG.sr1_break_pct
+                        )
+
+                        if sig:
+                            # Ensure we have 5m SR for SL; if not yet computed, compute once here
+                            if self.s5 is None or self.r5 is None:
+                                candles5_for_sr = await db.fetch_last_n("5", 200)
+                                s5, r5, tick = strat.calc_sr_5m(candles5_for_sr, CFG.sr5_left, CFG.sr5_right)
+                                self.s5, self.r5 = s5, r5
+                                if tick:
+                                    self.tick_size = tick
+                                log.info("[SR-5m][LAZY] support=%s resistance=%s tick=%s", self.s5, self.r5, self.tick_size)
+
+                            sl_preview = strat.compute_sl_exchange("long" if sig == "long" else "short", self.s5, self.r5, self.tick_size)
+                            log.info("[SIG-1m] signal=%s -> will open side=%s sl_preview=%s (tick=%s)", sig, ("Buy" if sig == "long" else "Sell"), sl_preview, self.tick_size)
+                            await self._maybe_trade(sig, self.s5, self.r5, self.tick_size)
+                        else:
+                            log.info("[SIG-1m] no-signal (mode=%s, close=%s)", mode, candles1[-1][4])
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.exception("[STRATEGY] crashed: %s", e)
+
+    async def _maybe_trade(self, signal: str, support: float, resistance: float, tick: float):
+        # Проверяем позицию
+        pos = await bybit.positions()
+        lst = pos.get("result", {}).get("list", [])
+        side_now = lst and lst[0].get("side", "")
+        size_now = float(lst[0].get("size", "0") or "0") if lst else 0.0
+        if size_now > 0 and side_now:
+            log.info("[TRADE] skip: already have open position on exchange (side=%s)", side_now)
+            return
+
+        # Открываем
+        side = "long" if signal == "long" else "short"
+        resp = await bybit.create_order(side, CFG.order_qty)
+        log.debug("[ORDER][raw-response] %r", resp)
+        if resp.get("retCode") != 0:
+            log.error("[ORDER] create failed: retCode=%s retMsg=%s payload=%s",
+                      resp.get("retCode"), resp.get("retMsg"), resp)
+            return
+
+        # Ставим биржевой SL сразу по 5м S/R
+        # positionIdx: 0 (both), 1 (long), 2 (short). Мы ведём net-mode, используем 0.
+        sl_price = strat.compute_sl_exchange(side, support, resistance, tick)
+        log.info("[SL] compute -> side=%s support=%s resistance=%s tick=%s sl=%s", side, support, resistance, tick, sl_price)
+        await bybit.trading_stop(0, sl_price)
+        log.info("[SL] set -> side=%s stopLoss=%s", "Buy" if side=="long" else "Sell", sl_price)
+
+        # Подтверждаем на бирже
+        await asyncio.sleep(1)  # дать бирже обновить позицию
+        pos2 = await bybit.positions()
+        lst2 = pos2.get("result", {}).get("list", [])
+        if lst2 and float(lst2[0].get("size", "0") or "0") > 0 and lst2[0].get("side"):
+            entry = float(lst2[0].get("avgPrice", "0") or lst2[0].get("sessionAvgPrice", "0") or "0")
+            side_ex = lst2[0]["side"]
+            await self.bot.send_message(CFG.tg_admin_chat_id,
+                f"🟢 Открыта позиция\n{CFG.symbol} {side_ex}\nВход: {entry}\nSL(биржевой): {sl_price}")
+            log.info("[CONFIRM-OPEN] confirmed on exchange -> side=%s qty=%s entry=%s", side_ex, lst2[0].get("size"), entry)
+        else:
+            await self.bot.send_message(CFG.tg_admin_chat_id,
+                f"🔴 Позиция НЕ подтверждена на бирже. Проверить вручную.")
+            log.warning("[CONFIRM-OPEN] not found on exchange after order")
 
     async def start(self):
-        log.info("=== Scalper bot starting ===")
-        await bybit.init_symbol_meta()
-        await bybit.set_leverage(CFG.leverage)
-        await bybit.get_total_equity()
+        if self.running:
+            return
         self.running = True
-        while self.running:
+        await bybit.open()
+        await db.open()
+        await self.preload()
+        # Guard: ensure initial 5m SR exists before loops
+        if self.s5 is None or self.r5 is None:
+            candles5_for_sr = await db.fetch_last_n("5", 200)
             try:
-                await self.tick()
+                s5_init, r5_init, tick_init = strat.calc_sr_5m(candles5_for_sr, CFG.sr5_left, CFG.sr5_right)
+                self.s5, self.r5 = s5_init, r5_init
+                if tick_init:
+                    self.tick_size = tick_init
+                log.info("[SR-5m][BOOT] support=%s resistance=%s tick=%s", self.s5, self.r5, self.tick_size)
             except Exception as e:
-                log.error(f"[LOOP] error={e}")
-            await asyncio.sleep(CFG.loop_delay_sec)
-
-    def reset_state(self):
-        """Полный сброс внутренних флагов, чтобы после /start можно было заново входить."""
-        self._last_exec_signal = None
-        self._last_exec_ts = 0.0
-        self._open_sides.clear()
-        self.support = None
-        self.resistance = None
-        self.mode = "FLAT"
-        log.info("[STATE] reset done")
+                log.warning("[SR-5m][BOOT] failed: %s", e)
+        await self.bot.send_message(CFG.tg_admin_chat_id, "✅ Данные подгружены (5m×200, 1m×300). Запускаю демоны/стратегию.")
+        self.tasks = [
+            asyncio.create_task(self._candles_updater(), name="candles_updater"),
+            asyncio.create_task(self._strategy_loop(), name="strategy_loop"),
+        ]
+        log.info("[LIFECYCLE] trader loop started")
 
     async def stop(self):
-        self.running = False
-        self.reset_state()
+        if not self.running:
+            return
         log.info("[LIFECYCLE] trader stopping")
+        self.running = False
+        # останавливаем задачи
+        for t in self.tasks:
+            t.cancel()
 
-    def _calc_stop_loss(self, side: str, price: float) -> Optional[float]:
-        """
-        Рассчитывает SL:
-        - если задан CFG.sl_pct > 0: от цены входа
-        - иначе: от уровней SR с отступом в _sl_offset_ticks
-        Округление к шагу тика внутри.
-        """
-        tick = float(getattr(bybit, "tick_size", 0.1))
-        off_ticks = max(1, self._sl_offset_ticks)
-
-        if self._sl_pct and self._sl_pct > 0:
-            if side == "Buy":
-                raw = price * (1.0 - self._sl_pct)
-                sl = _round_to_tick(raw, tick)  # округляем вниз — безопаснее для триггера
-            else:
-                # для шорта SL выше цены, округляем вверх
-                raw = price * (1.0 + self._sl_pct)
-                sl = _round_to_tick(raw + (tick - 1e-12), tick)
-            return float(sl)
-
-        # по SR
-        if side == "Buy" and self.support is not None:
-            raw = float(self.support) - off_ticks * tick
-            sl = _round_to_tick(raw, tick)
-            return float(sl)
-
-        if side == "Sell" and self.resistance is not None:
-            raw = float(self.resistance) + off_ticks * tick
-            # округлить вверх к тику
-            sl = _round_to_tick(raw + (tick - 1e-12), tick)
-            return float(sl)
-
-        return None
-
-    def _can_execute(self, sig: Optional[str]) -> bool:
-        if not sig or sig == "hold":
-            return False
-        now = time.time()
-        # исполняем только если сигнал изменился или давно не торговали
-        changed = sig != self._last_exec_signal
-        cooled = (now - self._last_exec_ts) >= self._entry_cooldown_sec
-        return changed and cooled
-
-    def set_notifiers(self, open_cb=None, close_cb=None):
-        """Inject async callbacks for Telegram notifications to avoid circular imports."""
-        self._notify_open = open_cb
-        self._notify_close = close_cb
-
-    def _position_idx(self, side: str) -> int:
-        """
-        Bybit v5 positionIdx mapping:
-        - One-way: 0 (side не требуется)
-        - Hedge: 1 для лонга (Buy), 2 для шорта (Sell)
-        """
-        if getattr(CFG, "hedge_mode", False):
-            return 1 if side == "Buy" else 2
-        return 0
-
-    async def _safe_call(self, cb, **kwargs):
-        if cb is None:
-            return
-        try:
-            res = cb(**kwargs)
-            if asyncio.iscoroutine(res):
-                await res
-        except Exception as e:
-            log.error(f"[TG] notify callback failed: {e}")
-
-    async def _enter_with_sl(self, side: str, qty: float, price_for_sl: float):
-        order_res = await bybit.place_market_order(
-            side=side,
-            qty=qty,
-            position_idx=self._position_idx(side)
-        )
-        self._last_exec_signal = "long" if side == "Buy" else "short"
-        self._last_exec_ts = time.time()
-        # отмечаем локально, что позиция ожидаемо открыта
-        if getattr(CFG, "hedge_mode", False):
-            self._open_sides.add(side)
-        else:
-            self._open_sides.add("ONEWAY")
-
-        # посчитать и поставить SL
-        sl = self._calc_stop_loss(side, price_for_sl)
-        if sl is None:
-            log.warning(
-                f"[SL] skip: cannot compute stopLoss side={side} price={price_for_sl} "
-                f"support={self.support} resistance={self.resistance}"
-            )
-            # Notify about position open without SL
-            await self._safe_call(
-                self._notify_open,
-                symbol=CFG.symbol,
-                side=side,
-                qty=str(qty),
-                entry_price=float(price_for_sl),
-                stop_loss=None,
-                take_profit=None,
-                reason=f"{self.mode} сигнал стратегии",
-                expected_exit="по смене режима или ломке уровня",
-                order_id=(order_res.get("result", {}) or {}).get("orderId"),
-                position_idx=self._position_idx(side),
-            )
-            return
-
-        try:
-            await bybit.set_trading_stop_insurance_sl(
-                position_idx=self._position_idx(side),
-                stop_loss=sl,
-                side=(side if getattr(CFG, "hedge_mode", False) else None)
-            )
-            log.info(f"[SL] set -> side={side} stopLoss={sl}")
-        except Exception as e:
-            log.error(f"[SL] failed side={side} stopLoss={sl} err={e}")
-
-        # Telegram notification about the opened position
-        await self._safe_call(
-            self._notify_open,
-            symbol=CFG.symbol,
-            side=side,
-            qty=str(qty),
-            entry_price=float(price_for_sl),
-            stop_loss=float(sl) if sl is not None else None,
-            take_profit=None,
-            reason=f"{self.mode} сигнал стратегии",
-            expected_exit="по смене режима или ломке уровня",
-            order_id=(order_res.get("result", {}) or {}).get("orderId"),
-            position_idx=self._position_idx(side),
-        )
-
-    async def wallet_text(self) -> str:
-        """Возвращает только число баланса, округлённое до 2 знаков (как строка)."""
-        try:
-            eq = await bybit.get_total_equity()
-            # Чистое число
-            if isinstance(eq, (int, float)):
-                return f"{eq:.2f}"
-            # Ответ вида { result: { list: [ { totalEquity: "..." } ] } }
-            if isinstance(eq, dict):
-                res = eq.get("result") or {}
-                lst = res.get("list") or []
-                if lst and isinstance(lst[0], dict) and lst[0].get("totalEquity") is not None:
-                    return f"{float(lst[0]['totalEquity']):.2f}"
-            return "n/a"
-        except Exception as e:
-            log.error(f"[BALANCE] failed: {e}")
-            return "n/a"
-
-    async def close_all_positions(self) -> None:
-        """Закрывает все открытые позиции рыночными приказами и шлёт нотификации.
-        - one-way: одна позиция -> отправляем противоположный рыночный ордер на её размер
-        - hedge: закрываем отдельно Buy/Sell через positionIdx (1/2)
-        """
-        try:
-            pos = await bybit.get_positions()
-        except Exception as e:
-            log.error(f"[CLOSEALL] fetch failed: {e}")
-            return
-
-        # Универсальный парсинг списка позиций
-        items = []
-        if isinstance(pos, dict):
-            res = pos.get("result") or {}
-            items = res.get("list") or res.get("positions") or []
-        elif isinstance(pos, list):
-            items = pos
-
-        if not items:
-            log.info("[CLOSEALL] no open positions on exchange")
-            return
-
-        hedge = bool(getattr(CFG, "hedge_mode", False))
-        closed_any = False
-
-        for it in items:
-            try:
-                size = float(str(it.get("size") or it.get("qty") or 0))
-                if size == 0:
-                    continue
-
-                # Определяем сторону текущей позиции
-                side = (it.get("side") or "").strip()
-                if not side:
-                    # fallback по positionIdx
-                    pidx_raw = int(str(it.get("positionIdx") or it.get("position_index") or 0))
-                    side = "Buy" if pidx_raw == 1 else ("Sell" if pidx_raw == 2 else "")
-                if side not in ("Buy", "Sell"):
-                    continue
-
-                opp = "Sell" if side == "Buy" else "Buy"
-                qty = abs(size)
-
-                # В hedge, чтобы закрыть Buy, кладём positionIdx=1 (а не 2), и наоборот
-                if hedge:
-                    pidx = 1 if side == "Buy" else 2
+        # корректно дождаться завершения всех задач
+        if self.tasks:
+            results = await asyncio.gather(*self.tasks, return_exceptions=True)
+            for t, res in zip(self.tasks, results):
+                name = t.get_name() if hasattr(t, "get_name") else repr(t)
+                if isinstance(res, asyncio.CancelledError):
+                    log.info("[TASK] %s cancelled", name)
+                elif isinstance(res, Exception):
+                    log.warning("[TASK] %s ended with exception: %r", name, res)
                 else:
-                    pidx = 0
+                    log.info("[TASK] %s finished cleanly", name)
 
-                log.info(f"[CLOSEALL] closing {side} -> mkt {opp} qty={qty} pidx={pidx}")
-                try:
-                    _ = await bybit.place_market_order(
-                        side=opp,
-                        qty=qty,
-                        position_idx=pidx,
-                    )
-                    closed_any = True
-                    await self._safe_call(
-                        self._notify_close,
-                        symbol=CFG.symbol,
-                        side=side,
-                        reason="ручное закрытие через команду /stop"
-                    )
-                except Exception as e:
-                    log.error(f"[CLOSEALL] failed to close {side}: {e}")
-                    continue
-            except Exception:
-                continue
+        self.tasks.clear()
 
-        if closed_any:
-            # локально обнуляем трекинг открытых сторон
-            self._open_sides.clear()
-            log.info("[CLOSEALL] requested for all open sides; local state cleared")
+        # закрыть все позиции и убедиться что нет открытых
+        res = await bybit.close_all()
+        if res.get("closed"):
+            log.info("[CLOSEALL] market-close executed")
+            await asyncio.sleep(1.0)
+        # verify
+        pos = await bybit.positions()
+        lst = pos.get("result", {}).get("list", [])
+        size_now = float(lst[0].get("size", "0") or "0") if lst else 0.0
+        if size_now == 0:
+            await self.bot.send_message(CFG.tg_admin_chat_id, "⛔️ Бот остановлен. Открытых позиций нет.")
+            log.info("[STATE] reset done")
         else:
-            log.info("[CLOSEALL] nothing to close")
+            await self.bot.send_message(CFG.tg_admin_chat_id, "⚠️ Бот остановлен, но позиция ещё открыта! Проверь вручную.")
+            log.warning("[STATE] stop but position still open")
 
-
-    async def _current_open_sides(self) -> set:
-        """
-        Возвращает множество открытых сторон по данным биржи:
-        - hedge_mode=False: {'ONEWAY'} если size != 0, иначе пустое множество
-        - hedge_mode=True: подмножество из {'Buy','Sell'} по positionIdx (1=Buy, 2=Sell)
-        """
-        sides = set()
-        try:
-            pos = await bybit.get_positions()
-            items = []
-            if isinstance(pos, dict):
-                res = pos.get("result") or {}
-                items = res.get("list") or res.get("positions") or []
-            elif isinstance(pos, list):
-                items = pos
-            for it in items:
-                try:
-                    size = float(str(it.get("size") or it.get("qty") or 0))
-                    if size == 0:
-                        continue
-                    if not getattr(CFG, "hedge_mode", False):
-                        sides.add("ONEWAY")
-                        break
-                    pidx = int(str(it.get("positionIdx") or it.get("position_index") or 0))
-                    if pidx == 1:
-                        sides.add("Buy")
-                    elif pidx == 2:
-                        sides.add("Sell")
-                    else:
-                        # если Bybit не отдал pidx, пробуем по полю side
-                        s = (it.get("side") or "").strip()
-                        if s in ("Buy", "Sell"):
-                            sides.add(s)
-                except Exception:
-                    continue
-        except Exception as e:
-            log.error(f"[POS] fetch/sides failed: {e}")
-        return sides
-
-    async def _has_open_position(self, side: Optional[str] = None) -> bool:
-        """
-        Проверяет на бирже наличие открытой позиции.
-        - В one-way режиме: любая позиция с size != 0 считается открытой.
-        - В hedge режиме: матчит конкретную сторону через positionIdx (1=Buy, 2=Sell), если side указан.
-        """
-        try:
-            pos = await bybit.get_positions()  # ожидается ответ v5 /positions
-        except Exception as e:
-            log.error(f"[POS] fetch failed: {e}")
-            return False
-
-        try:
-            # Универсальный парсинг: Bybit v5 обычно кладёт позиции в result.list
-            items = []
-            if isinstance(pos, dict):
-                res = pos.get("result") or {}
-                items = res.get("list") or res.get("positions") or []
-            elif isinstance(pos, list):
-                items = pos
-            else:
-                items = []
-
-            if not items:
-                return False
-
-            hedge = bool(getattr(CFG, "hedge_mode", False))
-            # маппинг позиции по side в hedge
-            target_idx = None
-            if hedge and side in ("Buy", "Sell"):
-                target_idx = 1 if side == "Buy" else 2
-
-            for it in items:
-                try:
-                    # допускаем строковые числа
-                    size = float(str(it.get("size") or it.get("qty") or 0))
-                    if size == 0:
-                        continue
-
-                    if not hedge:
-                        # one-way: любая непустая позиция
-                        return True
-
-                    # hedge: сверяем positionIdx
-                    pidx = int(str(it.get("positionIdx") or it.get("position_index") or 0))
-                    if target_idx is None or pidx == target_idx:
-                        return True
-                except Exception:
-                    continue
-
-            return False
-        except Exception as e:
-            log.error(f"[POS] parse failed: {e}")
-            return False
-
-    async def tick(self):
-        kline = await bybit.get_kline_5m(CFG.sr_5m_limit)
-        if not kline or "result" not in kline:
-            return
-
-        # --- синхронизация состояния позиций и нотификация о внешнем закрытии ---
-        try:
-            current_sides = await self._current_open_sides()
-            # если ранее считали, что позиция была, а теперь её нет — это внешнее закрытие (ручное/по стопу)
-            closed_sides = self._open_sides - current_sides
-            for s in closed_sides:
-                human_side = None if s == "ONEWAY" else s
-                log.info(f"[POS] externally closed -> side={human_side or 'one-way'}")
-                await self._safe_call(
-                    self._notify_close,
-                    symbol=CFG.symbol,
-                    side=human_side,
-                    reason="позиция закрыта на бирже (вручную/по стопу)"
-                )
-            # обновляем трекинг (для one-way это либо пусто, либо {'ONEWAY'})
-            self._open_sides = set(current_sides)
-        except Exception as e:
-            log.error(f"[POS] sync failed: {e}")
-
-        klines = kline["result"]["list"]
-        self.support, self.resistance = find_sr(klines)
-        price = float(klines[0][4])
-
-        self.mode = detect_mode(price, self.support, self.resistance)
-        log.info(f"[REGIME] mode={self.mode} price={price} support={self.support} resistance={self.resistance}")
-
-        sig = trade_signal(self.mode, price, self.support, self.resistance)
-
-        # дополнительная защита: сверяемся с биржей — если позиция уже есть, не переоткрываем
-        if sig in ("long", "short"):
-            side = "Buy" if sig == "long" else "Sell"
-            if await self._has_open_position(side if getattr(CFG, "hedge_mode", False) else None):
-                log.info(f"[TRADE] skip: already have open position on exchange (side={side})")
-                # синхронизируем локальный последний сигнал, чтобы не спамить
-                self._last_exec_signal = sig
-                self._last_exec_ts = time.time()
-                # удостоверимся, что локальный трекинг отражает факт открытой позиции
-                if getattr(CFG, "hedge_mode", False):
-                    self._open_sides.add(side)
-                else:
-                    self._open_sides.add("ONEWAY")
-                return
-
-        # анти-спам: только на смене сигнала и после cooldown
-        if not self._can_execute(sig):
-            log.debug(f"[TRADE] skip: sig={sig} last={self._last_exec_signal} "
-                      f"cooldown={self._entry_cooldown_sec:.0f}s")
-            return
-
-        log.info(f"[TRADE] signal -> {sig}")
-
-        if sig == "long":
-            await self._enter_with_sl("Buy", CFG.min_qty, price)
-        elif sig == "short":
-            await self._enter_with_sl("Sell", CFG.min_qty, price)
-
-
-trader = Trader()
+trader: Trader | None = None
+def init_trader(bot: Bot) -> Trader:
+    global trader
+    if trader is None:
+        trader = Trader(bot)
+    return trader

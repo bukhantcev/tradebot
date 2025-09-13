@@ -1,284 +1,302 @@
-import aiohttp
-import asyncio
-import ssl
-import time
-import hashlib
-import hmac
-import json
+import aiohttp, asyncio, hmac, hashlib, time, json
 from typing import Any, Dict, Optional
+from functools import lru_cache
 from config import CFG
 from log import log
 
-
-# Helper to convert bools to "true"/"false" strings in dicts for Bybit API
-def _convert_bools(d: dict | None):
-    if not d:
-        return d
-    out = {}
-    for k, v in d.items():
-        if isinstance(v, bool):
-            out[k] = "true" if v else "false"
-        else:
-            out[k] = v
-    return out
-
-# Note: Tick rounding for stop prices is handled directly inside set_trading_stop_insurance_sl.
+def _sign(payload: str) -> str:
+    return hmac.new(CFG.bybit_api_secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
 class BybitClient:
+
     def __init__(self):
+        base = getattr(CFG, "base_url", None) or getattr(CFG, "bybit_base_url", None) or "https://api.bybit.com"
+        self.base = str(base).rstrip("/")
         self.session: aiohttp.ClientSession | None = None
-        self.tick_size: float = 0.1
-        self.category: str = "linear" if str(CFG.bybit_category).lower() == "linear" else "inverse"
+        self.verify_ssl = CFG.bybit_verify_ssl
+        self._tick_size: Optional[float] = None
 
-    async def _get_session(self) -> aiohttp.ClientSession:
+    async def open(self):
+        """
+        Open aiohttp session (idempotent). Respects CFG.bybit_verify_ssl.
+        Logs endpoint base on success.
+        """
         if self.session and not self.session.closed:
-            return self.session
-        ssl_ctx = None
-        if not CFG.bybit_verify_ssl:
-            log.warning("[HTTP] SSL verification is DISABLED")
-            ssl_ctx = False
-        elif CFG.bybit_ca_bundle:
-            ssl_ctx = ssl.create_default_context(cafile=CFG.bybit_ca_bundle)
-        self.session = aiohttp.ClientSession(base_url=CFG.bybit_base_url, trust_env=True, connector=aiohttp.TCPConnector(ssl=ssl_ctx))
-        return self.session
+            return
+        timeout = aiohttp.ClientTimeout(total=30)
+        connector = aiohttp.TCPConnector(ssl=False) if self.verify_ssl is False else None
+        self.session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+        log.info("[HTTP] session opened -> %s", self.base)
 
-    def _sign(self, payload: str, ts: str) -> str:
-        text = f"{ts}{CFG.bybit_api_key}5000{payload}"
-        return hmac.new(CFG.bybit_api_secret.encode(), text.encode(), hashlib.sha256).hexdigest()
+    async def close(self):
+        """Close aiohttp session (idempotent)."""
+        if self.session:
+            try:
+                await self.session.close()
+                log.info("[HTTP] session closed")
+            finally:
+                self.session = None
 
-    async def _request(self, method: str, path: str, params: Dict[str, Any] | None = None, data: Dict[str, Any] | None = None, auth: bool = True):
-        session = await self._get_session()
-        url = path
-        ts = str(int(time.time() * 1000))
-        headers = {"Content-Type": "application/json"}
-        # Convert bools to "true"/"false" for Bybit API
-        params = _convert_bools(params) if isinstance(params, dict) else params
-        raw_body = None
-        payload_str = ""
-        if method == "GET" and params:
-            payload_str = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-        elif method == "POST":
-            if data is None:
-                payload_str = ""
-                raw_body = ""
-            else:
-                data = _convert_bools(data)
-                payload_str = json.dumps(data, separators=(",", ":"))
-                raw_body = payload_str
+    def _ts_ms(self) -> str:
+        return str(int(time.time() * 1000))
+
+    async def _request(self, method: str, path: str, params: Optional[Dict[str, Any]] = None, body: Optional[Dict[str, Any]] = None, auth: bool = False) -> Dict[str, Any]:
+        """
+        Unified HTTP requester with optional auth/signing for Bybit v5.
+        - Logs outbound/inbound
+        - Honors CFG.bybit_verify_ssl (set False to skip certificate verification)
+        - Retries on network/JSON errors up to 3 times
+        """
+        await self.open()
+        assert self.session is not None
+
+        url = f"{self.base}{path}"
+        params = params or {}
+        data_str = json.dumps(body, separators=(",", ":"), ensure_ascii=False) if body else ""
+        recv_window = "5000"
+
+        headers = {
+            "Content-Type": "application/json",
+        }
+
         if auth:
-            sign = self._sign(payload_str, ts)
+            ts = self._ts_ms()
+            # Bybit v5 sign string: timestamp + apiKey + recvWindow + (queryString for GET) or (body for others)
+            if method.upper() == "GET":
+                # Build canonical query string: key=value joined by '&', keys sorted asc, values as-is (no URL encoding)
+                if params:
+                    parts = [f"{k}={params[k]}" for k in sorted(params.keys())]
+                    qs = "&".join(parts)
+                else:
+                    qs = ""
+                sign_target = qs
+            else:
+                sign_target = data_str
+
+            sign_payload = f"{ts}{CFG.bybit_api_key}{recv_window}{sign_target}"
+            signature = _sign(sign_payload)
             headers.update({
                 "X-BAPI-API-KEY": CFG.bybit_api_key,
                 "X-BAPI-TIMESTAMP": ts,
-                "X-BAPI-SIGN": sign,
-                "X-BAPI-RECV-WINDOW": "5000",
+                "X-BAPI-RECV-WINDOW": recv_window,
+                "X-BAPI-SIGN": signature,
                 "X-BAPI-SIGN-TYPE": "2",
             })
-        for attempt in range(3):
+
+        # for GET, body must be empty string
+        method_up = method.upper()
+        payload_for_log = data_str if data_str else ""
+        log.info("[HTTP ->] %s %s params=%s body=%s", method_up, path, params, payload_for_log)
+
+        # aiohttp SSL param: pass False explicitly to disable verification
+        ssl_param = False if self.verify_ssl is False else None
+
+        tries = 3
+        for attempt in range(1, tries + 1):
             try:
-                log.info(f"[HTTP ->] {method} {path} params={params or {}} body={(payload_str if method=='POST' else '')}")
-                if method == "POST":
-                    async with session.request(method, url, data=raw_body, headers=headers) as resp:
-                        res = await resp.json()
+                if method_up == "GET":
+                    async with self.session.request(method_up, url, params=params, ssl=ssl_param, headers=headers) as resp:
+                        text = await resp.text()
                 else:
-                    async with session.request(method, url, params=params, headers=headers) as resp:
-                        res = await resp.json()
-                log.info(f"[HTTP <-] {method} {path} status={resp.status} retCode={res.get('retCode')} payload={res}")
-                return res
+                    async with self.session.request(method_up, url, params={}, data=data_str, ssl=ssl_param, headers=headers) as resp:
+                        text = await resp.text()
+
+                try:
+                    js = json.loads(text) if text else {}
+                except Exception as jerr:
+                    log.error("[HTTP] JSON parse error: %s text=%s", jerr, text[:500])
+                    raise
+
+                ret_code = js.get("retCode")
+                log.info("[HTTP <-] %s %s status=%s retCode=%s payload=%s", method_up, path, resp.status, ret_code, str(js)[:500])
+                return js
+            except aiohttp.ClientError as e:
+                if attempt >= tries:
+                    log.error("[RETRY] %s %s attempt=%s err=%s", method_up, path, attempt, e)
+                    return {"retCode": -1, "retMsg": str(e)}
+                log.error("[RETRY] %s %s attempt=%s err=%s", method_up, path, attempt, e)
+                await asyncio.sleep(1.0)
             except Exception as e:
-                log.error(f"[RETRY] {method} {path} attempt={attempt+1} error={e}")
-                await asyncio.sleep(1.5 * (attempt + 1))
-        return None
+                if attempt >= tries:
+                    log.error("[RETRY] %s %s attempt=%s err=%s", method_up, path, attempt, e)
+                    return {"retCode": -1, "retMsg": str(e)}
+                log.error("[RETRY] %s %s attempt=%s err=%s", method_up, path, attempt, e)
+                await asyncio.sleep(1.0)
 
-    async def init_symbol_meta(self):
-        res = await self._request("GET", "/v5/market/instruments-info", {"category": self.category, "symbol": CFG.symbol}, auth=False)
+    async def ensure_tick_size(self) -> float:
+        """Fetch and cache tick size for the configured symbol."""
+        if self._tick_size is not None:
+            return self._tick_size
+        info = await self.instruments_info(CFG.symbol)
         try:
-            self.tick_size = float(res["result"]["list"][0]["priceFilter"]["tickSize"])
-            log.info(f"[META] tickSize={self.tick_size}")
+            lst = info.get("result", {}).get("list", [])
+            pf = lst[0]["priceFilter"]
+            self._tick_size = float(pf.get("tickSize") or 0.1)
         except Exception:
-            log.error("[META] failed to parse tickSize")
+            # sane default, but we log it; will work for BTCUSDT testnet (0.1)
+            log.warning("[META] failed to parse tickSize, fallback 0.1")
+            self._tick_size = 0.1
+        log.info("[META] tickSize=%s", self._tick_size)
+        return self._tick_size
 
-    async def get_kline_5m(self, limit: int):
-        return await self._request("GET", "/v5/market/kline", {"category": self.category, "symbol": CFG.symbol, "interval": "5", "limit": limit}, auth=False)
+    async def _round_price(self, price: float) -> float:
+        ts = await self.ensure_tick_size()
+        if ts <= 0:
+            return price
+        # round to nearest multiple of tick size
+        return round(round(price / ts) * ts, 10)
 
-    async def get_wallet_balance(self):
-        return await self._request("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED"}, auth=True)
-
-    async def get_total_equity(self):
-        res = await self.get_wallet_balance()
+    async def _last_price(self) -> Optional[float]:
+        t = await self.tickers()
         try:
-            eq = res["result"]["list"][0]["totalEquity"]
-            log.info(f"[BALANCE] totalEquity={eq}")
-            return float(eq)
+            lst = t.get("result", {}).get("list", [])
+            p = float(lst[0].get("lastPrice"))
+            return p
         except Exception:
-            log.error("[BALANCE] unavailable: unexpected response: %s", res)
-            return 0.0
+            return None
 
-    async def get_coin_equity(self, coin="USDT"):
-        res = await self.get_wallet_balance()
-        for c in res["result"]["list"][0]["coin"]:
-            if c["coin"] == coin:
-                log.info(f"[BALANCE] {coin} equity={c['equity']}")
-                return float(c["equity"])
-        return 0.0
+    async def orderbook(self, limit: int = 1) -> Dict[str, Any]:
+        return await self._request(
+            "GET",
+            "/v5/market/orderbook",
+            {"category": CFG.category, "symbol": CFG.symbol, "limit": limit},
+        )
 
-    async def get_open_orders(self):
-        """Fetch current open orders for the configured symbol."""
-        params = {
-            "category": self.category,
-            "symbol": CFG.symbol,
-        }
-        return await self._request("GET", "/v5/order/realtime", params, auth=True)
-
-    async def get_order_history(self, limit: int = 20):
-        """Fetch recent order history."""
-        params = {
-            "category": self.category,
-            "symbol": CFG.symbol,
-            "limit": limit,
-        }
-        return await self._request("GET", "/v5/order/history", params, auth=True)
-
-    async def get_executions(self, limit: int = 20):
-        """Fetch recent trade executions (fills)."""
-        params = {
-            "category": self.category,
-            "symbol": CFG.symbol,
-            "limit": limit,
-        }
-        return await self._request("GET", "/v5/execution/list", params, auth=True)
-
-    async def get_position_list(self):
-        return await self._request("GET", "/v5/position/list", {"category": self.category, "symbol": CFG.symbol}, auth=True)
-
-    async def get_positions(self, symbol: Optional[str] = None):
+    async def _best_aggressive_price(self, side: str) -> Optional[float]:
         """
-        Backwards-compatible wrapper expected by trader:
-        Returns positions list for the given symbol (defaults to CFG.symbol).
+        For Buy -> take bestAsk and add a small tick buffer.
+        For Sell -> take bestBid and subtract a small tick buffer.
         """
-        params: Dict[str, Any] = {"category": self.category}
-        sym = symbol or CFG.symbol
-        if sym:
-            params["symbol"] = sym
-        res = await self._request("GET", "/v5/position/list", params, auth=True)
+        ob = await self.orderbook(limit=1)
         try:
-            return res["result"]["list"]
+            lst = ob.get("result", {}).get("a" if side == "long" else "b", [])
+            # On Bybit v5, orderbook result is like {"a":[["price","size"]], "b":[["price","size"]]}
+            price_str = lst[0][0]
+            px = float(price_str)
+            tick = await self.ensure_tick_size()
+            # add/subtract 2 ticks to be safely marketable
+            if side == "long":
+                px = px + 2 * tick
+            else:
+                px = px - 2 * tick
+            return await self._round_price(px)
         except Exception:
-            log.error("[POS] unexpected response while fetching positions: %s", res)
-            return []
+            return await self._last_price()
 
-    async def get_live_position(self, symbol: Optional[str] = None) -> Optional[dict]:
+    # ---- endpoints ----
+    async def instruments_info(self, symbol: str) -> Dict[str, Any]:
+        return await self._request("GET", "/v5/market/instruments-info", {"category": CFG.category, "symbol": symbol})
+
+    async def kline(self, interval: str, limit: int) -> Dict[str, Any]:
+        return await self._request("GET", "/v5/market/kline", {"category": CFG.category, "symbol": CFG.symbol, "interval": interval, "limit": limit})
+
+    async def tickers(self) -> Dict[str, Any]:
+        return await self._request("GET", "/v5/market/tickers", {"category": CFG.category, "symbol": CFG.symbol})
+
+    async def positions(self) -> Dict[str, Any]:
+        return await self._request("GET", "/v5/position/list", {"category": CFG.category, "symbol": CFG.symbol}, auth=True)
+
+    async def set_leverage(self, lev: float) -> Dict[str, Any]:
+        body = {"category": CFG.category, "symbol": CFG.symbol, "buyLeverage": str(lev), "sellLeverage": str(lev)}
+        return await self._request("POST", "/v5/position/set-leverage", body=body, auth=True)
+
+    async def create_order(self, side: str, qty: float) -> Dict[str, Any]:
         """
-        Возвращает первую найденную ОТКРЫТУЮ позицию по символу (size>0),
-        либо None если позиций нет. Для hedge:
-          positionIdx=1 -> long (side="Buy"), positionIdx=2 -> short (side="Sell").
+        Try Market IOC first.
+        If 30208 (price guard) or accepted-but-unfilled cases happen frequently, retry once with
+        IOC Limit using aggressive price from best bid/ask with a small tick buffer.
         """
-        sym = symbol or CFG.symbol
-        try:
-            positions = await self.get_positions(sym)
-            if not positions:
-                return None
-            for p in positions:
-                if p.get("symbol") != sym:
-                    continue
-                try:
-                    size = float(p.get("size", 0))
-                except Exception:
-                    size = 0.0
-                if size <= 0:
-                    continue
-                # Determine side from explicit side or positionIdx
-                idx = int(p.get("positionIdx", 0)) if str(p.get("positionIdx", "0")).isdigit() else 0
-                side = p.get("side")
-                if not side:
-                    if idx == 1:
-                        side = "Buy"
-                    elif idx == 2:
-                        side = "Sell"
-                # Parse numeric fields safely
-                try:
-                    avg_price = float(p.get("avgPrice", 0) or 0)
-                except Exception:
-                    avg_price = 0.0
-                return {
-                    "symbol": sym,
-                    "positionIdx": idx,
-                    "side": side,
-                    "size": size,
-                    "avgPrice": avg_price,
-                    "stopLoss": p.get("stopLoss") or "",
-                }
-        except Exception as e:
-            log.error(f"[POS] get_live_position failed: {e}")
-        return None
-
-    async def is_flat(self, symbol: Optional[str] = None) -> bool:
-        """Удобный шорткат: True, если по символу нет открытой позиции на бирже."""
-        return (await self.get_live_position(symbol)) is None
-
-    async def set_leverage(self, leverage: float):
-        payload = {
-            "category": self.category,
+        body_market = {
+            "category": CFG.category,
             "symbol": CFG.symbol,
-            "buyLeverage": str(leverage),
-            "sellLeverage": str(leverage),
-        }
-        return await self._request("POST", "/v5/position/set-leverage", data=payload)
-
-    async def place_market_order(
-        self,
-        *,
-        side: str,
-        qty: str,
-        time_in_force: str = "IOC",
-        reduce_only: bool = False,
-        position_idx: int | None = None,
-    ):
-        body = {
-            "category": self.category,
-            "symbol": CFG.symbol,
-            "side": side,
+            "side": "Buy" if side == "long" else "Sell",
             "orderType": "Market",
             "qty": str(qty),
-            "timeInForce": time_in_force,
+            "timeInForce": "IOC",
         }
-        if reduce_only:
-            body["reduceOnly"] = True  # will be converted to "true" by _convert_bools
-        # Bybit v5: in one-way mode omit positionIdx; in hedge mode use 1 (Long) or 2 (Short)
-        if position_idx in (1, 2):
-            body["positionIdx"] = int(position_idx)
-        return await self._request("POST", "/v5/order/create", data=body)
+        resp = await self._request("POST", "/v5/order/create", body=body_market, auth=True)
+        if resp.get("retCode") == 0:
+            return resp
 
-    async def set_trading_stop_insurance_sl(self, position_idx: int, stop_loss: float, side: Optional[str] = None):
-        """
-        Устанавливает страховочный стоп-лосс через /v5/position/trading-stop.
-        Bybit v5 требует:
-          - positionIdx обязательно:
-              0 = one-way (side не нужен)
-              1 = hedge long (side="Buy")
-              2 = hedge short (side="Sell")
-          - stopLoss строкой с учётом tickSize.
-        """
-        tick = getattr(self, "tick_size", 0.0) or 0.0
-        if tick > 0:
-            stop_loss_val = round(round(stop_loss / tick) * tick, 10)
-        else:
-            stop_loss_val = stop_loss
+        # Market rejected with max price guard: use aggressive IOC-Limit at book price +/- 2 ticks
+        if resp.get("retCode") == 30208:
+            px = await self._best_aggressive_price(side)
+            if px is not None:
+                body_limit = {
+                    "category": CFG.category,
+                    "symbol": CFG.symbol,
+                    "side": "Buy" if side == "long" else "Sell",
+                    "orderType": "Limit",
+                    "qty": str(qty),
+                    "price": str(px),
+                    "timeInForce": "IOC",
+                    "reduceOnly": False,
+                }
+                log.warning("[ORDER] Market rejected (30208). Retrying with IOC Limit at price=%s (aggr book)", px)
+                return await self._request("POST", "/v5/order/create", body=body_limit, auth=True)
 
-        payload = {
-            "category": self.category,
-            "symbol": CFG.symbol,
-            "positionIdx": int(position_idx),
-            "stopLoss": str(stop_loss_val),
+        # otherwise return the original error
+        return resp
+
+    async def wait_position_open(self, tries: int = 6, delay: float = 0.5) -> Optional[Dict[str, Any]]:
+        """
+        Poll /position/list a few times to confirm a position really opened.
+        Returns the first non-zero position dict or None.
+        """
+        for i in range(tries):
+            pos = await self.positions()
+            lst = pos.get("result", {}).get("list", [])
+            if lst:
+                p = lst[0]
+                try:
+                    size = float(p.get("size", "0") or "0")
+                except Exception:
+                    size = 0.0
+                if size > 0:
+                    log.info("[CONFIRM-OPEN] position detected size=%s side=%s avgPrice=%s", size, p.get("side"), p.get("avgPrice"))
+                    return p
+            await asyncio.sleep(delay)
+        log.warning("[CONFIRM-OPEN] not found on exchange after order")
+        return None
+
+    async def trading_stop(self, position_idx: int, stop_loss: float):
+        # Double-check there's a non-zero position before setting SL to avoid 10001.
+        pos = await self.positions()
+        lst = pos.get("result", {}).get("list", [])
+        if not lst:
+            return {"retCode": 10001, "retMsg": "no position to set SL"}
+        try:
+            size = float(lst[0].get("size", "0") or "0")
+        except Exception:
+            size = 0.0
+        if size <= 0:
+            return {"retCode": 10001, "retMsg": "no position to set SL"}
+        body = {
+            "category": CFG.category, "symbol": CFG.symbol,
+            "positionIdx": position_idx,
+            "stopLoss": str(stop_loss),
             "tpslMode": "Full",
             "triggerBy": "LastPrice",
         }
+        return await self._request("POST", "/v5/position/trading-stop", body=body, auth=True)
 
-        if position_idx in (1, 2):
-            if side not in ("Buy", "Sell"):
-                raise ValueError("For hedge positionIdx, side must be 'Buy' or 'Sell'")
-            payload["side"] = side
+    async def close_all(self):
+        # Market-close any position if size != 0
+        pos = await self.positions()
+        lst = pos.get("result", {}).get("list", [])
+        if not lst:
+            return {"closed": False, "reason": "no positions"}
+        p = lst[0]
+        # when in one-way mode, size field may be string; ensure float parsing works
+        size = float(p.get("size", "0") or "0")
+        side = p.get("side", "")
+        if size == 0 or side == "":
+            return {"closed": False, "reason": "flat"}
+        close_side = "short" if side == "Buy" else "long"
+        resp = await self.create_order(close_side, size)
+        return {"closed": True, "resp": resp}
 
-        return await self._request("POST", "/v5/position/trading-stop", data=payload)
+    async def wallet_unified(self) -> Dict[str, Any]:
+        return await self._request("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED"}, auth=True)
 
 bybit = BybitClient()
