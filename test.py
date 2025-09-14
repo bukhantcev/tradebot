@@ -1,5 +1,4 @@
-# Агрессивный скальпинг-бот для Bybit с Telegram управлением
-# ВЫСОКИЙ РИСК — ТЕСТИРОВАТЬ ТОЛЬКО НА TESTNET!
+
 
 import os
 import json
@@ -37,7 +36,10 @@ BYBIT_API_KEY_TEST = os.getenv("BYBIT_API_KEY", "")
 BYBIT_API_SECRET_TEST = os.getenv("BYBIT_API_SECRET", "")
 
 # Telegram
-TELEGRAM_BOT_TOKEN = os.getenv("TG_TOKEN_LOCAL", "")
+if os.getenv("HOST_ROLE", "local") == "local":
+    TELEGRAM_BOT_TOKEN = os.getenv("TG_TOKEN_LOCAL", "")
+else:
+    TELEGRAM_BOT_TOKEN = os.getenv("TG_TOKEN_SERVER", "")
 TELEGRAM_CHAT_ID = os.getenv("TG_ADMIN_CHAT_ID", "")
 
 # Торговые параметры
@@ -611,9 +613,24 @@ class BybitTrader:
                 current_price=float(approx_last),
             )
 
+            # --- ensure TP is on the correct side of the IOC price ---
+            safe_tp = None
+            if pre_tp is not None:
+                tick_meta = self.get_symbol_meta(symbol)
+                tick = tick_meta.get("tick_size", 0.1) or 0.1
+                if sside == "buy":
+                    ceil_ref = max(float(price), float(approx_last), float(ref_entry))
+                    if pre_tp <= ceil_ref:
+                        pre_tp = ceil_ref + tick
+                else:
+                    floor_ref = min(float(price), float(approx_last), float(ref_entry))
+                    if pre_tp >= floor_ref:
+                        pre_tp = floor_ref - tick
+                safe_tp = self.normalize_price(symbol, float(pre_tp))
+
             logging.info(f"[IOC] bps={bps} shift={tick_shift} side={side} qty={qty} price={price} bestBid={bb} bestAsk={ba}")
             try:
-                r = self.client.place_order(
+                params = dict(
                     category="linear",
                     symbol=symbol,
                     side=side,
@@ -622,14 +639,15 @@ class BybitTrader:
                     price=str(price),
                     qty=qty,
                     reduceOnly=False,
-                    # --- TP only at creation; SL handled via trailing ---
-                    takeProfit=(str(pre_tp) if pre_tp is not None else None),
-                    stopLoss=None,
                     tpTriggerBy="LastPrice",
                     slTriggerBy="LastPrice",
                     tpslMode="Full",
                     positionIdx=0,
                 )
+                if safe_tp is not None:
+                    params["takeProfit"] = str(safe_tp)
+                # DO NOT include stopLoss when using trailing later
+                r = self.client.place_order(**params)
                 try:
                     order_id = (r.get("result") or {}).get("orderId")
                 except Exception:
