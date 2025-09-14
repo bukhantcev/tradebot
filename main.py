@@ -15,7 +15,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from pybit.unified_trading import HTTP
 
-# наша аналитическая БД
+# наша аналитическая БД (оставляю твой модуль)
 from test_db import AnalyticsDB, RiskConfig
 
 UTC = timezone.utc
@@ -55,6 +55,7 @@ ATR_PCT_MIN = float(os.getenv("ATR_PCT_MIN", "0.0015"))
 ATR_PCT_BOOST = float(os.getenv("ATR_PCT_BOOST", "0.006"))
 RISK_USDT = float(os.getenv("RISK_USDT", "0"))
 
+# Настройка TP/SL по инструментам (можно править в .env/коде)
 PER_SYMBOL_TPSL = {
     "BTCUSDT": {"mode": "auto"},
     "ETHUSDT": {"mode": "atr", "sl_atr": 1.2, "tp_atr": 2.0, "atr_len": 14},
@@ -65,6 +66,11 @@ PER_SYMBOL_TPSL = {
 # ---------------------- TP/SL HELPER ----------------------
 def compute_tpsl_for_symbol(symbol: str, side: str, entry: float,
                             atr_value: Optional[float], meta: dict) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Унифицированный расчёт SL/TP:
+      - mode=auto: выбор между ATR / тиками / абсолютом в зависимости от волатильности
+      - mode=ticks|atr|abs|rr: жёсткие правила
+    """
     conf = PER_SYMBOL_TPSL.get(symbol)
     if not conf:
         return (None, None)
@@ -142,17 +148,14 @@ class TradingMode(Enum):
     TESTNET = "testnet"
     MAINNET = "mainnet"
 
-
 class OrderSide(Enum):
     BUY = "Buy"
     SELL = "Sell"
-
 
 class BotStatus(Enum):
     STOPPED = "stopped"
     RUNNING = "running"
     ERROR = "error"
-
 
 @dataclass
 class TradeSignal:
@@ -163,7 +166,6 @@ class TradeSignal:
     confidence: float
     strategy_name: str
 
-
 @dataclass
 class Position:
     symbol: str
@@ -172,7 +174,6 @@ class Position:
     entry_price: float
     unrealized_pnl: float
     percentage: float
-
 
 # ---------------------- ANALYZER / STRATEGIES ----------------------
 class TechnicalAnalyzer:
@@ -191,6 +192,12 @@ class TechnicalAnalyzer:
         atr = talib.ATR(high, low, close, timeperiod=14)
 
         price = float(close[-1])
+        atr_val = float(atr[-1]) if atr[-1] == atr[-1] else 0.0  # NaN-safe
+        atr_pct = (atr_val / price) if price > 0 else 0.0
+
+        # детектор «супер-спайка» объёма — сильные новости/шипы пропускаем
+        avg_vol = float(np.mean(volume[-20:])) if len(volume) >= 20 else float(np.mean(volume))
+        super_spike = bool(avg_vol > 0 and volume[-1] > 2.5 * avg_vol)
 
         signals = {
             "rsi_oversold": bool(rsi[-1] < 30),
@@ -201,8 +208,10 @@ class TechnicalAnalyzer:
             "price_below_ema_fast": bool(price < float(ema_fast[-1])),
             "bb_oversold": bool(price < float(bb_lower[-1])),
             "bb_overbought": bool(price > float(bb_upper[-1])),
-            "volume_spike": bool(volume[-1] > float(np.mean(volume[-20:]) * 1.5)),
-            "atr": float(atr[-1]),
+            "volume_spike": bool(volume[-1] > float(avg_vol * 1.5)),
+            "atr": atr_val,
+            "atr_pct_ok": bool(0.0015 <= atr_pct <= 0.0100),
+            "super_spike": super_spike,
         }
 
         return {
@@ -215,10 +224,10 @@ class TechnicalAnalyzer:
                 "ema_slow": float(ema_slow[-1]),
                 "bb_upper": float(bb_upper[-1]),
                 "bb_lower": float(bb_lower[-1]),
-                "atr": float(atr[-1]),
+                "atr": atr_val,
+                "atr_pct": atr_pct,
             },
         }
-
 
 class ScalpingStrategies:
     def __init__(self, analyzer: TechnicalAnalyzer):
@@ -229,74 +238,77 @@ class ScalpingStrategies:
         p = market["price"]
         atr = s["atr"]
 
-        if s["rsi_oversold"] and s["volume_spike"]:
-            return TradeSignal(
-                side=OrderSide.BUY,
-                entry_price=p,
-                stop_loss=p - 1.5 * atr,
-                take_profit=p + 2.0 * atr,
-                confidence=0.7,
-                strategy_name="rsi_mean_reversion_buy",
-            )
-        if s["rsi_overbought"] and s["volume_spike"]:
-            return TradeSignal(
-                side=OrderSide.SELL,
-                entry_price=p,
-                stop_loss=p + 1.5 * atr,
-                take_profit=p - 2.0 * atr,
-                confidence=0.7,
-                strategy_name="rsi_mean_reversion_sell",
-            )
+        # только в зоне «не крайностей» — ловим откат, но не ножи
+        rsi = market["indicators"]["rsi"]
+        if 38 <= rsi <= 62 and s["volume_spike"] and s["atr_pct_ok"] and not s["super_spike"]:
+            if s["price_above_ema_fast"] and not s["bb_overbought"]:
+                return TradeSignal(
+                    side=OrderSide.BUY,
+                    entry_price=p,
+                    stop_loss=p - 1.0 * atr,
+                    take_profit=p + 1.5 * atr,
+                    confidence=0.68,
+                    strategy_name="rsi_mean_reversion_buy",
+                )
+            if s["price_below_ema_fast"] and not s["bb_oversold"]:
+                return TradeSignal(
+                    side=OrderSide.SELL,
+                    entry_price=p,
+                    stop_loss=p + 1.0 * atr,
+                    take_profit=p - 1.5 * atr,
+                    confidence=0.68,
+                    strategy_name="rsi_mean_reversion_sell",
+                )
         return None
 
     def macd_momentum(self, market: Dict) -> Optional[TradeSignal]:
         s = market["signals"]
         p = market["price"]
         atr = s["atr"]
-
-        if s["macd_bullish"] and s["price_above_ema_fast"]:
-            return TradeSignal(
-                side=OrderSide.BUY,
-                entry_price=p,
-                stop_loss=p - 1.0 * atr,
-                take_profit=p + 1.5 * atr,
-                confidence=0.6,
-                strategy_name="macd_momentum_buy",
-            )
-        if s["macd_bearish"] and s["price_below_ema_fast"]:
-            return TradeSignal(
-                side=OrderSide.SELL,
-                entry_price=p,
-                stop_loss=p + 1.0 * atr,
-                take_profit=p - 1.5 * atr,
-                confidence=0.6,
-                strategy_name="macd_momentum_sell",
-            )
+        if s["atr_pct_ok"] and not s["super_spike"]:
+            if s["macd_bullish"] and s["price_above_ema_fast"]:
+                return TradeSignal(
+                    side=OrderSide.BUY,
+                    entry_price=p,
+                    stop_loss=p - 1.0 * atr,
+                    take_profit=p + 1.5 * atr,
+                    confidence=0.62,
+                    strategy_name="macd_momentum_buy",
+                )
+            if s["macd_bearish"] and s["price_below_ema_fast"]:
+                return TradeSignal(
+                    side=OrderSide.SELL,
+                    entry_price=p,
+                    stop_loss=p + 1.0 * atr,
+                    take_profit=p - 1.5 * atr,
+                    confidence=0.62,
+                    strategy_name="macd_momentum_sell",
+                )
         return None
 
     def bb_breakout(self, market: Dict) -> Optional[TradeSignal]:
         s = market["signals"]
         p = market["price"]
         atr = s["atr"]
-
-        if s["bb_overbought"] and s["volume_spike"]:
-            return TradeSignal(
-                side=OrderSide.BUY,
-                entry_price=p,
-                stop_loss=p - 2.0 * atr,
-                take_profit=p + 1.0 * atr,
-                confidence=0.5,
-                strategy_name="bb_breakout_buy",
-            )
-        if s["bb_oversold"] and s["volume_spike"]:
-            return TradeSignal(
-                side=OrderSide.SELL,
-                entry_price=p,
-                stop_loss=p + 2.0 * atr,
-                take_profit=p - 1.0 * atr,
-                confidence=0.5,
-                strategy_name="bb_breakout_sell",
-            )
+        if s["atr_pct_ok"] and s["volume_spike"] and not s["super_spike"]:
+            if s["bb_overbought"]:
+                return TradeSignal(
+                    side=OrderSide.BUY,
+                    entry_price=p,
+                    stop_loss=p - 2.0 * atr,
+                    take_profit=p + 1.0 * atr,
+                    confidence=0.52,
+                    strategy_name="bb_breakout_buy",
+                )
+            if s["bb_oversold"]:
+                return TradeSignal(
+                    side=OrderSide.SELL,
+                    entry_price=p,
+                    stop_loss=p + 2.0 * atr,
+                    take_profit=p - 1.0 * atr,
+                    confidence=0.52,
+                    strategy_name="bb_breakout_sell",
+                )
         return None
 
     def get_best_signal(self, market: Dict) -> Optional[TradeSignal]:
@@ -314,40 +326,8 @@ class ScalpingStrategies:
             return None
         return best
 
-
 # ---------------------- BYBIT TRADER ----------------------
 class BybitTrader:
-    def get_last_price(self, symbol: str) -> Optional[float]:
-        """LastPrice из тикера."""
-        try:
-            r = self.client.get_tickers(category="linear", symbol=symbol)
-            if r.get("retCode") == 0:
-                lst = (r.get("result") or {}).get("list") or []
-                if lst:
-                    return self._safe_float(lst[0].get("lastPrice"))
-        except Exception:
-            pass
-        return None
-
-    def get_order_fill(self, symbol: str, order_id: str) -> Tuple[bool, Optional[float]]:
-        """
-        Проверяем факт исполнения по orderId через историю ордеров.
-        Возвращает (filled, avg_price) где filled=True если cumExecQty > 0.
-        """
-        try:
-            res = self.client.get_order_history(category="linear", symbol=symbol, orderId=order_id, limit=1)
-            if res.get("retCode") != 0:
-                return False, None
-            rows = res.get("result", {}).get("list") or []
-            if not rows:
-                return False, None
-            row = rows[0]
-            cum = self._safe_float(row.get("cumExecQty"))
-            avg = self._safe_float(row.get("avgPrice"))
-            return (cum > 0, (avg if avg > 0 else None))
-        except Exception:
-            return False, None
-
     def __init__(self, api_key: str, api_secret: str, testnet: bool):
         self.client = HTTP(api_key=api_key, api_secret=api_secret, testnet=testnet)
         self.testnet = testnet
@@ -361,6 +341,11 @@ class BybitTrader:
         except Exception:
             return float(default)
 
+    def _tick_decimals(self, tick: float) -> int:
+        s = f"{tick}"
+        return len(s.split(".")[1]) if "." in s else 0
+
+    # ---- meta / state ----
     def get_symbol_meta(self, symbol: str) -> dict:
         """tickSize, qtyStep, minOrderQty, minOrderAmt"""
         try:
@@ -389,10 +374,6 @@ class BybitTrader:
             norm = minq
         return float(f"{norm:.8f}")
 
-    def _tick_decimals(self, tick: float) -> int:
-        s = f"{tick}"
-        return len(s.split(".")[1]) if "." in s else 0
-
     def normalize_price(self, symbol: str, price: float, side: Optional[str] = None, adjust: bool = False) -> float:
         """Квантование цены по тик-сайзу. adjust=True — сдвиг на 1 тик внутрь в пользу исполнения IOC."""
         meta = self.get_symbol_meta(symbol)
@@ -410,48 +391,33 @@ class BybitTrader:
 
         return float(f"{norm:.{dec}f}")
 
-    def _ensure_tp_sl_valid(
-        self,
-        symbol: str,
-        side: str,
-        entry_price: float,
-        stop_loss: Optional[float],
-        take_profit: Optional[float],
-        current_price: Optional[float] = None,
-    ) -> Tuple[Optional[float], Optional[float]]:
-        """
-        Приводим SL/TP к правилам Bybit и нормализуем до тика.
-          Buy:  SL < min(entry, lastPrice), TP > max(entry, lastPrice)
-          Sell: SL > max(entry, lastPrice), TP < min(entry, lastPrice)
-        """
-        meta = self.get_symbol_meta(symbol)
-        tick = meta.get("tick_size", 0.1) or 0.1
-        last = float(current_price) if (current_price is not None and current_price > 0) else float(entry_price)
+    def get_last_price(self, symbol: str) -> Optional[float]:
+        try:
+            r = self.client.get_tickers(category="linear", symbol=symbol)
+            if r.get("retCode") == 0:
+                lst = (r.get("result") or {}).get("list") or []
+                if lst:
+                    return self._safe_float(lst[0].get("lastPrice"))
+        except Exception:
+            pass
+        return None
 
-        if entry_price is None or entry_price <= 0:
-            return (stop_loss, take_profit)
+    def get_order_fill(self, symbol: str, order_id: str) -> Tuple[bool, Optional[float]]:
+        """Проверяем факт исполнения по orderId через историю ордеров."""
+        try:
+            res = self.client.get_order_history(category="linear", symbol=symbol, orderId=order_id, limit=1)
+            if res.get("retCode") != 0:
+                return False, None
+            rows = res.get("result", {}).get("list") or []
+            if not rows:
+                return False, None
+            row = rows[0]
+            cum = self._safe_float(row.get("cumExecQty"))
+            avg = self._safe_float(row.get("avgPrice"))
+            return (cum > 0, (avg if avg > 0 else None))
+        except Exception:
+            return False, None
 
-        s = str(side).lower()
-        if s == "buy":
-            floor_ref = min(entry_price, last)
-            ceil_ref = max(entry_price, last)
-            if stop_loss is not None and stop_loss >= floor_ref:
-                stop_loss = floor_ref - tick
-            if take_profit is not None and take_profit <= ceil_ref:
-                take_profit = ceil_ref + tick
-        else:  # sell
-            floor_ref = min(entry_price, last)
-            ceil_ref = max(entry_price, last)
-            if stop_loss is not None and stop_loss <= ceil_ref:
-                stop_loss = ceil_ref + tick
-            if take_profit is not None and take_profit >= floor_ref:
-                take_profit = floor_ref - tick
-
-        sl_norm = self.normalize_price(symbol, float(stop_loss), side=None) if stop_loss is not None else None
-        tp_norm = self.normalize_price(symbol, float(take_profit), side=None) if take_profit is not None else None
-        return (sl_norm, tp_norm)
-
-    # ---- public ----
     def get_balance(self) -> Dict:
         try:
             res = self.client.get_wallet_balance(accountType="UNIFIED")
@@ -489,6 +455,7 @@ class BybitTrader:
             logging.error(f"klines error: {e}")
         return pd.DataFrame()
 
+    # ---- главная операция открытия позиции ----
     def place_market_order(
         self,
         symbol: str,
@@ -498,13 +465,11 @@ class BybitTrader:
         take_profit: Optional[float] = None,
     ) -> Dict:
         """
-        Открываем позицию максимально безопасно:
+        Алгоритм:
           1) стакан
-          2) открытие Limit + IOC (без SL/TP), с адаптивным SLP_BPS_STEPS и tick_shift
-          3) проверка факта позиции
-          4) постановка SL/TP через set_trading_stop (ретраи)
-        Возвращает {'retCode':0,'filled':True,'avgPrice':...} при успехе,
-        {'retCode':-2,'retMsg':'ioc not filled'} если IOC не исполнился.
+          2) Limit + IOC с адаптивным slippage и сдвигом по тикам, ТОЛЬКО TP в ордере (SL → через trailing)
+          3) подтверждение fill/позиции
+          4) set_trading_stop: trailing + TP (ретраи)
         """
         # 1) стакан
         try:
@@ -521,7 +486,7 @@ class BybitTrader:
         last_avg_from_order: Optional[float] = None
 
         def _try_ioc_with(bps: float, tick_shift: int) -> Dict:
-            # refresh orderbook each attempt
+            # refresh
             ob2 = self.client.get_orderbook(category="linear", symbol=symbol, limit=1)
             if ob2.get("retCode") != 0:
                 return {"retCode": -1, "retMsg": f"orderbook retCode={ob2.get('retCode')}"}
@@ -538,7 +503,7 @@ class BybitTrader:
             price = base + tick_shift * tick if sside == "buy" else base - tick_shift * tick
             price = self.normalize_price(symbol, price)
 
-            # --- pre-validate TP/SL for in-order submission ---
+            # предвалидация TP по правилам
             ref_entry = base
             approx_last = ba if sside == "buy" else bb
             pre_sl, pre_tp = self._ensure_tp_sl_valid(
@@ -550,7 +515,7 @@ class BybitTrader:
                 current_price=float(approx_last),
             )
 
-            # --- ensure TP is on the correct side of the IOC price ---
+            # TP должен быть на «правильной стороне» от фактической цены IOC
             safe_tp = None
             if pre_tp is not None:
                 tick_meta = self.get_symbol_meta(symbol)
@@ -583,7 +548,7 @@ class BybitTrader:
                 )
                 if safe_tp is not None:
                     params["takeProfit"] = str(safe_tp)
-                # DO NOT include stopLoss when using trailing later
+                # stopLoss не ставим в ордер — будем вешать trailing на позицию
                 r = self.client.place_order(**params)
                 try:
                     order_id = (r.get("result") or {}).get("orderId")
@@ -603,7 +568,7 @@ class BybitTrader:
             for t in range(0, IOC_TICKS_TRIES):
                 res_open = _try_ioc_with(bps, t)
                 if res_open and res_open.get("retCode") == 0:
-                    # подтвердим исполнение по самому ордеру (частичный IOC тоже возможен)
+                    # подтверждаем fill по ордеру
                     ord_id = res_open.get("orderId")
                     filled = False
                     avg_from_order = None
@@ -613,14 +578,13 @@ class BybitTrader:
                             filled, avg_from_order = self.get_order_fill(symbol, ord_id)
                             if filled:
                                 break
-                    # затем подтверждаем позицию (может появиться с задержкой)
+                    # подтверждаем позицию
                     for _ in range(8):
                         time.sleep(0.25)
                         pos = self.get_position(symbol)
                         if pos and pos.size > 0:
                             positioned = True
                             break
-                    # если позиция ещё не появилась, но есть факт исполнения по ордеру — считаем открытой
                     if not positioned and filled:
                         positioned = True
                         last_avg_from_order = avg_from_order
@@ -631,10 +595,9 @@ class BybitTrader:
                 break
 
         if not positioned:
-            # no Market fallback (reduces 30208 noise). Let next tick retry.
             return last_err or {"retCode": -2, "retMsg": "ioc not filled"}
 
-        # refresh pos once more to get avgPrice
+        # позиция видна?
         pos = self.get_position(symbol)
         if not pos or pos.size <= 0:
             if last_avg_from_order is None:
@@ -649,17 +612,15 @@ class BybitTrader:
             symbol, side, float(pos.entry_price), stop_loss, take_profit, current_price=last_px
         )
 
-        # Derive trailing distance from SL relative to entry
+        # trailing distance из SL
         trail_dist = None
         try:
             if sl_norm is not None and pos and pos.entry_price:
                 tick = self.get_symbol_meta(symbol).get("tick_size", 0.1) or 0.1
                 trail_dist = abs(float(pos.entry_price) - float(sl_norm))
-                # ensure >= 2 ticks
                 min_trail = 2 * tick
                 if trail_dist < min_trail:
                     trail_dist = min_trail
-                # normalize to tick decimals
                 dec = self._tick_decimals(tick)
                 trail_dist = float(f"{trail_dist:.{dec}f}")
         except Exception:
@@ -670,7 +631,7 @@ class BybitTrader:
                 return self.client.set_trading_stop(
                     category="linear",
                     symbol=symbol,
-                    positionIdx=0,        # one-way; если hedge — маппинг Buy->1, Sell->2
+                    positionIdx=0,        # one-way
                     tpslMode="Full",
                     triggerBy="LastPrice",
                     takeProfit=(str(tp_v) if tp_v is not None else None),
@@ -716,29 +677,50 @@ class BybitTrader:
         logging.info(f"[OPEN] success side={side} avgPrice={float(pos.entry_price)} trail={trail_dist} tp={tp_norm}")
         return {**(res_open or {}), "filled": True, "avgPrice": float(pos.entry_price)}
 
+    # ---- валидация SL/TP по правилам биржи ----
+    def _ensure_tp_sl_valid(
+        self,
+        symbol: str,
+        side: str,
+        entry_price: float,
+        stop_loss: Optional[float],
+        take_profit: Optional[float],
+        current_price: Optional[float] = None,
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Приводим SL/TP к правилам Bybit и нормализуем до тика.
+          Buy:  SL < min(entry, lastPrice), TP > max(entry, lastPrice)
+          Sell: SL > max(entry, lastPrice), TP < min(entry, lastPrice)
+        """
+        meta = self.get_symbol_meta(symbol)
+        tick = meta.get("tick_size", 0.1) or 0.1
+        last = float(current_price) if (current_price is not None and current_price > 0) else float(entry_price)
+
+        if entry_price is None or entry_price <= 0:
+            return (stop_loss, take_profit)
+
+        s = str(side).lower()
+        if s == "buy":
+            floor_ref = min(entry_price, last)
+            ceil_ref = max(entry_price, last)
+            if stop_loss is not None and stop_loss >= floor_ref:
+                stop_loss = floor_ref - tick
+            if take_profit is not None and take_profit <= ceil_ref:
+                take_profit = ceil_ref + tick
+        else:  # sell
+            floor_ref = min(entry_price, last)
+            ceil_ref = max(entry_price, last)
+            if stop_loss is not None and stop_loss <= ceil_ref:
+                stop_loss = ceil_ref + tick
+            if take_profit is not None and take_profit >= floor_ref:
+                take_profit = floor_ref - tick
+
+        sl_norm = self.normalize_price(symbol, float(stop_loss), side=None) if stop_loss is not None else None
+        tp_norm = self.normalize_price(symbol, float(take_profit), side=None) if take_profit is not None else None
+        return (sl_norm, tp_norm)
 
 # ---------------------- BOT CORE ----------------------
 class ScalpingBot:
-    def _is_reversal_signal(self, market: Dict, signal: TradeSignal, pos: Position) -> bool:
-        """Возврат True, если сигнал сильно против текущей позиции (разворот)."""
-        try:
-            if not signal or not pos or pos.size <= 0:
-                return False
-            s = market.get("signals", {})
-            ind = market.get("indicators", {})
-            rsi = float(ind.get("rsi", 50.0))
-            conf = float(getattr(signal, "confidence", 0.0) or 0.0)
-
-            if str(pos.side).lower() == "buy":
-                if signal.side == OrderSide.SELL and s.get("macd_bearish") and s.get("price_below_ema_fast") and rsi < 50.0 and conf >= 0.65:
-                    return True
-            elif str(pos.side).lower() == "sell":
-                if signal.side == OrderSide.BUY and s.get("macd_bullish") and s.get("price_above_ema_fast") and rsi > 50.0 and conf >= 0.65:
-                    return True
-        except Exception:
-            return False
-        return False
-
     def __init__(self):
         self.analyzer = TechnicalAnalyzer()
         self.strategies = ScalpingStrategies(self.analyzer)
@@ -758,7 +740,7 @@ class ScalpingBot:
         self.risk_cfg = RiskConfig(
             max_notional_usdt=self.max_notional_usdt,
             leverage=BASE_LEVERAGE,
-            notes="test.py run",
+            notes="tradebot",
         )
 
         # Telegram
@@ -777,6 +759,26 @@ class ScalpingBot:
     @property
     def current_trader(self) -> BybitTrader:
         return self.trader_test if self.mode == TradingMode.TESTNET else self.trader_main
+
+    # ----- Разворотный фильтр -----
+    def _is_reversal_signal(self, market: Dict, signal: TradeSignal, pos: Position) -> bool:
+        """True, если сигнал сильно против текущей позиции (условия для принудительного закрытия)."""
+        try:
+            if not signal or not pos or pos.size <= 0:
+                return False
+            s = market.get("signals", {})
+            rsi = float(market.get("indicators", {}).get("rsi", 50.0))
+            conf = float(getattr(signal, "confidence", 0.0) or 0.0)
+
+            if str(pos.side).lower() == "buy":
+                if signal.side == OrderSide.SELL and s.get("macd_bearish") and s.get("price_below_ema_fast") and rsi < 50.0 and conf >= 0.65:
+                    return True
+            elif str(pos.side).lower() == "sell":
+                if signal.side == OrderSide.BUY and s.get("macd_bullish") and s.get("price_above_ema_fast") and rsi > 50.0 and conf >= 0.65:
+                    return True
+        except Exception:
+            return False
+        return False
 
     # ----- UI -----
     def get_keyboard(self) -> InlineKeyboardMarkup:
@@ -975,7 +977,9 @@ class ScalpingBot:
                 "bb_upper": float(market["indicators"]["bb_upper"]),
                 "bb_lower": float(market["indicators"]["bb_lower"]),
                 "atr": float(market["signals"]["atr"]),
+                "atr_pct": float(market["indicators"]["atr_pct"]),
                 "volume_spike": bool(market["signals"]["volume_spike"]),
+                "super_spike": bool(market["signals"]["super_spike"]),
                 "macd_bullish": bool(market["signals"]["macd_bullish"]),
                 "macd_bearish": bool(market["signals"]["macd_bearish"]),
                 "rsi_oversold": bool(market["signals"]["rsi_oversold"]),
@@ -1046,7 +1050,7 @@ class ScalpingBot:
             qty_str = f"{norm_qty:.8f}"
 
             # --- Per-symbol TP/SL override ---
-            atr_val = float(market["signals"].get("atr", 0.0)) if isinstance(market.get("signals", {}).get("atr", 0.0), (int, float)) else float(market["signals"]["atr"])
+            atr_val = float(market["signals"].get("atr", 0.0))
             meta = self.current_trader.get_symbol_meta(self.symbol)
             calc_sl, calc_tp = compute_tpsl_for_symbol(
                 symbol=self.symbol,
@@ -1055,6 +1059,7 @@ class ScalpingBot:
                 atr_value=atr_val,
                 meta=meta,
             )
+            # TP = 1.5*ATR по умолчанию, трейлинг из SL
             sl = float(calc_sl) if calc_sl is not None else float(signal.stop_loss)
             tp = float(calc_tp) if calc_tp is not None else float(signal.take_profit)
 
@@ -1079,13 +1084,13 @@ class ScalpingBot:
             except Exception as e:
                 logging.error(f"[ADB] save order attempt error: {e}")
 
-            # 6) открытие
+            # 6) очистка старых стопов (особенно на тестнете) и открытие
             try:
-                # на тестнете иногда висят стопы/активные ордера пред. сделки — очистим перед входом
                 self.current_trader.client.cancel_all_orders(category="linear", symbol=self.symbol)
                 self.current_trader.client.cancel_all_orders(category="linear", symbol=self.symbol, orderFilter="StopOrder")
             except Exception:
                 pass
+
             result = self.current_trader.place_market_order(
                 symbol=self.symbol,
                 side=signal.side.value,
@@ -1156,7 +1161,7 @@ class ScalpingBot:
                 f"Сторона: {signal.side.value}\n"
                 f"Размер: {qty_str}\n"
                 f"Вход: {real_entry:.2f}\n"
-                f"SL: {sl:.2f}\n"
+                f"SL* (через trailing): {sl:.2f}\n"
                 f"TP: {tp:.2f}\n"
                 f"Стратегия: {signal.strategy_name}\n"
                 f"Режим: {self.mode.value}"
@@ -1190,7 +1195,6 @@ class ScalpingBot:
             logging.error(f"analyze_and_trade error: {e}")
             self.status = BotStatus.ERROR
 
-
 # ---------------------- MAIN ----------------------
 def main():
     logging.basicConfig(
@@ -1206,7 +1210,6 @@ def main():
     app.add_handler(CallbackQueryHandler(bot.button_callback))
 
     app.run_polling(close_loop=False)
-
 
 if __name__ == "__main__":
     main()

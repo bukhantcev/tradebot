@@ -1,5 +1,3 @@
-
-
 import os
 import json
 import time
@@ -45,13 +43,17 @@ TELEGRAM_CHAT_ID = os.getenv("TG_ADMIN_CHAT_ID", "")
 # Торговые параметры
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
 BASE_LEVERAGE = int(os.getenv("BASE_LEVERAGE", "10"))
-MAX_NOTIONAL_USDT = float(os.getenv("MAX_NOTIONAL_USDT", "10"))  # целевой номинал позиции
-IOC_TICKS_TRIES = int(os.getenv("IOC_TICKS_TRIES", "5"))  # сколько тиков добавочно двигать цену для IOC
-SLIPPAGE_BPS = float(os.getenv("SLIPPAGE_BPS", "10"))     # 10 б.п. = 0.10% буфер к стакану
+MAX_NOTIONAL_USDT = float(os.getenv("MAX_NOTIONAL_USDT", "10"))
 
-SLP_BPS_STEPS = [float(x) for x in os.getenv("SLP_BPS_STEPS", "10,25,50,80,120").split(",")]
+IOC_TICKS_TRIES = int(os.getenv("IOC_TICKS_TRIES", "2"))
+SLIPPAGE_BPS = float(os.getenv("SLIPPAGE_BPS", "10"))
+SLP_BPS_STEPS = [float(x) for x in os.getenv("SLP_BPS_STEPS", "5,10,15,25").split(",")]
 
-# Пер-символьная конфигурация TP/SL
+MAX_SPREAD_TICKS = float(os.getenv("MAX_SPREAD_TICKS", "3"))
+MAX_IOC_SLIPPAGE_BPS = float(os.getenv("MAX_IOC_SLIPPAGE_BPS", "25"))
+ATR_PCT_MIN = float(os.getenv("ATR_PCT_MIN", "0.0015"))
+ATR_PCT_BOOST = float(os.getenv("ATR_PCT_BOOST", "0.006"))
+RISK_USDT = float(os.getenv("RISK_USDT", "0"))
 
 PER_SYMBOL_TPSL = {
     "BTCUSDT": {"mode": "auto"},
@@ -61,72 +63,37 @@ PER_SYMBOL_TPSL = {
 }
 
 # ---------------------- TP/SL HELPER ----------------------
-from typing import Optional, Tuple
-def compute_tpsl_for_symbol(
-    symbol: str,
-    side: str,
-    entry: float,
-    atr_value: Optional[float],
-    meta: dict,
-) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Compute absolute SL/TP for a symbol, based on PER_SYMBOL_TPSL config.
-    Returns (sl, tp) as floats (not quantized), or (None, None) if cannot compute.
-    """
+def compute_tpsl_for_symbol(symbol: str, side: str, entry: float,
+                            atr_value: Optional[float], meta: dict) -> Tuple[Optional[float], Optional[float]]:
     conf = PER_SYMBOL_TPSL.get(symbol)
     if not conf:
         return (None, None)
-    mode = conf.get("mode", "").lower()
-    tick_size = meta.get("tick_size", 0.1) if meta else 0.1
-    if not tick_size or tick_size <= 0:
-        tick_size = 0.1
-    # Direction: Buy: SL below, TP above; Sell: SL above, TP below
+    mode = str(conf.get("mode", "auto")).lower()
+    tick_size = (meta or {}).get("tick_size", 0.1) or 0.1
     s = str(side).lower()
 
-    # --- AUTO MODE: choose distances by situation (ATR vs price & tick) ---
-    if mode in ("", "auto", None):
-        # Heuristics:
-        #  - High vol: use ATR multipliers
-        #  - Medium vol: use ticks scaled from ATR
-        #  - Low vol: use absolute fractions of price
-        atr_pct = (atr_value / entry) if (atr_value and entry) else 0.0
-        # Defaults
-        sl_dist = None
-        tp_dist = None
-        chosen = None
-        if atr_pct >= 0.003:  # >= 0.3%
-            # High volatility → ATR-based
+    if mode in ("", "auto", None, "auto"):
+        atr_pct = (float(atr_value) / entry) if (atr_value and entry) else 0.0
+        sl_dist = tp_dist = None
+        if atr_pct >= 0.003:
             sl_mult = conf.get("sl_atr", 1.2)
             tp_mult = conf.get("tp_atr", 1.8)
             if atr_value and atr_value > 0:
                 sl_dist = sl_mult * atr_value
                 tp_dist = tp_mult * atr_value
-                chosen = "atr"
-        elif atr_pct >= 0.0015:  # 0.15% .. 0.3% → medium
-            # Medium volatility → ticks roughly from ATR
+        elif atr_pct >= 0.0015:
             base_ticks = max(5, int(round((0.8 * (atr_value or 0.0)) / tick_size)))
             rr = conf.get("rr", 1.6)
             sl_dist = base_ticks * tick_size
             tp_dist = int(round(base_ticks * rr)) * tick_size
-            chosen = "ticks"
         else:
-            # Low volatility → absolute fraction of price
-            sl_abs_frac = conf.get("sl_abs_frac", 0.0010)   # 0.10%
-            tp_abs_frac = conf.get("tp_abs_frac", 0.0018)   # 0.18%
+            sl_abs_frac = conf.get("sl_abs_frac", 0.0010)
+            tp_abs_frac = conf.get("tp_abs_frac", 0.0018)
             sl_dist = max(2 * tick_size, sl_abs_frac * entry)
             tp_dist = max(3 * tick_size, tp_abs_frac * entry)
-            chosen = "abs"
-        # Build SL/TP by side
         if sl_dist is not None and tp_dist is not None:
-            if s == "buy":
-                sl = entry - sl_dist
-                tp = entry + tp_dist
-            else:
-                sl = entry + sl_dist
-                tp = entry - tp_dist
-            return (sl, tp)
+            return (entry - sl_dist, entry + tp_dist) if s == "buy" else (entry + sl_dist, entry - tp_dist)
 
-    # --- TICKS ---
     if mode == "ticks":
         sl_ticks = conf.get("sl_ticks")
         tp_ticks = conf.get("tp_ticks")
@@ -134,47 +101,28 @@ def compute_tpsl_for_symbol(
             return (None, None)
         sl_dist = sl_ticks * tick_size
         tp_dist = tp_ticks * tick_size
-        if s == "buy":
-            sl = entry - sl_dist
-            tp = entry + tp_dist
-        else:
-            sl = entry + sl_dist
-            tp = entry - tp_dist
-        return (sl, tp)
-    # --- ATR ---
-    elif mode == "atr":
+        return (entry - sl_dist, entry + tp_dist) if s == "buy" else (entry + sl_dist, entry - tp_dist)
+
+    if mode == "atr":
         sl_atr = conf.get("sl_atr")
         tp_atr = conf.get("tp_atr")
         if sl_atr is None or tp_atr is None or not atr_value or atr_value <= 0:
             return (None, None)
         sl_dist = sl_atr * atr_value
         tp_dist = tp_atr * atr_value
-        if s == "buy":
-            sl = entry - sl_dist
-            tp = entry + tp_dist
-        else:
-            sl = entry + sl_dist
-            tp = entry - tp_dist
-        return (sl, tp)
-    # --- ABS ---
-    elif mode == "abs":
+        return (entry - sl_dist, entry + tp_dist) if s == "buy" else (entry + sl_dist, entry - tp_dist)
+
+    if mode == "abs":
         sl_abs = conf.get("sl_abs")
         tp_abs = conf.get("tp_abs")
         if sl_abs is None or tp_abs is None:
             return (None, None)
-        if s == "buy":
-            sl = entry - sl_abs
-            tp = entry + tp_abs
-        else:
-            sl = entry + sl_abs
-            tp = entry - tp_abs
-        return (sl, tp)
-    # --- RR ---
-    elif mode == "rr":
+        return (entry - sl_abs, entry + tp_abs) if s == "buy" else (entry + sl_abs, entry - tp_abs)
+
+    if mode == "rr":
         rr = conf.get("rr")
         if rr is None:
             return (None, None)
-        # SL distance: prefer sl_ticks, else sl_abs, else sl_atr
         sl_dist = None
         if conf.get("sl_ticks") is not None:
             sl_dist = conf["sl_ticks"] * tick_size
@@ -185,20 +133,9 @@ def compute_tpsl_for_symbol(
         if sl_dist is None:
             return (None, None)
         tp_dist = sl_dist * rr
-        if s == "buy":
-            sl = entry - sl_dist
-            tp = entry + tp_dist
-        else:
-            sl = entry + sl_dist
-            tp = entry - tp_dist
-        return (sl, tp)
-    return (None, None)
+        return (entry - sl_dist, entry + tp_dist) if s == "buy" else (entry + sl_dist, entry - tp_dist)
 
-# Логирование
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+    return (None, None)
 
 # ---------------------- TYPES ----------------------
 class TradingMode(Enum):
@@ -391,6 +328,7 @@ class BybitTrader:
         except Exception:
             pass
         return None
+
     def get_order_fill(self, symbol: str, order_id: str) -> Tuple[bool, Optional[float]]:
         """
         Проверяем факт исполнения по orderId через историю ордеров.
@@ -409,6 +347,7 @@ class BybitTrader:
             return (cum > 0, (avg if avg > 0 else None))
         except Exception:
             return False, None
+
     def __init__(self, api_key: str, api_secret: str, testnet: bool):
         self.client = HTTP(api_key=api_key, api_secret=api_secret, testnet=testnet)
         self.testnet = testnet
@@ -600,9 +539,7 @@ class BybitTrader:
             price = self.normalize_price(symbol, price)
 
             # --- pre-validate TP/SL for in-order submission ---
-            # Use candidate IOC price as entry estimate and top-of-book as current reference
-            ref_entry = base  # candidate limit price before tick_shift
-            # approximate current price: bestAsk for buy, bestBid for sell
+            ref_entry = base
             approx_last = ba if sside == "buy" else bb
             pre_sl, pre_tp = self._ensure_tp_sl_valid(
                 symbol=symbol,
@@ -700,11 +637,9 @@ class BybitTrader:
         # refresh pos once more to get avgPrice
         pos = self.get_position(symbol)
         if not pos or pos.size <= 0:
-            # Позиция не отобразилась, но мог быть частичный/задержанный IOC; попробуем взять avgPrice из ордера
             if last_avg_from_order is None:
                 return {**(res_open or {}), "retCode": -2, "retMsg": "position not found after IOC"}
             else:
-                # Нет позиции — SL/TP поставить нельзя, пропускаем на этот цикл
                 logging.warning("[OPEN] order filled по истории, но позиция ещё не видна — пропускаем SL/TP в этом цикле")
                 return {**(res_open or {}), "filled": True, "avgPrice": float(last_avg_from_order)}
 
@@ -754,23 +689,18 @@ class BybitTrader:
             last_err = res_tpsl
             msg = (res_tpsl or {}).get("retMsg", "")
 
-            # Если биржа ругается на «должен быть выше/ниже base_price», пересчитаем только TP, trailing >= 2*tick
             if "should be higher than base_price" in msg or "should be lower than base_price" in msg:
                 tick = self.get_symbol_meta(symbol).get("tick_size", 0.1) or 0.1
                 last_px = self.get_last_price(symbol) or float(pos.entry_price)
                 if str(side).lower() == "buy":
-                    # Buy: TP > max(entry,last)
                     ceil_ref = max(float(pos.entry_price), last_px)
                     if tp_norm is not None and tp_norm <= ceil_ref:
                         tp_norm = ceil_ref + tick
                 else:
-                    # Sell: TP < min(entry,last)
                     floor_ref = min(float(pos.entry_price), last_px)
                     if tp_norm is not None and tp_norm >= floor_ref:
                         tp_norm = floor_ref - tick
-                # нормализуем повторно
                 tp_norm = self.normalize_price(symbol, tp_norm) if tp_norm is not None else None
-                # ensure trailing distance >= 2*tick
                 min_trail = 2 * tick
                 if trail_dist is not None and trail_dist < min_trail:
                     dec = self._tick_decimals(tick)
@@ -778,7 +708,6 @@ class BybitTrader:
                 time.sleep(0.25)
                 continue
 
-            # Иные ошибки — маленькая пауза и ещё попытки
             time.sleep(0.25)
 
         if last_err:
@@ -791,11 +720,7 @@ class BybitTrader:
 # ---------------------- BOT CORE ----------------------
 class ScalpingBot:
     def _is_reversal_signal(self, market: Dict, signal: TradeSignal, pos: Position) -> bool:
-        """Возврат True, если сигнал сильно против текущей позиции (разворот).
-        Критерии по умолчанию (можно будет вынести в конфиг):
-          • Для Buy-позиции: новый сигнал Sell И macd_bearish И price_below_ema_fast И RSI<50 И confidence>=0.65
-          • Для Sell-позиции: новый сигнал Buy  И macd_bullish И price_above_ema_fast И RSI>50 И confidence>=0.65
-        """
+        """Возврат True, если сигнал сильно против текущей позиции (разворот)."""
         try:
             if not signal or not pos or pos.size <= 0:
                 return False
@@ -813,6 +738,7 @@ class ScalpingBot:
         except Exception:
             return False
         return False
+
     def __init__(self):
         self.analyzer = TechnicalAnalyzer()
         self.strategies = ScalpingStrategies(self.analyzer)
@@ -966,8 +892,6 @@ class ScalpingBot:
             side_close = "Sell" if pos.side == "Buy" else "Buy"
             qty_str = f"{float(pos.size):.8f}"
 
-            # на Unified/linear корректнее делать reduceOnly рыночным лимитом IOC:
-            # для простоты используем Market + reduceOnly=False (Bybit сам скроет в позицию)
             try:
                 res = trader.client.place_order(
                     category="linear",
@@ -1085,7 +1009,7 @@ class ScalpingBot:
             if not signal:
                 return
 
-            # 2.5) ранний детектор разворота: если есть позиция и пришёл сильный обратный сигнал — закрываем
+            # 2.5) ранний детектор разворота
             try:
                 pos_chk = self.current_trader.get_position(self.symbol)
                 if pos_chk and pos_chk.size > 0:
@@ -1096,7 +1020,6 @@ class ScalpingBot:
                             await self.send_telegram_message("⛔ Разворот: позиция закрыта по рынку (противосигнал)")
                         except Exception:
                             pass
-                        # после закрытия даём бирже отразить состояние и выходим из цикла
                         return
             except Exception as e:
                 logging.error(f"[REVERSAL] error: {e}")
@@ -1270,6 +1193,10 @@ class ScalpingBot:
 
 # ---------------------- MAIN ----------------------
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
     logging.info("=== Bot starting === (TESTNET by default)")
     bot = ScalpingBot()
 
