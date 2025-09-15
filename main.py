@@ -479,6 +479,57 @@ class BybitTrader:
             logging.error(f"klines error: {e}")
         return pd.DataFrame()
 
+    def get_open_orders(self, symbol: str) -> list:
+        """Return list of open active orders for symbol (linear)."""
+        try:
+            res = self.client.get_open_orders(category="linear", symbol=symbol)
+            if res.get("retCode") == 0:
+                return (res.get("result") or {}).get("list") or []
+        except Exception as e:
+            logging.error(f"get_open_orders error: {e}")
+        return []
+
+    def has_partial_tp(self, symbol: str, side_close: str, target_price: float, tol_ticks: int = 2) -> bool:
+        """Detect existing reduceOnly GTC limit close order near target (within tol_ticks)."""
+        try:
+            orders = self.get_open_orders(symbol)
+            if not orders:
+                return False
+            tick = self.get_symbol_meta(symbol).get("tick_size", 0.1) or 0.1
+            for o in orders:
+                try:
+                    if str(o.get("reduceOnly")).lower() != "true":
+                        continue
+                    if str(o.get("orderType")).lower() != "limit":
+                        continue
+                    if str(o.get("side", "")).lower() != str(side_close).lower():
+                        continue
+                    px = self._safe_float(o.get("price"))
+                    if px <= 0:
+                        continue
+                    if abs(px - float(target_price)) <= tol_ticks * float(tick):
+                        return True
+                except Exception:
+                    continue
+        except Exception as e:
+            logging.error(f"has_partial_tp error: {e}")
+        return False
+
+    def arm_trailing_stop(self, symbol: str, take_profit: Optional[float], trailing_dist: Optional[float]) -> dict:
+        """Set trailing stop and optional TP via set_trading_stop."""
+        try:
+            return self.client.set_trading_stop(
+                category="linear",
+                symbol=symbol,
+                positionIdx=0,
+                tpslMode="Full",
+                triggerBy="LastPrice",
+                takeProfit=(str(take_profit) if take_profit is not None else None),
+                trailingStop=(str(trailing_dist) if trailing_dist is not None else None),
+            )
+        except Exception as e:
+            return {"retCode": -1, "retMsg": str(e)}
+
     # ---- главная операция открытия позиции ----
     def place_market_order(
         self,
@@ -635,71 +686,6 @@ class BybitTrader:
         sl_norm, tp_norm = self._ensure_tp_sl_valid(
             symbol, side, float(pos.entry_price), stop_loss, take_profit, current_price=last_px
         )
-        return {**(res_open or {}), "filled": True, "avgPrice": float(pos.entry_price)}
-
-        # trailing distance из SL
-        trail_dist = None
-        try:
-            if sl_norm is not None and pos and pos.entry_price:
-                tick = self.get_symbol_meta(symbol).get("tick_size", 0.1) or 0.1
-                trail_dist = abs(float(pos.entry_price) - float(sl_norm))
-                min_trail = 2 * tick
-                if trail_dist < min_trail:
-                    trail_dist = min_trail
-                dec = self._tick_decimals(tick)
-                trail_dist = float(f"{trail_dist:.{dec}f}")
-        except Exception:
-            trail_dist = None
-
-        def _try_set_trailing(tp_v, trailing_dist):
-            try:
-                return self.client.set_trading_stop(
-                    category="linear",
-                    symbol=symbol,
-                    positionIdx=0,        # one-way
-                    tpslMode="Full",
-                    triggerBy="LastPrice",
-                    takeProfit=(str(tp_v) if tp_v is not None else None),
-                    trailingStop=(str(trailing_dist) if trailing_dist is not None else None),
-                )
-            except Exception as e:
-                return {"retCode": -1, "retMsg": str(e)}
-
-        last_err = None
-        for attempt in range(6):
-            res_tpsl = _try_set_trailing(tp_norm, trail_dist)
-            if res_tpsl and res_tpsl.get("retCode") == 0:
-                last_err = None
-                break
-
-            last_err = res_tpsl
-            msg = (res_tpsl or {}).get("retMsg", "")
-
-            if "should be higher than base_price" in msg or "should be lower than base_price" in msg:
-                tick = self.get_symbol_meta(symbol).get("tick_size", 0.1) or 0.1
-                last_px = self.get_last_price(symbol) or float(pos.entry_price)
-                if str(side).lower() == "buy":
-                    ceil_ref = max(float(pos.entry_price), last_px)
-                    if tp_norm is not None and tp_norm <= ceil_ref:
-                        tp_norm = ceil_ref + tick
-                else:
-                    floor_ref = min(float(pos.entry_price), last_px)
-                    if tp_norm is not None and tp_norm >= floor_ref:
-                        tp_norm = floor_ref - tick
-                tp_norm = self.normalize_price(symbol, tp_norm) if tp_norm is not None else None
-                min_trail = 2 * tick
-                if trail_dist is not None and trail_dist < min_trail:
-                    dec = self._tick_decimals(tick)
-                    trail_dist = float(f"{min_trail:.{dec}f}")
-                time.sleep(0.25)
-                continue
-
-            time.sleep(0.25)
-
-        if last_err:
-            logging.error(f"[Trailing/TP] set_trading_stop failed: {last_err}")
-
-        logging.info(f"[OPEN] success side={side} avgPrice={float(pos.entry_price)} trail={trail_dist} tp={tp_norm}")
         return {**(res_open or {}), "filled": True, "avgPrice": float(pos.entry_price)}
 
     # ---- валидация SL/TP по правилам биржи ----
@@ -1178,7 +1164,41 @@ class ScalpingBot:
             # 3) позиция уже открыта?
             pos = self.current_trader.get_position(self.symbol)
             if pos and pos.size > 0:
-                logging.info("Уже есть открытая позиция, пропускаем сигнал")
+                # --- управление открытой позицией: частичный TP + поздний трейлинг ---
+                entry = float(pos.entry_price)
+                last_px = float(market["price"])
+                atr_val = float(market["signals"].get("atr", 0.0))
+
+                # 1) Частичный TP: 1/3 позиции на +0.5*ATR (BUY) или -0.5*ATR (SELL)
+                if atr_val > 0 and PART_TP_FRAC > 0:
+                    if str(pos.side).lower() == "buy":
+                        tp1 = entry + PART_TP_ATR_MULT * atr_val
+                        side_close = "Sell"
+                    else:
+                        tp1 = entry - PART_TP_ATR_MULT * atr_val
+                        side_close = "Buy"
+                    qty_tp = max(0.0, float(pos.size) * PART_TP_FRAC)
+                    # Проверим, нет ли уже такого редьюс-ордера рядом с целью
+                    if qty_tp > 0 and not self.current_trader.has_partial_tp(self.symbol, side_close, tp1, tol_ticks=2):
+                        resp_tp = self.current_trader.place_reduce_only_limit(self.symbol, side_close, qty_tp, tp1)
+                        if resp_tp.get("retCode") != 0:
+                            logging.warning(f"[PART-TP] failed: {resp_tp}")
+
+                # 2) Поздний трейлинг: включаем, когда пройдено >= 1.0*ATR от входа
+                try:
+                    tick = self.current_trader.get_symbol_meta(self.symbol).get("tick_size", 0.1) or 0.1
+                    moved = abs(last_px - entry)
+                    if atr_val > 0 and moved >= TRAIL_ARM_ATR * atr_val:
+                        # дистанция трейлинга — не меньше 2 тиков и не меньше |entry - (entry ± atr)|
+                        trail_dist = max(abs(atr_val), TRAIL_FROM_SL_MIN * tick)
+                        # В TP тут не лезем (частичный TP уже стоит), оставим take_profit=None
+                        setres = self.current_trader.arm_trailing_stop(self.symbol, take_profit=None, trailing_dist=trail_dist)
+                        if setres.get("retCode") != 0:
+                            logging.warning(f"[TRAIL] set_trading_stop failed: {setres}")
+                except Exception as e:
+                    logging.error(f"[TRAIL] error: {e}")
+
+                logging.info("Позиция уже открыта: управление (partial TP / trailing) выполнено")
                 return
 
             # 4) размер позиции — по номиналу USDT
