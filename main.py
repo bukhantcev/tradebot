@@ -516,17 +516,26 @@ class BybitTrader:
         return False
 
     def arm_trailing_stop(self, symbol: str, take_profit: Optional[float], trailing_dist: Optional[float]) -> dict:
-        """Set trailing stop and optional TP via set_trading_stop."""
+        """Set trailing stop and optional TP via set_trading_stop. Omits None fields to avoid 'take_profit invalid'."""
         try:
-            return self.client.set_trading_stop(
-                category="linear",
-                symbol=symbol,
-                positionIdx=0,
-                tpslMode="Full",
-                triggerBy="LastPrice",
-                takeProfit=(str(take_profit) if take_profit is not None else None),
-                trailingStop=(str(trailing_dist) if trailing_dist is not None else None),
-            )
+            params = {
+                "category": "linear",
+                "symbol": symbol,
+                "positionIdx": 0,
+                "triggerBy": "LastPrice",
+            }
+            # tpslMode имеет смысл только если мы что-то ставим из TP/Trailing
+            if take_profit is not None or trailing_dist is not None:
+                params["tpslMode"] = "Full"
+            if take_profit is not None:
+                # нормализуем TP к тик-сайзу
+                tp_px = self.normalize_price(symbol, float(take_profit))
+                params["takeProfit"] = str(tp_px)
+            if trailing_dist is not None:
+                # биржа ждёт положительную дистанцию в цене
+                dist = abs(float(trailing_dist))
+                params["trailingStop"] = str(dist)
+            return self.client.set_trading_stop(**params)
         except Exception as e:
             return {"retCode": -1, "retMsg": str(e)}
 
