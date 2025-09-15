@@ -774,12 +774,44 @@ class BybitTrader:
         return 0
 
     def place_reduce_only_limit(self, symbol: str, side_close: str, qty: float, price: float) -> dict:
-        """Выставляет GTC reduceOnly лимит на закрытие части позиции (частичный TP)."""
+        """Выставляет GTC reduceOnly лимит на закрытие части позиции (частичный TP).
+        Корректно обрезает количество до размера позиции, учитывает qty_step/min_qty и min_notional.
+        Если после нормализации количество слишком мало для биржи или позиции — возвращает retCode=-13.
+        """
         try:
-            qty_norm = self.normalize_qty(symbol, qty)
-            if qty_norm <= 0:
-                return {"retCode": -1, "retMsg": "qty_norm<=0"}
+            # 0) Метаданные инструмента
+            meta = self.get_symbol_meta(symbol)
+            step = float(meta.get("qty_step", 0.001) or 0.001)
+            minq = float(meta.get("min_qty", step) or step)
+            min_notional = float(meta.get("min_notional", 0.0) or 0.0)
+
+            # 1) Текущая позиция — закрывать можно только до её размера
+            pos = self.get_position(symbol)
+            if not pos or float(pos.size) <= 0:
+                return {"retCode": -11, "retMsg": "no position to reduce"}
+
+            # сторона должна быть обратной
+            if str(pos.side).lower() == "buy" and str(side_close).lower() != "sell":
+                return {"retCode": -12, "retMsg": "side mismatch: need Sell to close Buy"}
+            if str(pos.side).lower() == "sell" and str(side_close).lower() != "buy":
+                return {"retCode": -12, "retMsg": "side mismatch: need Buy to close Sell"}
+
+            # 2) Обрезаем желаемое количество до позиции
+            max_close = float(pos.size)
+            qty_cap = min(float(qty), max_close)
+            if qty_cap <= 0:
+                return {"retCode": -13, "retMsg": "qty<=0 after cap by position"}
+
+            # 3) Нормализация к шагу
+            import math
+            qty_norm = math.floor(qty_cap / step) * step
+            # 4) Проверка min_qty и min_notional
+            if qty_norm < minq:
+                return {"retCode": -13, "retMsg": f"qty too small for exchange (qty_norm={qty_norm}, min_qty={minq})"}
             px = self.normalize_price(symbol, price)
+            if min_notional > 0 and (px * qty_norm) < min_notional:
+                return {"retCode": -13, "retMsg": f"notional too small (px*qty={px*qty_norm} < min_notional={min_notional})"}
+
             return self.client.place_order(
                 category="linear",
                 symbol=symbol,
@@ -1181,7 +1213,10 @@ class ScalpingBot:
                     # Проверим, нет ли уже такого редьюс-ордера рядом с целью
                     if qty_tp > 0 and not self.current_trader.has_partial_tp(self.symbol, side_close, tp1, tol_ticks=2):
                         resp_tp = self.current_trader.place_reduce_only_limit(self.symbol, side_close, qty_tp, tp1)
-                        if resp_tp.get("retCode") != 0:
+                        rc = resp_tp.get("retCode")
+                        if rc == -13:
+                            logging.info(f"[PART-TP] skipped: too small pos/notional ({resp_tp})")
+                        elif rc != 0:
                             logging.warning(f"[PART-TP] failed: {resp_tp}")
 
                 # 2) Поздний трейлинг: включаем, когда пройдено >= 1.0*ATR от входа
