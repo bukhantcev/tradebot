@@ -1,5 +1,7 @@
 import os
 import json
+import sqlite3
+import math
 import time
 import logging
 from datetime import datetime, timezone
@@ -1195,6 +1197,97 @@ class ScalpingBot:
             logging.error(f"analyze_and_trade error: {e}")
             self.status = BotStatus.ERROR
 
+    def _get_open_order_id_for_trade(self, trade_id: int) -> str | None:
+        """Возвращает orderId первого успешного ордера открытия по trade_id (из order_attempts.response_json)."""
+        try:
+            conn = sqlite3.connect(self.adb.path)
+            q = """
+            SELECT response_json
+            FROM order_attempts
+            WHERE trade_id = ?
+              AND intent = 'open'
+              AND (ret_code = 0 OR ret_code IS NULL)
+            ORDER BY id ASC
+            LIMIT 1
+            """
+            row = conn.execute(q, (trade_id,)).fetchone()
+            conn.close()
+            if not row or not row[0]:
+                return None
+            resp = json.loads(row[0])
+            # pybit обычно кладёт orderId в result.orderId, а мы ещё дублируем в корень (см. place_market_order)
+            oid = resp.get("orderId") or (resp.get("result") or {}).get("orderId")
+            return str(oid) if oid else None
+        except Exception:
+            return None
+
+    async def summary_command(self, update, context):
+        """Текстовая сводка по всем сделкам с отображением orderId открытия."""
+        try:
+            import sqlite3, pandas as pd
+            conn = sqlite3.connect(self.adb.path)
+
+            df = pd.read_sql_query("""
+                SELECT id, ts_open, ts_close, symbol, side, qty, avg_entry_price, avg_exit_price,
+                       status, pnl_abs, pnl_pct, close_reason, strategy, mode
+                FROM trades
+                ORDER BY COALESCE(ts_close, ts_open) DESC, id DESC
+            """, conn)
+
+            conn.close()
+
+            if df.empty:
+                await self.send_telegram_message("📄 Сводка: сделок пока нет.")
+                return
+
+            # Формируем компактный отчёт порциями (TG ограничивает длину сообщения)
+            lines = []
+            header = "📄 Сводка по сделкам:\n"
+            lines.append(header)
+
+            for _, r in df.iterrows():
+                trade_id = int(r["id"])
+                order_id = self._get_open_order_id_for_trade(trade_id)
+                status = str(r.get("status") or "unknown")
+                side = str(r.get("side") or "?")
+                symbol = str(r.get("symbol") or "?")
+                qty = r.get("qty")
+                px_in = r.get("avg_entry_price")
+                px_out = r.get("avg_exit_price")
+                pnl_abs = r.get("pnl_abs")
+                pnl_pct = r.get("pnl_pct")
+                reason = r.get("close_reason") or "-"
+
+                # красивые числа
+                def f(x, n=2):
+                    try:
+                        return f"{float(x):.{n}f}"
+                    except Exception:
+                        return "-"
+
+                block = (
+                    f"ID: {trade_id}  |  orderId: {order_id or '-'}\n"
+                    f"{symbol} {side}  qty={f(qty, 6)}\n"
+                    f"entry={f(px_in)}  exit={f(px_out)}\n"
+                    f"status={status}  reason={reason}\n"
+                    f"PnL={f(pnl_abs)}$  ({f(pnl_pct)}%)\n"
+                    "— — —\n"
+                )
+                lines.append(block)
+
+            # отправляем частями, чтобы не уткнуться в лимит сообщения
+            msg = ""
+            for line in lines:
+                if len(msg) + len(line) > 3500:  # безопасный лимит
+                    await self.send_telegram_message(msg)
+                    msg = ""
+                msg += line
+            if msg:
+                await self.send_telegram_message(msg)
+
+        except Exception as e:
+            await self.send_telegram_message(f"❌ Ошибка сводки: {e}")
+
 # ---------------------- MAIN ----------------------
 def main():
     logging.basicConfig(
@@ -1207,6 +1300,7 @@ def main():
     # Telegram app; run_polling сам управляет лупом — без ошибок закрытия лупа
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", bot.start_command))
+    app.add_handler(CommandHandler("summary", bot.summary_command))
     app.add_handler(CallbackQueryHandler(bot.button_callback))
 
     app.run_polling(close_loop=False)
