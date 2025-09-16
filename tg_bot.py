@@ -1,6 +1,8 @@
 import asyncio, json, logging, html
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, FSInputFile
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from config import get_tg_token, TELEGRAM_CHAT_ID
 from params_store import load_params
 
@@ -13,7 +15,11 @@ kb = ReplyKeyboardMarkup(
 class TgBot:
     def __init__(self, controller):
         self.controller = controller
-        self.bot = Bot(token=get_tg_token(), parse_mode="HTML")
+        # ✅ aiogram ≥ 3.7: parse_mode переносим в default properties
+        self.bot = Bot(
+            token=get_tg_token(),
+            default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+        )
         self.dp = Dispatcher()
         self.dp.message.register(self.on_msg, F.chat.id == int(TELEGRAM_CHAT_ID))
         self.log = logging.getLogger("tg")
