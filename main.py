@@ -72,6 +72,9 @@ PER_SYMBOL_TPSL = {
     "SOLUSDT": {"mode": "rr", "sl_ticks": 15, "rr": 1.8},
 }
 
+# Инвертировать торговые сигналы (BUY<->SELL)
+INVERT_SIGNALS = str(os.getenv("INVERT_SIGNALS", "0")).strip().lower() not in ("0", "", "false", "no", "off")
+
 # ---------------------- TP/SL HELPER ----------------------
 def compute_tpsl_for_symbol(symbol: str, side: str, entry: float,
                             atr_value: Optional[float], meta: dict) -> Tuple[Optional[float], Optional[float]]:
@@ -183,6 +186,40 @@ class Position:
     entry_price: float
     unrealized_pnl: float
     percentage: float
+
+# ---------------------- helpers for inversion ----------------------
+def invert_side(side: OrderSide) -> OrderSide:
+    return OrderSide.SELL if side == OrderSide.BUY else OrderSide.BUY
+
+def invert_tpsl(entry: float, orig_side: OrderSide,
+                sl: Optional[float], tp: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Инвертируем расположение SL/TP вокруг точки входа:
+      BUY(sl=entry-X, tp=entry+Y) -> SELL(sl=entry+X, tp=entry-Y)
+      SELL(sl=entry+X, tp=entry-Y) -> BUY(sl=entry-X, tp=entry+Y)
+    Если какого-то уровня нет — возвращаем None.
+    """
+    if sl is None and tp is None:
+        return (None, None)
+
+    def dist(a, b):
+        try:
+            return abs(float(a) - float(b))
+        except Exception:
+            return None
+
+    if orig_side == OrderSide.BUY:
+        d_sl = dist(entry, sl) if sl is not None else None
+        d_tp = dist(tp, entry) if tp is not None else None
+        new_sl = (entry + d_sl) if d_sl is not None else None
+        new_tp = (entry - d_tp) if d_tp is not None else None
+        return (new_sl, new_tp)
+    else:
+        d_sl = dist(sl, entry) if sl is not None else None
+        d_tp = dist(entry, tp) if tp is not None else None
+        new_sl = (entry - d_sl) if d_sl is not None else None
+        new_tp = (entry + d_tp) if d_tp is not None else None
+        return (new_sl, new_tp)
 
 # ---------------------- ANALYZER / STRATEGIES ----------------------
 class TechnicalAnalyzer:
@@ -349,6 +386,39 @@ class ScalpingStrategies:
         if risk <= 0 or (profit / risk) < 1.2:
             return None
         return best
+
+# ---------- Инвертирующая обёртка ----------
+class InversionProxyStrategies:
+    """Обёртка стратегий: инвертирует сторону и зеркалит SL/TP."""
+    def __init__(self, analyzer: TechnicalAnalyzer, base: ScalpingStrategies):
+        self.analyzer = analyzer
+        self.base = base
+
+    def _invert_signal(self, sig: Optional[TradeSignal]) -> Optional[TradeSignal]:
+        if not sig:
+            return None
+        new_side = invert_side(sig.side)
+        new_sl, new_tp = invert_tpsl(sig.entry_price, sig.side, sig.stop_loss, sig.take_profit)
+        return TradeSignal(
+            side=new_side,
+            entry_price=sig.entry_price,
+            stop_loss=new_sl if new_sl is not None else sig.stop_loss,
+            take_profit=new_tp if new_tp is not None else sig.take_profit,
+            confidence=sig.confidence,
+            strategy_name=f"INV[{sig.strategy_name}]",
+        )
+
+    def rsi_mean_reversion(self, market: Dict) -> Optional[TradeSignal]:
+        return self._invert_signal(self.base.rsi_mean_reversion(market))
+
+    def macd_momentum(self, market: Dict) -> Optional[TradeSignal]:
+        return self._invert_signal(self.base.macd_momentum(market))
+
+    def bb_breakout(self, market: Dict) -> Optional[TradeSignal]:
+        return self._invert_signal(self.base.bb_breakout(market))
+
+    def get_best_signal(self, market: Dict) -> Optional[TradeSignal]:
+        return self._invert_signal(self.base.get_best_signal(market))
 
 # ---------------------- BYBIT TRADER ----------------------
 class BybitTrader:
@@ -783,10 +853,7 @@ class BybitTrader:
         return 0
 
     def place_reduce_only_limit(self, symbol: str, side_close: str, qty: float, price: float) -> dict:
-        """Выставляет GTC reduceOnly лимит на закрытие части позиции (частичный TP).
-        Корректно обрезает количество до размера позиции, учитывает qty_step/min_qty и min_notional.
-        Если после нормализации количество слишком мало для биржи или позиции — возвращает retCode=-13.
-        """
+        """Выставляет GTC reduceOnly лимит на закрытие части позиции (частичный TP)."""
         try:
             # 0) Метаданные инструмента
             meta = self.get_symbol_meta(symbol)
@@ -839,7 +906,8 @@ class BybitTrader:
 class ScalpingBot:
     def __init__(self):
         self.analyzer = TechnicalAnalyzer()
-        self.strategies = ScalpingStrategies(self.analyzer)
+        base_strats = ScalpingStrategies(self.analyzer)
+        self.strategies = InversionProxyStrategies(self.analyzer, base_strats) if INVERT_SIGNALS else base_strats
 
         # аналитическая БД
         self.adb = AnalyticsDB("analytics.db")
@@ -951,7 +1019,7 @@ class ScalpingBot:
                     )
                 if not self.scheduler.running:
                     self.scheduler.start()
-                msg = f"✅ Бот запущен в режиме {self.mode.value}"
+                msg = f"✅ Бот запущен в режиме {self.mode.value} (invert={INVERT_SIGNALS})"
             else:
                 self.status = BotStatus.STOPPED
                 if self.scheduler.get_job("trading_job"):
@@ -1054,509 +1122,203 @@ class ScalpingBot:
             logging.error(f"TG send error: {e}")
 
     # ----- CORE -----
-    from datetime import datetime, timezone
-    UTC = timezone.utc
-
     async def analyze_and_trade(self):
         if self.status != BotStatus.RUNNING:
             return
 
-        # --- 0) Детектор закрытия позиции с учётом БД ---
+        trader = self.current_trader
+
+        # 0) фиксация закрытия (детектор перехода open->closed)
         try:
-            trader = self.current_trader
             pos_now = trader.get_position(self.symbol)
             now_open = bool(pos_now and pos_now.size > 0)
-
-            # было открыто -> стало закрыто : фиксируем закрытие в БД
             if self._last_pos_open and not now_open:
-                # находим последний open trade по символу
                 open_trade = self._get_last_open_trade(self.symbol)
                 if open_trade:
-                    # пытаемся взять факт выхода с биржи
                     ro = trader.get_recent_filled_reduce_only(self.symbol)
                     if ro and ro.get("avgPrice"):
                         avg_exit = float(ro["avgPrice"])
                         ts_close = datetime.now(UTC)
                     else:
-                        # fallback: если не нашли ордер — возьмём lastPrice на момент детекта
-                        last_px = trader.get_last_price(self.symbol) or open_trade["entry"]
+                        last_px = trader.get_last_price(self.symbol) or 0.0
                         avg_exit = float(last_px)
                         ts_close = datetime.now(UTC)
-
-                    # считаем PnL в $: (exit - entry) * qty c учётом стороны
-                    side = str(open_trade["side"]).lower()
-                    qty = float(open_trade["qty"])
-                    entry = float(open_trade["entry"])
-                    if side == "buy":
-                        pnl_abs = (avg_exit - entry) * qty
-                    else:
-                        pnl_abs = (entry - avg_exit) * qty
-
-                    # % можно считать как pnl / (entry*qty) * 100
-                    denom = max(entry * qty, 1e-9)
-                    pnl_pct = (pnl_abs / denom) * 100.0
-
-                    # записываем в БД
                     try:
-                        self.adb.close_trade(
-                            trade_id=open_trade["id"],
-                            ts_close=ts_close,
-                            avg_exit_price=avg_exit,
-                            pnl_abs=float(pnl_abs),
-                            pnl_pct=float(pnl_pct),
-                            close_reason="tp/sl/trailing/manual"
-                            # если хочешь, можно детектить точнее по ro['side']/orderType
-                        )
-                    except Exception as e:
-                        logging.error(f"[ADB] close_trade error: {e}")
-
-                    # Уведомим
-                    try:
-                        await self.send_telegram_message(
-                            "✅ Позиция ЗАКРЫТА\n"
-                            f"Символ: {self.symbol}\n"
-                            f"entry: {entry:.2f}  exit: {avg_exit:.2f}\n"
-                            f"PnL: {pnl_abs:.4f}$  ({pnl_pct:.2f}%)"
-                        )
+                        self.adb.close_trade(symbol=self.symbol, exit_price=avg_exit, ts=ts_close)
                     except Exception:
                         pass
-
-            # обновляем локальный слепок (для следующего цикла)
+                    await self.send_telegram_message(f"✅ Позиция закрыта. Выход ~ {avg_exit:.2f}")
             self._last_pos_open = now_open
-            self._last_pos_side = (pos_now.side if now_open else None)
-            self._last_pos_entry = (float(pos_now.entry_price) if now_open else None)
-            self._last_pos_size = (float(pos_now.size) if now_open else 0.0)
-
+            if now_open and pos_now:
+                self._last_pos_side = pos_now.side
+                self._last_pos_entry = pos_now.entry_price
+                self._last_pos_size = pos_now.size
         except Exception as e:
-            logging.error(f"Close detector error: {e}")
+            logging.warning(f"[CLOSE-DETECT] {e}")
 
-        # --- дальше твоя логика анализа/входа как была ---
-        # ...
+        # 1) данные рынка
+        df = trader.get_klines(self.symbol, interval="5", limit=200)
+        if df.empty:
+            logging.warning("[DATA] empty klines")
+            return
 
+        market = self.analyzer.analyze_market(df)
+        price = float(market["price"])
+        atr_val = float(market["indicators"]["atr"])
+
+        # 2) сигнал (с возможной инверсией на уровне self.strategies)
+        sig = self.strategies.get_best_signal(market)
+
+        # лог в БД
         try:
-            # 1) данные рынка (1m, 100 свечей)
-            df = self.current_trader.get_klines(self.symbol, "1", 100)
-            if df.empty:
-                logging.warning("Пустые свечи 1m")
-                return
-
-            market = self.analyzer.analyze_market(df)
-            regime_1m = "UP" if market["price"] > market["indicators"]["ema_fast"] else "DOWN"
-
-            # фичи для БД
-            features = {
-                "rsi": float(market["indicators"]["rsi"]),
-                "ema_fast": float(market["indicators"]["ema_fast"]),
-                "ema_slow": float(market["indicators"]["ema_slow"]),
-                "bb_upper": float(market["indicators"]["bb_upper"]),
-                "bb_lower": float(market["indicators"]["bb_lower"]),
-                "atr": float(market["signals"]["atr"]),
-                "atr_pct": float(market["indicators"]["atr_pct"]),
-                "volume_spike": bool(market["signals"]["volume_spike"]),
-                "super_spike": bool(market["signals"]["super_spike"]),
-                "macd_bullish": bool(market["signals"]["macd_bullish"]),
-                "macd_bearish": bool(market["signals"]["macd_bearish"]),
-                "rsi_oversold": bool(market["signals"]["rsi_oversold"]),
-                "rsi_overbought": bool(market["signals"]["rsi_overbought"]),
-            }
-
-            # 2) сигнал
-            signal = self.strategies.get_best_signal(market)
-
-            # лог сигнала (даже если None — для частоты)
-            try:
-                self.adb.add_signal(
-                    ts=datetime.now(UTC),
-                    symbol=self.symbol,
-                    side=(signal.side.value if signal else "None"),
-                    entry_estimate=(float(signal.entry_price) if signal else None),
-                    sl_estimate=(float(signal.stop_loss) if signal else None),
-                    tp_estimate=(float(signal.take_profit) if signal else None),
-                    confidence=(float(signal.confidence) if signal else None),
-                    strategy=(signal.strategy_name if signal else "no_signal"),
-                    features=features,
-                    regime_1m=regime_1m,
-                    regime_5m=None,
-                    sr_1m=None,
-                    sr_5m=None,
-                    trade_id=None,
-                )
-            except Exception as e:
-                logging.error(f"[ADB] save signal error: {e}")
-
-            if not signal:
-                return
-
-            # 2.5) ранний детектор разворота
-            try:
-                pos_chk = self.current_trader.get_position(self.symbol)
-                if pos_chk and pos_chk.size > 0:
-                    if self._is_reversal_signal(market, signal, pos_chk):
-                        logging.info("[REVERSAL] Обнаружен сильный противоположный сигнал — закрываем позицию по рынку")
-                        ok, txt = await self._close_position_and_clear()
-                        try:
-                            await self.send_telegram_message("⛔ Разворот: позиция закрыта по рынку (противосигнал)")
-                        except Exception:
-                            pass
-                        return
-            except Exception as e:
-                logging.error(f"[REVERSAL] error: {e}")
-
-            # 3) позиция уже открыта?
-            pos = self.current_trader.get_position(self.symbol)
-            if pos and pos.size > 0:
-                # --- управление открытой позицией: частичный TP + поздний трейлинг ---
-                entry = float(pos.entry_price)
-                last_px = float(market["price"])
-                atr_val = float(market["signals"].get("atr", 0.0))
-
-                # 1) Частичный TP: 1/3 позиции на +0.5*ATR (BUY) или -0.5*ATR (SELL)
-                if atr_val > 0 and PART_TP_FRAC > 0:
-                    if str(pos.side).lower() == "buy":
-                        tp1 = entry + PART_TP_ATR_MULT * atr_val
-                        side_close = "Sell"
-                    else:
-                        tp1 = entry - PART_TP_ATR_MULT * atr_val
-                        side_close = "Buy"
-                    qty_tp = max(0.0, float(pos.size) * PART_TP_FRAC)
-                    # Проверим, нет ли уже такого редьюс-ордера рядом с целью
-                    if qty_tp > 0 and not self.current_trader.has_partial_tp(self.symbol, side_close, tp1, tol_ticks=2):
-                        resp_tp = self.current_trader.place_reduce_only_limit(self.symbol, side_close, qty_tp, tp1)
-                        rc = resp_tp.get("retCode")
-                        if rc == -13:
-                            logging.info(f"[PART-TP] skipped: too small pos/notional ({resp_tp})")
-                        elif rc != 0:
-                            logging.warning(f"[PART-TP] failed: {resp_tp}")
-
-                # 2) Поздний трейлинг: включаем, когда пройдено >= 1.0*ATR от входа
-                try:
-                    tick = self.current_trader.get_symbol_meta(self.symbol).get("tick_size", 0.1) or 0.1
-                    moved = abs(last_px - entry)
-                    if atr_val > 0 and moved >= TRAIL_ARM_ATR * atr_val:
-                        # дистанция трейлинга — не меньше 2 тиков и не меньше |entry - (entry ± atr)|
-                        trail_dist = max(abs(atr_val), TRAIL_FROM_SL_MIN * tick)
-                        # В TP тут не лезем (частичный TP уже стоит), оставим take_profit=None
-                        setres = self.current_trader.arm_trailing_stop(self.symbol, take_profit=None, trailing_dist=trail_dist)
-                        if setres.get("retCode") != 0:
-                            logging.warning(f"[TRAIL] set_trading_stop failed: {setres}")
-                except Exception as e:
-                    logging.error(f"[TRAIL] error: {e}")
-
-                logging.info("Позиция уже открыта: управление (partial TP / trailing) выполнено")
-                return
-
-            # 4) размер позиции — по номиналу USDT
-            price = float(market["price"])
-            bal = self.current_trader.get_balance()
-            free = float(bal.get("totalAvailableBalance", 0.0))
-            target_notional = min(self.max_notional_usdt, free)
-            if target_notional <= 0:
-                logging.warning("Недостаточно средств")
-                return
-            raw_qty = target_notional / max(price, 1e-8)
-            norm_qty = self.current_trader.normalize_qty(self.symbol, raw_qty)
-            if norm_qty <= 0:
-                logging.warning(f"Нельзя нормализовать qty (raw={raw_qty})")
-                return
-            qty_str = f"{norm_qty:.8f}"
-
-            # --- Per-symbol TP/SL override ---
-            atr_val = float(market["signals"].get("atr", 0.0))
-            meta = self.current_trader.get_symbol_meta(self.symbol)
-            calc_sl, calc_tp = compute_tpsl_for_symbol(
+            self.adb.log_signal(
                 symbol=self.symbol,
-                side=signal.side.value,
-                entry=price,
-                atr_value=atr_val,
-                meta=meta,
+                ts=datetime.now(UTC),
+                price=price,
+                meta=json.dumps({"inv": INVERT_SIGNALS, "rsi": market["indicators"]["rsi"]}),
+                strategy=(sig.strategy_name if sig else "none"),
+                side=(sig.side.value if sig else "none"),
+                conf=(sig.confidence if sig else 0.0),
             )
-            # TP = 1.5*ATR по умолчанию, трейлинг из SL
-            sl = float(calc_sl) if calc_sl is not None else float(signal.stop_loss)
-            tp = float(calc_tp) if calc_tp is not None else float(signal.take_profit)
+        except Exception:
+            pass
 
-            # 5) лог попытки открытия
+        # 3) защита от «ножей» и супер-спайков
+        s = market["signals"]
+        if s.get("super_spike") or not s.get("atr_pct_ok") or not s.get("sr_ok"):
+            return
+
+        # 4) если позиции нет — можем войти по сигналу
+        pos = trader.get_position(self.symbol)
+        if not pos or pos.size <= 0:
+            if not sig:
+                return
+
+            # размер позиции от риска
+            meta = trader.get_symbol_meta(self.symbol)
+            tick = float(meta.get("tick_size", 0.1) or 0.1)
+
+            # если у сигнала нет SL/TP — попробуем вычислить по профилю
+            sl_px, tp_px = sig.stop_loss, sig.take_profit
+            if sl_px is None or tp_px is None:
+                alt_sl, alt_tp = compute_tpsl_for_symbol(self.symbol, sig.side.value, sig.entry_price, atr_val, meta)
+                sl_px = sl_px if sl_px is not None else alt_sl
+                tp_px = tp_px if tp_px is not None else alt_tp
+
+            # валидация уровня
+            sl_px, tp_px = trader._ensure_tp_sl_valid(
+                symbol=self.symbol,
+                side=sig.side.value,
+                entry_price=sig.entry_price,
+                stop_loss=sl_px,
+                take_profit=tp_px,
+                current_price=price,
+            )
+
+            # риск на сделку -> количество (через дистанцию до SL)
+            risk_dist = abs(sig.entry_price - (sl_px if sl_px is not None else sig.entry_price - max(atr_val, tick)))
+            if risk_dist <= 0:
+                return
+            qty_est = (self.risk_cfg.max_notional_usdt / price) if RISK_USDT <= 0 else (RISK_USDT / risk_dist)
+            qty = trader.normalize_qty(self.symbol, max(qty_est, meta.get("min_qty", 0.001)))
+
+            # открытие лимит+IOC с TP (SL позже через trailing)
+            res = trader.place_market_order(
+                symbol=self.symbol,
+                side=sig.side.value,
+                qty=f"{qty:.8f}",
+                stop_loss=sl_px,
+                take_profit=tp_px,
+            )
+            if res.get("retCode") != 0:
+                logging.warning(f"[OPEN FAIL] {res}")
+                await self.send_telegram_message(f"❌ Открытие не удалось: {res.get('retMsg')}")
+                return
+
+            # зафиксировали факт открытия
             try:
-                self.adb.add_order_attempt(
+                self.adb.open_trade(
+                    symbol=self.symbol,
                     ts=datetime.now(UTC),
-                    intent="open",
-                    side=signal.side.value,
-                    order_type="Limit-IOC",
-                    price=None,
-                    qty=float(qty_str),
-                    stop_loss=sl,
-                    take_profit=tp,
-                    ret_code=None,
-                    ret_msg=None,
-                    payload={"category": "linear", "symbol": self.symbol, "side": signal.side.value,
-                             "orderType": "Limit-IOC", "qty": qty_str, "stopLoss": sl, "takeProfit": tp},
-                    response={},
-                    trade_id=None,
+                    side=sig.side.value,
+                    entry_price=float(res.get("avgPrice") or sig.entry_price),
+                    strategy=sig.strategy_name,
+                    size=qty,
                 )
-            except Exception as e:
-                logging.error(f"[ADB] save order attempt error: {e}")
-
-            # 6) очистка старых стопов (особенно на тестнете) и открытие
-            try:
-                self.current_trader.client.cancel_all_orders(category="linear", symbol=self.symbol)
-                self.current_trader.client.cancel_all_orders(category="linear", symbol=self.symbol, orderFilter="StopOrder")
             except Exception:
                 pass
 
-            result = self.current_trader.place_market_order(
-                symbol=self.symbol,
-                side=signal.side.value,
-                qty=qty_str,
-                stop_loss=sl,
-                take_profit=tp,
-            )
-
-            # 7) лог ответа
-            try:
-                self.adb.add_order_attempt(
-                    ts=datetime.now(UTC),
-                    intent="open",
-                    side=signal.side.value,
-                    order_type="Limit-IOC",
-                    price=None,
-                    qty=float(qty_str),
-                    stop_loss=sl,
-                    take_profit=tp,
-                    ret_code=result.get("retCode"),
-                    ret_msg=result.get("retMsg"),
-                    payload={},
-                    response=result,
-                    trade_id=None,
-                )
-            except Exception as e:
-                logging.error(f"[ADB] save order response error: {e}")
-
-            if result.get("retCode") == -2:
-                logging.warning("[OPEN] Не удалось исполнить IOC — позиция не открыта (перепроверим на следующем цикле)")
-                return
-            if result.get("retCode") != 0:
-                logging.error(f"[ORDER] failed: {result}")
-                return
-
-            # подтверждение позиции
-            pos = self.current_trader.get_position(self.symbol)
-            if not pos or pos.size <= 0:
-                real_entry = float(result.get("avgPrice") or 0.0)  # из истории ордера
-            else:
-                real_entry = float(pos.entry_price)
-
-            trade_id = self.adb.new_trade(
-                ts_open=datetime.now(UTC),
-                symbol=self.symbol,
-                side=signal.side.value,
-                qty=float(qty_str),
-                avg_entry_price=real_entry,
-                strategy=signal.strategy_name,
-                mode=self.mode.value,
-                risk_cfg=self.risk_cfg,
-            )
-            # 8) привязка trade_id к последним signal и order_attempts (чтобы отчёты были точные)
-            try:
-                with sqlite3.connect(self.adb.path) as c:
-                    # Привяжем к последнему успешному попытке открытия (intent='open') без trade_id
-                    c.execute(
-                        """
-                        UPDATE order_attempts
-                        SET trade_id = ?
-                        WHERE id = (
-                            SELECT id FROM order_attempts
-                            WHERE trade_id IS NULL AND intent = 'open'
-                            ORDER BY id DESC
-                            LIMIT 1
-                        )
-                        """,
-                        (trade_id,)
-                    )
-                    # Привяжем к последнему сигналу без trade_id (это как раз сигнал, по которому мы открылись)
-                    c.execute(
-                        """
-                        UPDATE signals
-                        SET trade_id = ?
-                        WHERE id = (
-                            SELECT id FROM signals
-                            WHERE trade_id IS NULL
-                            ORDER BY id DESC
-                            LIMIT 1
-                        )
-                        """,
-                        (trade_id,)
-                    )
-                    c.commit()
-            except Exception as e:
-                logging.error(f"[ADB] link trade_id error: {e}")
-            except Exception as e:
-                logging.error(f"[ADB] new_trade error: {e}")
-
-            # 9) уведомление
             await self.send_telegram_message(
-                "🚀 Открыта позиция\n"
-                f"Символ: {self.symbol}\n"
-                f"Сторона: {signal.side.value}\n"
-                f"Размер: {qty_str}\n"
-                f"Вход: {real_entry:.2f}\n"
-                f"SL* (через trailing): {sl:.2f}\n"
-                f"TP: {tp:.2f}\n"
-                f"Стратегия: {signal.strategy_name}\n"
-                f"Режим: {self.mode.value}"
+                f"🚀 Открытие: {sig.side.value} qty={qty:.4f} @~{float(res.get('avgPrice') or sig.entry_price):.2f} "
+                f"(strat={sig.strategy_name}, inv={INVERT_SIGNALS})"
             )
 
-            # 10) обновляем слепок
-            self._last_pos_open = bool(pos and pos.size > 0)
-            self._last_pos_side = (pos.side if (pos and pos.size > 0) else signal.side.value)
-            self._last_pos_entry = real_entry
-            self._last_pos_size = (float(pos.size) if (pos and pos.size > 0) else float(qty_str))
+            # trailing включим, когда уйдём в плюс на TRAIL_ARM_ATR*ATR; частичный TP поставим заранее
+            return
 
-            # 11) снапшот в БД
-            try:
-                if pos and pos.size > 0:
-                    bal = self.current_trader.get_balance()
-                    self.adb.add_snapshot(
-                        trade_id=trade_id,
-                        ts=datetime.now(UTC),
-                        last_price=float(market["price"]),
-                        position_side=pos.side,
-                        position_size=float(pos.size),
-                        position_entry=float(pos.entry_price),
-                        unrealized_pnl=float(pos.unrealized_pnl),
-                        balance_available=self.current_trader._safe_float(bal.get("totalAvailableBalance")),
-                        raw_json={"position": pos.__dict__, "balance": bal},
-                    )
-            except Exception as e:
-                logging.error(f"[ADB] snapshot error: {e}")
-
-        except Exception as e:
-            logging.error(f"analyze_and_trade error: {e}")
-            self.status = BotStatus.ERROR
-
-    def _get_open_order_id_for_trade(self, trade_id: int) -> str | None:
-        """Возвращает orderId первого успешного ордера открытия по trade_id (из order_attempts.response_json)."""
+        # 5) если позиция есть — управление: частичный TP и трейлинг
         try:
-            conn = sqlite3.connect(self.adb.path)
-            q = """
-            SELECT response_json
-            FROM order_attempts
-            WHERE trade_id = ?
-              AND intent = 'open'
-              AND (ret_code = 0 OR ret_code IS NULL)
-            ORDER BY id ASC
-            LIMIT 1
-            """
-            row = conn.execute(q, (trade_id,)).fetchone()
-            conn.close()
-            if not row or not row[0]:
-                return None
-            resp = json.loads(row[0])
-            # pybit обычно кладёт orderId в result.orderId, а мы ещё дублируем в корень (см. place_market_order)
-            oid = resp.get("orderId") or (resp.get("result") or {}).get("orderId")
-            return str(oid) if oid else None
+            # side_close для лимитных редьюсов
+            side_close = "Sell" if str(pos.side).lower() == "buy" else "Buy"
+
+            # целевой частичный TP
+            part_dist = max(PART_TP_ATR_MULT * atr_val, 2 * trader.get_symbol_meta(self.symbol)["tick_size"])
+            target_px = pos.entry_price + part_dist if pos.side == "Buy" else pos.entry_price - part_dist
+            target_px = trader.normalize_price(self.symbol, target_px)
+
+            # если нет частичного TP — поставим reduceOnly GTC ~ на 1/3 размера
+            if not trader.has_partial_tp(self.symbol, side_close, target_px, tol_ticks=2):
+                part_qty = max(PART_TP_FRAC * float(pos.size), trader.get_symbol_meta(self.symbol)["min_qty"])
+                place_res = trader.place_reduce_only_limit(self.symbol, side_close, part_qty, target_px)
+                if place_res.get("retCode") == 0:
+                    logging.info(f"[PART-TP] placed {part_qty} @ {target_px}")
+                else:
+                    logging.info(f"[PART-TP] skip: {place_res}")
+
+            # трейлинг — когда ушли в плюс на TRAIL_ARM_ATR*ATR
+            pnl_move = (price - pos.entry_price) if pos.side == "Buy" else (pos.entry_price - price)
+            if pnl_move >= TRAIL_ARM_ATR * atr_val:
+                trailing_dist = max(ATR_PCT_MIN * price, TRAIL_FROM_SL_MIN * trader.get_symbol_meta(self.symbol)["tick_size"])
+                ar = trader.arm_trailing_stop(self.symbol, take_profit=None, trailing_dist=trailing_dist)
+                logging.info(f"[TRAIL] set_trading_stop -> {ar}")
+        except Exception as e:
+            logging.warning(f"[PM] {e}")
+
+    # ----- Вспомогательные методы для БД -----
+    def _get_last_open_trade(self, symbol: str):
+        try:
+            return self.adb.get_last_open_trade(symbol=symbol)
         except Exception:
             return None
 
-    async def summary_command(self, update, context):
-        """Текстовая сводка по всем сделкам с отображением orderId открытия."""
-        try:
-            import sqlite3, pandas as pd
-            conn = sqlite3.connect(self.adb.path)
+# ---------------------- ENTRYPOINT ----------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s:%(lineno)d | %(message)s",
+)
 
-            df = pd.read_sql_query("""
-                SELECT id, ts_open, ts_close, symbol, side, qty, avg_entry_price, avg_exit_price,
-                       status, pnl_abs, pnl_pct, close_reason, strategy, mode
-                FROM trades
-                ORDER BY COALESCE(ts_close, ts_open) DESC, id DESC
-            """, conn)
-
-            conn.close()
-
-            if df.empty:
-                await self.send_telegram_message("📄 Сводка: сделок пока нет.")
-                return
-
-            # Формируем компактный отчёт порциями (TG ограничивает длину сообщения)
-            lines = []
-            header = "📄 Сводка по сделкам:\n"
-            lines.append(header)
-
-            for _, r in df.iterrows():
-                trade_id = int(r["id"])
-                order_id = self._get_open_order_id_for_trade(trade_id)
-                status = str(r.get("status") or "unknown")
-                side = str(r.get("side") or "?")
-                symbol = str(r.get("symbol") or "?")
-                qty = r.get("qty")
-                px_in = r.get("avg_entry_price")
-                px_out = r.get("avg_exit_price")
-                pnl_abs = r.get("pnl_abs")
-                pnl_pct = r.get("pnl_pct")
-                reason = r.get("close_reason") or "-"
-
-                # красивые числа
-                def f(x, n=2):
-                    try:
-                        return f"{float(x):.{n}f}"
-                    except Exception:
-                        return "-"
-
-                block = (
-                    f"ID: {trade_id}  |  orderId: {order_id or '-'}\n"
-                    f"{symbol} {side}  qty={f(qty, 6)}\n"
-                    f"entry={f(px_in)}  exit={f(px_out)}\n"
-                    f"status={status}  reason={reason}\n"
-                    f"PnL={f(pnl_abs)}$  ({f(pnl_pct)}%)\n"
-                    "— — —\n"
-                )
-                lines.append(block)
-
-            # отправляем частями, чтобы не уткнуться в лимит сообщения
-            msg = ""
-            for line in lines:
-                if len(msg) + len(line) > 3500:  # безопасный лимит
-                    await self.send_telegram_message(msg)
-                    msg = ""
-                msg += line
-            if msg:
-                await self.send_telegram_message(msg)
-
-        except Exception as e:
-            await self.send_telegram_message(f"❌ Ошибка сводки: {e}")
-
-
-    def _db_conn(self):
-        return sqlite3.connect(self.adb.path)
-
-    def _get_last_open_trade(self, symbol: str):
-        """Берём последний открытый trade для символа (id, side, qty, entry_price, ts_open)."""
-        with self._db_conn() as c:
-            row = c.execute("""
-                SELECT id, side, qty, avg_entry_price, ts_open
-                FROM trades
-                WHERE symbol = ? AND status = 'open'
-                ORDER BY ts_open DESC, id DESC
-                LIMIT 1
-            """, (symbol,)).fetchone()
-        if not row:
-            return None
-        return {"id": row[0], "side": row[1], "qty": float(row[2] or 0), "entry": float(row[3] or 0), "ts_open": row[4]}
-
-# ---------------------- MAIN ----------------------
-def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-    )
-    logging.info("=== Bot starting === (TESTNET by default)")
-    bot = ScalpingBot()
-
-    # Telegram app; run_polling сам управляет лупом — без ошибок закрытия лупа
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+async def _bootstrap(app: Application, bot: ScalpingBot):
     app.add_handler(CommandHandler("start", bot.start_command))
-    app.add_handler(CommandHandler("summary", bot.summary_command))
     app.add_handler(CallbackQueryHandler(bot.button_callback))
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
 
-    app.run_polling(close_loop=False)
+def main():
+    bot = ScalpingBot()
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    import asyncio
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(_bootstrap(application, bot))
+        loop.run_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            loop.run_until_complete(application.stop())
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
