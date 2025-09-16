@@ -1,5 +1,4 @@
 from typing import List, Dict, Any
-import math
 
 def ema(series: List[float], length: int) -> List[float]:
     if length <= 1 or len(series) == 0: return series[:]
@@ -41,7 +40,7 @@ def atr(high: List[float], low: List[float], close: List[float], length: int) ->
             tr = max(high[i]-low[i], abs(high[i]-close[i-1]), abs(low[i]-close[i-1]))
             trs.append(tr)
     if length <= 1: return trs
-    # Wilder's smoothing via EMA approximation
+    # EMA для простоты
     return ema(trs, length)
 
 def compute_indicators(candles: List[Dict[str, Any]], p: Dict[str, Any]) -> Dict[str, Any]:

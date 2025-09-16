@@ -1,4 +1,4 @@
-import os, time, asyncio
+import os, time, asyncio, logging, html
 from typing import List, Dict, Any
 from config import BYBIT_SYMBOL, BYBIT_LEVERAGE, CATEGORY, DATA_DIR, DUMP_DIR, BYBIT_TESTNET
 from bybit_client import BybitClient
@@ -9,21 +9,31 @@ from trader import Trader
 from strategy import decide
 from tg_bot import TgBot
 
+def setup_logging():
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s | %(levelname)s | %(name)s:%(lineno)d | %(message)s"
+    )
+    logging.getLogger("httpx").setLevel(logging.INFO)
+    logging.getLogger("websockets").setLevel(logging.INFO)
+    logging.getLogger("aiogram").setLevel(logging.INFO)
+
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(DUMP_DIR, exist_ok=True)
 
 def candle_from_ws(itm: Dict[str, Any]) -> Dict[str, Any]:
-    # WS kline item fields (unified): { "start": "...", "end": "...", "open": "...", "high": "...", "low": "...", "close": "...", "volume": "...", "confirm": true/false }
-    def f(x): return float(x)
+    def f(x):
+        try: return float(x)
+        except: return 0.0
     return {
         "ts": int(itm.get("start") or 0),
-        "open": f(itm.get("open", 0)), "high": f(itm.get("high", 0)),
-        "low": f(itm.get("low", 0)), "close": f(itm.get("close", 0)),
-        "volume": f(itm.get("volume", 0)), "confirm": bool(itm.get("confirm", False))
+        "open": f(itm.get("open")), "high": f(itm.get("high")),
+        "low": f(itm.get("low")), "close": f(itm.get("close")),
+        "volume": f(itm.get("volume")), "confirm": bool(itm.get("confirm", False))
     }
 
 class Controller:
-    def __init__(self, notifier=None):
+    def __init__(self, notifier: TgBot | None):
         self.client = BybitClient()
         self.symbol = BYBIT_SYMBOL
         self.params = load_params()
@@ -37,6 +47,7 @@ class Controller:
         self.qty_step = 0.001
         self._hour_start = int(time.time() // 3600 * 3600) * 1000
         self.notifier = notifier
+        self.log = logging.getLogger("controller")
 
     async def setup_instrument(self):
         info = await self.client.instruments_info(CATEGORY, self.symbol)
@@ -46,39 +57,41 @@ class Controller:
             lot = lst[0].get("lotSizeFilter", {})
             self.tick_size = float(priceFilter.get("tickSize", "0.1"))
             self.qty_step = float(lot.get("qtyStep", "0.001"))
-
-    async def on_kline_tick(self):
-        # Каждую новую закрытую минуту — решение
-        if len(self.candles_1) < 100 or len(self.candles_5) < 30:
-            return
-        if not self.running:
-            return
-        last = self.candles_1[-1]
-        if not last.get("confirm"):  # ждём закрытия свечи
-            return
-        sig = decide(self.candles_1, self.candles_5, self.params)
-        self.dump.add_signal({"t": int(time.time()*1000), **sig})
-        if sig["decision"] in ("long","short"):
-            # размер по USDT -> qty = size_usdt / price
-            price = last["close"]
-            if self.notifier:
-                await self.notifier.notify(f"📊 Сигнал: {sig['decision']} @ {price}")
-            qty = max(self.params["size_usdt"] / price, self.qty_step)
-            # Биржевые TP/SL по цене из сигнала
-            tp = sig["tp"]; sl = sig["sl"]
-            side = "Buy" if sig["decision"]=="long" else "Sell"
-            r = await self.trader.open_market(side, qty, tp, sl)
-            self.dump.add_trade({"dir": sig["decision"], "opened_at": int(time.time()*1000),
-                                 "open_price": price, "tp": tp, "sl": sl, "reason": sig.get("reason","")})
+        self.log.debug(f"Instrument tick_size={self.tick_size} qty_step={self.qty_step}")
 
     def on_kline(self, interval: str, itm: Dict[str, Any]):
         c = candle_from_ws(itm)
         if interval == "1":
             if not self.candles_1 or c["ts"] >= (self.candles_1[-1]["ts"] or 0):
                 self.candles_1.append(c)
+                if c.get("confirm"):
+                    self.dump.add_candle("1", c)
+                    self.log.debug(f"[WS] 1m closed ts={c['ts']} close={c['close']}")
         else:
             if not self.candles_5 or c["ts"] >= (self.candles_5[-1]["ts"] or 0):
                 self.candles_5.append(c)
+                if c.get("confirm"):
+                    self.dump.add_candle("5", c)
+                    self.log.debug(f"[WS] 5m closed ts={c['ts']} close={c['close']}")
+
+    async def on_kline_tick(self):
+        if not self.running or not self.candles_1 or not self.candles_5:
+            return
+        last = self.candles_1[-1]
+        if not last.get("confirm"):
+            return
+        sig = decide(self.candles_1, self.candles_5, self.params)
+        self.dump.add_signal({"t": int(time.time()*1000), **sig})
+        if sig["decision"] in ("long","short"):
+            price = last["close"]
+            if self.notifier:
+                await self.notifier.notify(f"📊 Сигнал: {sig['decision']} @ {price}")
+            qty = max(self.params["size_usdt"] / max(price, 1e-9), self.qty_step)
+            tp = sig["tp"]; sl = sig["sl"]
+            side = "Buy" if sig["decision"]=="long" else "Sell"
+            await self.trader.open_market(side, qty, tp, sl)
+            self.dump.add_trade({"dir": sig["decision"], "opened_at": int(time.time()*1000),
+                                 "open_price": price, "tp": tp, "sl": sl, "reason": sig.get("reason","")})
 
     async def start(self):
         if self.running: return
@@ -98,8 +111,23 @@ class Controller:
 
     async def status(self) -> str:
         pos = await self.client.position_list(CATEGORY, self.symbol)
-        bal = await self.client.wallet_balance()
-        return f"Account: {'testnet' if BYBIT_TESTNET else 'main'}\nSymbol: {self.symbol}\nTickSize: {self.tick_size} QtyStep: {self.qty_step}\nPositions: {pos}\nBalance: {bal}"
+        return f"Account: {'testnet' if BYBIT_TESTNET else 'main'}\nSymbol: {self.symbol}\nTickSize: {self.tick_size} QtyStep: {self.qty_step}\nPositions: {pos}"
+
+    async def short_balance(self) -> str:
+        try:
+            bal = await self.client.wallet_balance()
+            lst = bal.get("result", {}).get("list", [])
+            # Берём USDT (первый кошелёк)
+            usdt = 0.0
+            if lst:
+                for acc in lst:
+                    for c in acc.get("coin", []):
+                        if c.get("coin") == "USDT":
+                            usdt = float(c.get("equity", "0"))
+                            break
+            return f"Баланс: {usdt:.2f} USDT"
+        except Exception:
+            return "Баланс: н/д"
 
     async def dump_now(self):
         self.dump.set_params_used(self.params)
@@ -119,30 +147,30 @@ class Controller:
             await asyncio.sleep(5)
             now_ms = int(time.time()*1000)
             if now_ms - self._hour_start >= 3600*1000:
-                # закрываем час, отправляем в OpenAI, обновляем параметры, удаляем дамп
                 if self.notifier:
                     await self.notifier.notify("⏱ Новый час: формируем дамп и шлём в ИИ")
                 path = await self.dump_now()
-                await send_to_openai_and_update_params(path)
-                self.params = load_params()  # подменяем сразу
+                await send_to_openai_and_update_params(path, notifier=self.notifier)
+                # перечитать — ИИ мог обновить params.json
+                self.params = load_params()
                 self.dump = HourlyDump()
                 self._hour_start = int(time.time() // 3600 * 3600) * 1000
 
     async def minute_job(self):
-        # опрашиваем раз в ~2с и пытаемся отреагировать на закрытие свечи
         while True:
             try:
                 await self.on_kline_tick()
             except Exception:
-                pass
+                logging.getLogger("controller").exception("minute_job error")
             await asyncio.sleep(2)
 
 async def main():
+    setup_logging()
     bot = TgBot(None)
     ctl = Controller(notifier=bot)
     bot.controller = ctl
     await ctl.ws.connect()
-    # параллельно: TG, мин. цикл, часовой цикл
+
     await asyncio.gather(
         bot.start(),
         ctl.minute_job(),

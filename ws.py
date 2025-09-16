@@ -1,4 +1,4 @@
-import json, asyncio, websockets
+import json, asyncio, websockets, logging
 from typing import Callable, Dict, Any, Optional
 from config import BYBIT_TESTNET
 
@@ -11,9 +11,9 @@ class PublicWS:
         self.symbol = symbol
         self.on_kline = on_kline
         self.intervals = intervals
-        self._ws: Optional[websockets.WebSocketClientProtocol] = None
-        self._task = None
+        self._task: Optional[asyncio.Task] = None
         self._stopped = asyncio.Event()
+        self.log = logging.getLogger("ws")
 
     async def connect(self):
         self._stopped.clear()
@@ -26,18 +26,18 @@ class PublicWS:
 
     async def _run(self):
         subs = [f"kline.{itv}.{self.symbol}" for itv in self.intervals]
+        self.log.info(f"WS connect to {self.url} subs={subs}")
         while not self._stopped.is_set():
             try:
                 async with websockets.connect(self.url, ping_interval=15, ping_timeout=10) as ws:
-                    self._ws = ws
-                    sub_msg = {"op": "subscribe", "args": subs}
-                    await ws.send(json.dumps(sub_msg))
+                    await ws.send(json.dumps({"op": "subscribe", "args": subs}))
                     async for msg in ws:
                         j = json.loads(msg)
-                        if j.get("topic","").startswith("kline."):
-                            data = j.get("data", [])
-                            for itm in data:
-                                interval = j["topic"].split(".")[1]
+                        topic = j.get("topic", "")
+                        if topic.startswith("kline."):
+                            interval = topic.split(".")[1]
+                            for itm in j.get("data", []):
                                 self.on_kline(interval, itm)
             except Exception:
+                self.log.exception("WS error")
                 await asyncio.sleep(1.0)
