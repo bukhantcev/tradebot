@@ -1,4 +1,5 @@
 import os, json, time, shutil, tempfile, asyncio, logging, html
+import re
 from typing import Dict, Any, List
 from config import DUMP_DIR, OPENAI_API_KEY, OPENAI_MODEL
 from params_store import save_params
@@ -74,7 +75,8 @@ async def send_to_openai_and_update_params(dump_path: str, notifier=None):
             {"role": "system", "content": "You are a helpful quant and return pure JSON."},
             {"role": "user", "content": prompt},
             {"role": "user", "content": dump_text}
-        ]
+        ],
+        "response_format": {"type": "json_object"}
     }
     log.info(f"Sending dump to OpenAI: {dump_path}")
     async with httpx.AsyncClient(timeout=90) as cli:
@@ -83,20 +85,13 @@ async def send_to_openai_and_update_params(dump_path: str, notifier=None):
         r.raise_for_status()
         j = r.json()
 
-    # Попытка достать чистый JSON
-    text = ""
-    try:
-        # unified Responses API format may vary — пробуем наиболее частый
-        text = j["output"][0]["content"][0]["text"]
-    except Exception:
-        # запасной путь — просто json.dumps на всякий случай
-        text = ""
+    text = _extract_json_text_from_openai(j)
 
     if notifier:
-        shown = (text or "")[:2000] or "(пустой ответ)"
-        # показываем ответ ИИ целиком (усечённо) в TG
-        import html as _html
-        await notifier.notify(f"🧠 Ответ ИИ:\n<pre>{_html.escape(shown)}</pre>")
+        raw_preview = html.escape(json.dumps(j, ensure_ascii=False)[:1800])
+        txt_preview = html.escape((text or "(пусто)")[:1800])
+        await notifier.notify(f"🧠 Ответ ИИ (raw):\n<pre>{raw_preview}</pre>")
+        await notifier.notify(f"🧠 Ответ ИИ (parsed):\n<pre>{txt_preview}</pre>")
 
     try:
         new_params = json.loads(text)
@@ -113,3 +108,46 @@ async def send_to_openai_and_update_params(dump_path: str, notifier=None):
         os.remove(dump_path)
     except Exception:
         log.exception("Failed to remove dump file")
+
+
+# Helper to extract JSON string from OpenAI response
+def _extract_json_text_from_openai(resp: dict) -> str:
+    """
+    Try to extract JSON string from various OpenAI response formats.
+    """
+    txt = resp.get("output_text")
+    if isinstance(txt, str) and txt.strip():
+        return txt.strip()
+
+    try:
+        out = resp.get("output") or []
+        parts = []
+        for item in out:
+            for c in item.get("content", []):
+                t = c.get("text")
+                if isinstance(t, str):
+                    parts.append(t)
+        if parts:
+            return "\n".join(parts).strip()
+    except Exception:
+        pass
+
+    try:
+        ch = resp.get("choices")
+        if ch and "message" in ch[0] and "content" in ch[0]["message"]:
+            t = ch[0]["message"]["content"]
+            if isinstance(t, str) and t.strip():
+                return t.strip()
+    except Exception:
+        pass
+
+    dump = json.dumps(resp, ensure_ascii=False)
+    m = re.search(r"```json\s*(\{.*?\})\s*```", dump, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+
+    m2 = re.search(r"(\{(?:[^{}]|(?1))*\})", dump)
+    if m2:
+        return m2.group(1).strip()
+
+    return ""
