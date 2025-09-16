@@ -57,7 +57,9 @@ class HourlyDump:
         self._safe_write(fpath, payload)
         return fpath
 
-async def send_to_openai_and_update_params(dump_path: str):
+async def send_to_openai_and_update_params(dump_path: str, notifier=None):
+    if notifier:
+        await notifier.notify("📦 Дамп часа отправлен в ИИ на анализ...")
     if not OPENAI_API_KEY:
         return  # скипаем если нет ключа
     with open(dump_path, "r", encoding="utf-8") as f:
@@ -92,8 +94,11 @@ async def send_to_openai_and_update_params(dump_path: str):
     try:
         new_params = json.loads(text)
         save_params(new_params)
+        if notifier:
+            await notifier.notify("🧠 Параметры обновлены от ИИ")
     except Exception:
-        pass
+        if notifier:
+            await notifier.notify("⚠️ Ошибка разбора ответа от ИИ")
 
     # удаляем отправленный дамп
     try:

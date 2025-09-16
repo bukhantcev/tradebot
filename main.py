@@ -23,7 +23,7 @@ def candle_from_ws(itm: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 class Controller:
-    def __init__(self):
+    def __init__(self, notifier=None):
         self.client = BybitClient()
         self.symbol = BYBIT_SYMBOL
         self.params = load_params()
@@ -36,6 +36,7 @@ class Controller:
         self.tick_size = 0.1
         self.qty_step = 0.001
         self._hour_start = int(time.time() // 3600 * 3600) * 1000
+        self.notifier = notifier
 
     async def setup_instrument(self):
         info = await self.client.instruments_info(CATEGORY, self.symbol)
@@ -60,6 +61,8 @@ class Controller:
         if sig["decision"] in ("long","short"):
             # размер по USDT -> qty = size_usdt / price
             price = last["close"]
+            if self.notifier:
+                await self.notifier.notify(f"📊 Сигнал: {sig['decision']} @ {price}")
             qty = max(self.params["size_usdt"] / price, self.qty_step)
             # Биржевые TP/SL по цене из сигнала
             tp = sig["tp"]; sl = sig["sl"]
@@ -80,14 +83,18 @@ class Controller:
     async def start(self):
         if self.running: return
         await self.setup_instrument()
-        self.trader = Trader(self.client, self.symbol, self.tick_size, self.qty_step)
+        self.trader = Trader(self.client, self.symbol, self.tick_size, self.qty_step, notifier=self.notifier)
         await self.trader.ensure_leverage(BYBIT_LEVERAGE)
         self.running = True
+        if self.notifier:
+            await self.notifier.notify(f"▶️ Старт бота для {self.symbol} ({'testnet' if BYBIT_TESTNET else 'main'})")
 
     async def stop(self):
         self.running = False
         if self.trader:
             await self.trader.close_all()
+        if self.notifier:
+            await self.notifier.notify("⏹ Бот остановлен")
 
     async def status(self) -> str:
         pos = await self.client.position_list(CATEGORY, self.symbol)
@@ -104,6 +111,8 @@ class Controller:
         await self.stop()
         await asyncio.sleep(0.5)
         await self.start()
+        if self.notifier:
+            await self.notifier.notify("♻️ Бот перезапущен")
 
     async def hourly_job(self):
         while True:
@@ -111,6 +120,8 @@ class Controller:
             now_ms = int(time.time()*1000)
             if now_ms - self._hour_start >= 3600*1000:
                 # закрываем час, отправляем в OpenAI, обновляем параметры, удаляем дамп
+                if self.notifier:
+                    await self.notifier.notify("⏱ Новый час: формируем дамп и шлём в ИИ")
                 path = await self.dump_now()
                 await send_to_openai_and_update_params(path)
                 self.params = load_params()  # подменяем сразу
@@ -127,9 +138,10 @@ class Controller:
             await asyncio.sleep(2)
 
 async def main():
-    ctl = Controller()
+    bot = TgBot(None)
+    ctl = Controller(notifier=bot)
+    bot.controller = ctl
     await ctl.ws.connect()
-    bot = TgBot(ctl)
     # параллельно: TG, мин. цикл, часовой цикл
     await asyncio.gather(
         bot.start(),

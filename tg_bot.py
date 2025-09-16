@@ -17,6 +17,12 @@ class TgBot:
         self.dp = Dispatcher()
         self.dp.message.register(self.on_msg, F.chat.id == int(TELEGRAM_CHAT_ID))
 
+    async def notify(self, text: str):
+        try:
+            await self.bot.send_message(chat_id=int(TELEGRAM_CHAT_ID), text=text)
+        except Exception:
+            pass
+
     async def start(self):
         await self.bot.delete_webhook(drop_pending_updates=True)
         await self.dp.start_polling(self.bot)

@@ -4,12 +4,13 @@ from bybit_client import BybitClient
 from config import CATEGORY
 
 class Trader:
-    def __init__(self, client: BybitClient, symbol: str, tick_size: float, qty_step: float):
+    def __init__(self, client: BybitClient, symbol: str, tick_size: float, qty_step: float, notifier: Optional[Any] = None):
         self.client = client
         self.symbol = symbol
         self.tick_size = Decimal(str(tick_size))
         self.qty_step = Decimal(str(qty_step))
         self.positionIdx = 0  # one-way
+        self.notifier = notifier
 
     def _fmt_price(self, p: float) -> str:
         d = Decimal(str(p))
@@ -47,6 +48,9 @@ class Trader:
                                            takeProfit=tp, stopLoss=sl,
                                            tpOrderType="Market", slOrderType="Market",
                                            tpslMode="Full", tpTriggerBy="LastPrice", slTriggerBy="LastPrice")
+        if self.notifier:
+            msg = f"🚀 Открыта позиция {side} {q} {self.symbol}\nTP={tp} SL={sl}"
+            await self.notifier.notify(msg)
         return o
 
     async def close_all(self):
@@ -56,3 +60,5 @@ class Trader:
         await self.client.place_order(CATEGORY, self.symbol, side="Buy", orderType="Market", qty="0",
                                       reduceOnly=True, closeOnTrigger=True, positionIdx=self.positionIdx)
         await self.client.cancel_all(CATEGORY, self.symbol)
+        if self.notifier:
+            await self.notifier.notify(f"🔻 Все позиции по {self.symbol} закрыты")
