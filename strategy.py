@@ -12,8 +12,9 @@ def decide(m1_candles: List[dict], m5_candles: List[dict], params: Dict[str, Any
     # Sticky/anti-churn params (defaults if not provided)
     ind = params.get("indicators", {})
     cross_confirm_bars = int(ind.get("cross_confirm_bars", 1))  # how many closed bars EMA relation must persist
-    rsi_enter_long = float(ind.get("rsi_enter_long", 40.0))
-    rsi_enter_short = float(ind.get("rsi_enter_short", 60.0))
+    # Softer entry gates by default
+    rsi_enter_long = float(ind.get("rsi_enter_long", 55.0))
+    rsi_enter_short = float(ind.get("rsi_enter_short", 45.0))
     # optional exits (not used for entries, but kept for future logic)
     rsi_exit_long = float(ind.get("rsi_exit_long", 60.0))
     rsi_exit_short = float(ind.get("rsi_exit_short", 40.0))
@@ -26,6 +27,7 @@ def decide(m1_candles: List[dict], m5_candles: List[dict], params: Dict[str, Any
 
     # M5 warmup policy: allow fallback to M1 trend while M5 history is short
     allow_m5_warmup = params.get("allow_m5_warmup", True)
+    require_m5_confirm = bool(params.get("require_m5_confirm", True)) == False
     m5_confirm = True
     if len(m5_candles) < required_m5:
         if not allow_m5_warmup:
@@ -134,22 +136,32 @@ def decide(m1_candles: List[dict], m5_candles: List[dict], params: Dict[str, Any
         log.debug(f"[DECIDE] {d}")
         return d
 
-    if up_1 and up_5 and rsi <= rsi_enter_long:
+    # Entry conditions with optional M5 confirmation
+    long_ok = up_1 and ((up_5) or (not require_m5_confirm)) and (rsi <= rsi_enter_long)
+    short_ok = down_1 and ((down_5) or (not require_m5_confirm)) and (rsi >= rsi_enter_short)
+
+    if long_ok:
         d = {"decision": "long", "tp": close + tp, "sl": close - sl,
              "virt_tp": virt_tp, "virt_sl": virt_sl,
-             "reason": f"ema_up({cross_confirm_bars}b)+rsi<=enter_long" + ("+m5" if m5_confirm else "+warmup")}
-        log.info(f"[SIGNAL] ENTER_LONG price={close:.2f} tp={d['tp']:.2f} sl={d['sl']:.2f} rsi={rsi:.2f} ema1={ef:.2f}>{es:.2f} ema5={ema5_f:.2f}>{ema5_s:.2f} virt_tp={d['virt_tp']:.2f} virt_sl={d['virt_sl']:.2f} reason={d['reason']}")
+             "reason": f"ema_up({cross_confirm_bars}b)+rsi<=enter_long" + ("+m5" if (m5_confirm and require_m5_confirm) else "+m5_relaxed")}
+        log.info(f"[SIGNAL] ENTER_LONG price={close:.2f} tp={d['tp']:.2f} sl={d['sl']:.2f} rsi={rsi:.2f} ema1={ef:.2f}>{es:.2f} ema5={ema5_f:.2f}>{ema5_s:.2f} virt_tp={d['virt_tp']:.2f} virt_sl={d['virt_sl']:.2f} require_m5_confirm={require_m5_confirm} reason={d['reason']}")
         log.debug(f"[DECIDE] {d}")
         return d
-    if down_1 and down_5 and rsi >= rsi_enter_short:
+
+    if short_ok:
         d = {"decision": "short", "tp": close - tp, "sl": close + sl,
              "virt_tp": virt_tp, "virt_sl": virt_sl,
-             "reason": f"ema_down({cross_confirm_bars}b)+rsi>=enter_short" + ("+m5" if m5_confirm else "+warmup")}
-        log.info(f"[SIGNAL] ENTER_SHORT price={close:.2f} tp={d['tp']:.2f} sl={d['sl']:.2f} rsi={rsi:.2f} ema1={ef:.2f}<{es:.2f} ema5={ema5_f:.2f}<{ema5_s:.2f} virt_tp={d['virt_tp']:.2f} virt_sl={d['virt_sl']:.2f} reason={d['reason']}")
+             "reason": f"ema_down({cross_confirm_bars}b)+rsi>=enter_short" + ("+m5" if (m5_confirm and require_m5_confirm) else "+m5_relaxed")}
+        log.info(f"[SIGNAL] ENTER_SHORT price={close:.2f} tp={d['tp']:.2f} sl={d['sl']:.2f} rsi={rsi:.2f} ema1={ef:.2f}<{es:.2f} ema5={ema5_f:.2f}<{ema5_s:.2f} virt_tp={d['virt_tp']:.2f} virt_sl={d['virt_sl']:.2f} require_m5_confirm={require_m5_confirm} reason={d['reason']}")
         log.debug(f"[DECIDE] {d}")
         return d
 
     d = {"decision": "hold", "reason": "filters_fail"}
-    log.info(f"[SIGNAL] HOLD price={close:.2f} rsi={rsi:.2f} ema1={ef:.2f}/{es:.2f} ema5={ema5_f:.2f}/{ema5_s:.2f} reason={d['reason']}")
+    hold_details = (f"flags: up1={up_1} down1={down_1} up5={up_5} down5={down_5} "
+                    f"rsi={rsi:.2f}<=L{rsi_enter_long}? {rsi<=rsi_enter_long} "
+                    f">=S{rsi_enter_short}? {rsi>=rsi_enter_short} "
+                    f"m5_confirm={m5_confirm} require_m5_confirm={require_m5_confirm} "
+                    f"long_ok={long_ok if 'long_ok' in locals() else 'n/a'} short_ok={short_ok if 'short_ok' in locals() else 'n/a'}")
+    log.info(f"[SIGNAL] HOLD price={close:.2f} rsi={rsi:.2f} ema1={ef:.2f}/{es:.2f} ema5={ema5_f:.2f}/{ema5_s:.2f} reason={d['reason']} {hold_details}")
     log.debug(f"[DECIDE] {d}")
     return d
