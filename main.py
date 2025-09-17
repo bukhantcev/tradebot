@@ -49,6 +49,12 @@ class Controller:
         self.notifier = notifier
         self.log = logging.getLogger("controller")
 
+        # Anti-churn state
+        self.last_processed_ts: int = 0  # last closed 1m candle we acted on
+        self.prev_decision: str = "hold"  # last non-hold decision
+        self.last_entry_bar_ts: int = 0  # ts of the bar when we last opened a position
+        self.bar_1m_ms: int = 60_000
+
     async def request_ai_params_from_latest_dump(self):
         """On startup/restart: find the latest dump_*.json and request fresh params from OpenAI.
         If nothing found, just log and continue.
@@ -84,15 +90,31 @@ class Controller:
         if not c.get("confirm"):
             self.log.debug(f"[WS_TICK] {interval}m forming ts={c['ts']} close={c['close']}")
         if interval == "1":
-            if not self.candles_1 or c["ts"] >= (self.candles_1[-1]["ts"] or 0):
+            if not self.candles_1:
                 self.candles_1.append(c)
-                if c.get("confirm"):
+            else:
+                last_ts = self.candles_1[-1]["ts"]
+                if c["ts"] > last_ts:
+                    self.candles_1.append(c)
+                elif c["ts"] == last_ts:
+                    # update in place for forming candle
+                    self.candles_1[-1] = c
+            if c.get("confirm"):
+                # only once per closed bar
+                if not self.dump or (self.candles_1 and c["ts"] == self.candles_1[-1]["ts"]):
                     self.dump.add_candle("1", c)
                     self.log.debug(f"[WS] 1m closed ts={c['ts']} close={c['close']}")
         else:
-            if not self.candles_5 or c["ts"] >= (self.candles_5[-1]["ts"] or 0):
+            if not self.candles_5:
                 self.candles_5.append(c)
-                if c.get("confirm"):
+            else:
+                last_ts5 = self.candles_5[-1]["ts"]
+                if c["ts"] > last_ts5:
+                    self.candles_5.append(c)
+                elif c["ts"] == last_ts5:
+                    self.candles_5[-1] = c
+            if c.get("confirm"):
+                if not self.dump or (self.candles_5 and c["ts"] == self.candles_5[-1]["ts"]):
                     self.dump.add_candle("5", c)
                     self.log.debug(f"[WS] 5m closed ts={c['ts']} close={c['close']}")
 
@@ -102,18 +124,45 @@ class Controller:
         last = self.candles_1[-1]
         if not last.get("confirm"):
             return
+        # act only once per closed bar
+        if last["ts"] == self.last_processed_ts:
+            self.log.debug(f"[SKIP] already processed bar ts={last['ts']}")
+            return
+
+        # read cooldown from params (defaults to 3 bars)
+        min_bars_between = int(self.params.get("min_bars_between_trades", 3))
+        if self.last_entry_bar_ts and (last["ts"] - self.last_entry_bar_ts) < min_bars_between * self.bar_1m_ms:
+            remain = (min_bars_between * self.bar_1m_ms - (last["ts"] - self.last_entry_bar_ts)) // self.bar_1m_ms
+            self.log.info(f"[SKIP] cooldown {remain} bars remaining")
+            self.last_processed_ts = last["ts"]
+            return
+
         sig = decide(self.candles_1, self.candles_5, self.params)
         self.dump.add_signal({"t": int(time.time()*1000), **sig})
-        if sig["decision"] in ("long","short"):
+
+        # process only on decision change and only for entries
+        if sig["decision"] in ("long", "short"):
+            if sig["decision"] == self.prev_decision:
+                self.log.info(f"[SKIP] same decision as previous: {sig['decision']}")
+                self.last_processed_ts = last["ts"]
+                return
             price = last["close"]
             if self.notifier:
                 await self.notifier.notify(f"📊 Сигнал: {sig['decision']} @ {price}")
             qty = max(self.params["size_usdt"] / max(price, 1e-9), self.qty_step)
             tp = sig["tp"]; sl = sig["sl"]
-            side = "Buy" if sig["decision"]=="long" else "Sell"
+            side = "Buy" if sig["decision"] == "long" else "Sell"
             await self.trader.open_market(side, qty, tp, sl)
             self.dump.add_trade({"dir": sig["decision"], "opened_at": int(time.time()*1000),
-                                 "open_price": price, "tp": tp, "sl": sl, "reason": sig.get("reason","")})
+                                 "open_price": price, "tp": tp, "sl": sl, "reason": sig.get("reason", "")})
+            # update anti-churn state
+            self.prev_decision = sig["decision"]
+            self.last_entry_bar_ts = last["ts"]
+        else:
+            # reset prev decision on hold
+            self.prev_decision = "hold"
+
+        self.last_processed_ts = last["ts"]
 
     async def preload_history(self):
         """Load enough historical candles on startup to satisfy strategy warmup, then continue."""
