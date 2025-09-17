@@ -3,7 +3,7 @@ from typing import List, Dict, Any
 from config import BYBIT_SYMBOL, BYBIT_LEVERAGE, CATEGORY, DATA_DIR, DUMP_DIR, BYBIT_TESTNET
 from bybit_client import BybitClient
 from ws import PublicWS, preload_klines
-from params_store import load_params
+from params_store import load_params, save_params
 from hourly_dump import HourlyDump, send_to_openai_and_update_params
 from trader import Trader
 from strategy import decide
@@ -125,9 +125,11 @@ class Controller:
             before_m5 = len(self.candles_5)
             self.log.info(f"[PRELOAD] requesting klines: m1={required_m1} m5={required_m5}")
             self.log.info("[PRELOAD] start REST fetch for historical klines")
-            await preload_klines(self.symbol, self.on_kline, {"1": required_m1, "5": required_m5}, testnet=BYBIT_TESTNET)
+            await preload_klines(self.symbol, self.on_kline, {"1": required_m1, "5": required_m5}, testnet=BYBIT_TESTNET, category=CATEGORY)
             after_m1 = len(self.candles_1)
             after_m5 = len(self.candles_5)
+            if after_m1 < required_m1 or after_m5 < required_m5:
+                self.log.warning(f"[PRELOAD] insufficient candles after REST: m1={after_m1}/{required_m1} m5={after_m5}/{required_m5}")
             self.log.info(f"[PRELOAD] done REST fetch; added m1={after_m1-before_m1} m5={after_m5-before_m5}")
         except Exception:
             self.log.exception("[PRELOAD] failed (will continue with WS only)")
@@ -162,8 +164,14 @@ class Controller:
         self.running = False
         if self.trader:
             await self.trader.close_all()
+        # Persist current (possibly AI-updated) params as defaults for next runs
+        try:
+            save_params(self.params)
+            self.log.info("[PARAMS] persisted on stop (set as new defaults)")
+        except Exception:
+            self.log.exception("[PARAMS] failed to persist on stop")
         if self.notifier:
-            await self.notifier.notify("⏹ Бот остановлен")
+            await self.notifier.notify("⏹ Бот остановлен (параметры сохранены как дефолтные)")
 
     async def status(self) -> str:
         pos = await self.client.position_list(CATEGORY, self.symbol)
@@ -186,9 +194,24 @@ class Controller:
             return "Баланс: н/д"
 
     async def dump_now(self):
-        self.dump.set_params_used(self.params)
-        self.dump.set_meta(self.symbol, "testnet" if BYBIT_TESTNET else "main", self._hour_start, int(time.time()*1000))
-        path = self.dump.flush_to_file()
+        """Build a start_dump from current in-memory candles + current params (fresh HourlyDump)."""
+        hd = HourlyDump()
+        # meta window by 1m candles if available
+        if self.candles_1:
+            start_ts = int(self.candles_1[0]["ts"]) if "ts" in self.candles_1[0] else int(time.time()*1000)
+            end_ts = int(self.candles_1[-1]["ts"]) if "ts" in self.candles_1[-1] else int(time.time()*1000)
+        else:
+            start_ts = end_ts = int(time.time()*1000)
+        hd.set_meta(self.symbol, "testnet" if BYBIT_TESTNET else "main", start_ts, end_ts)
+        # inject candles from memory (preload)
+        for c in self.candles_1:
+            hd.add_candle("1", c)
+        for c in self.candles_5:
+            hd.add_candle("5", c)
+        # params currently loaded (defaults at startup)
+        hd.set_params_used(self.params)
+        path = hd.flush_to_file()
+        self.log.info(f"[BOOTSTRAP] start_dump written: {path}")
         return path
 
     async def restart(self):
