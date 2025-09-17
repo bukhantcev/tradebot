@@ -96,7 +96,7 @@ async def send_to_openai_and_update_params(dump_path: str, notifier=None):
                 ]
             }
         ],
-        "response_format": {"type": "json_object"}
+        "text": {"format": "json"}
     }
 
     log.info(f"Sending dump to OpenAI: {dump_path}")
