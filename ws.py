@@ -54,23 +54,36 @@ async def preload_klines(symbol: str, on_kline, counts: dict, *, testnet: bool, 
                         break
                     # newest→oldest → oldest→newest
                     data = list(reversed(data))
-                    # normalize and extend accumulator
+                    # normalize and extend accumulator (v5: 7 fields [start, open, high, low, close, volume, turnover])
                     appended = 0
                     for row in data:
                         try:
-                            if isinstance(row, list) and len(row) >= 8:
-                                item = {
-                                    "start": int(row[0]),
-                                    "end": int(row[1]),
-                                    "open": float(row[2]),
-                                    "high": float(row[3]),
-                                    "low": float(row[4]),
-                                    "close": float(row[5]),
-                                    "volume": float(row[6]),
-                                    "turnover": float(row[7]),
-                                    "confirm": True,
-                                }
-                            elif isinstance(row, dict) and {"start","end","open","high","low","close"}.issubset(row.keys()):
+                            if isinstance(row, list):
+                                if len(row) >= 7:
+                                    start_i = int(row[0])
+                                    item = {
+                                        "start": start_i,
+                                        # synthesize candle end as next start: start + step_ms
+                                        "end": start_i + step_ms,
+                                        "open": float(row[1]),
+                                        "high": float(row[2]),
+                                        "low": float(row[3]),
+                                        "close": float(row[4]),
+                                        "volume": float(row[5]),
+                                        "turnover": float(row[6]),
+                                        "confirm": True,
+                                    }
+                                else:
+                                    continue
+                            elif isinstance(row, dict) and {"start","open","high","low","close"}.issubset(row.keys()):
+                                row["start"] = int(row["start"])  # ensure ms
+                                row["end"] = row.get("end") or (row["start"] + step_ms)
+                                row["open"] = float(row["open"])
+                                row["high"] = float(row["high"])
+                                row["low"] = float(row["low"])
+                                row["close"] = float(row["close"])
+                                if "volume" in row: row["volume"] = float(row["volume"])
+                                if "turnover" in row: row["turnover"] = float(row["turnover"])
                                 row["confirm"] = True
                                 item = row
                             else:
