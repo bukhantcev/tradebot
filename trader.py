@@ -39,6 +39,7 @@ class Trader:
         q = self._fmt_qty(qty)
         tp = self._fmt_price(tp_price) if tp_price else None
         sl = self._fmt_price(sl_price) if sl_price else None
+        self.log.info(f"[ORDER_ATTEMPT] side={side} qty={q} tp={tp} sl={sl}")
         self.log.info(f"OPEN {side} qty={q} tp={tp} sl={sl}")
         body = {
             "category": CATEGORY, "symbol": self.symbol, "side": side,
@@ -47,6 +48,10 @@ class Trader:
             "tpOrderType": "Market", "slOrderType": "Market"
         }
         o = await self.client.place_order(body)
+        if o.get("retCode") == 0:
+            self.log.info(f"[ORDER_OK] side={side} qty={q} orderId={o.get('result',{}).get('orderId')} resp={o}")
+        else:
+            self.log.error(f"[ORDER_FAIL] side={side} qty={q} code={o.get('retCode')} msg={o.get('retMsg')} resp={o}")
         self.log.debug(f"place_order resp={o}")
 
         # После исполнения — проставим TP/SL на позицию
