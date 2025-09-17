@@ -41,7 +41,7 @@ class Controller:
         self.candles_1: List[dict] = []
         self.candles_5: List[dict] = []
         self.running = False
-        self.ws = PublicWS(self.symbol, self.on_kline, intervals=("1","5"))
+        self.ws = PublicWS(self.symbol, self.on_kline, intervals=("1","5"), deliver_only_confirm=True)
         self.trader: Trader | None = None
         self.tick_size = 0.1
         self.qty_step = 0.001
@@ -81,6 +81,8 @@ class Controller:
 
     def on_kline(self, interval: str, itm: Dict[str, Any]):
         c = candle_from_ws(itm)
+        if not c.get("confirm"):
+            self.log.debug(f"[WS_TICK] {interval}m forming ts={c['ts']} close={c['close']}")
         if interval == "1":
             if not self.candles_1 or c["ts"] >= (self.candles_1[-1]["ts"] or 0):
                 self.candles_1.append(c)
@@ -119,8 +121,14 @@ class Controller:
             ema_slow = self.params["indicators"]["ema_slow"]
             required_m1 = max(50, ema_slow) + 1
             required_m5 = ema_slow + 1
+            before_m1 = len(self.candles_1)
+            before_m5 = len(self.candles_5)
             self.log.info(f"[PRELOAD] requesting klines: m1={required_m1} m5={required_m5}")
+            self.log.info("[PRELOAD] start REST fetch for historical klines")
             await preload_klines(self.symbol, self.on_kline, {"1": required_m1, "5": required_m5}, testnet=BYBIT_TESTNET)
+            after_m1 = len(self.candles_1)
+            after_m5 = len(self.candles_5)
+            self.log.info(f"[PRELOAD] done REST fetch; added m1={after_m1-before_m1} m5={after_m5-before_m5}")
         except Exception:
             self.log.exception("[PRELOAD] failed (will continue with WS only)")
 

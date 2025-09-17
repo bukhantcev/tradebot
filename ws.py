@@ -12,6 +12,7 @@ async def preload_klines(symbol: str, on_kline, counts: dict, *, testnet: bool, 
     """
     base = "https://api-testnet.bybit.com" if testnet else "https://api.bybit.com"
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as cli:
+        log_ws = logging.getLogger("ws")
         for interval, need in counts.items():
             if not need or need <= 0:
                 continue
@@ -19,11 +20,15 @@ async def preload_klines(symbol: str, on_kline, counts: dict, *, testnet: bool, 
             url = f"{base}/v5/market/kline"
             params = {"category": category, "symbol": symbol, "interval": interval, "limit": str(limit)}
             try:
+                log_ws.info(f"[PRELOAD] GET {url} params={params}")
                 r = await cli.get(url, params=params)
+                log_ws.info(f"[PRELOAD] HTTP {r.status_code} len={len(r.text)} interval={interval}")
                 if r.status_code != 200:
-                    logging.getLogger("ws").warning(f"[PRELOAD] kline {interval}m HTTP {r.status_code}: {r.text[:200]}")
+                    log_ws.warning(f"[PRELOAD] kline {interval}m HTTP {r.status_code}: {r.text[:200]}")
                     continue
                 data = r.json().get("result", {}).get("list") or []
+                if not data:
+                    log_ws.warning(f"[PRELOAD] empty list for interval={interval} (symbol={symbol})")
                 # API returns newest→oldest; reverse to oldest→newest
                 data = list(reversed(data))
                 for row in data:
@@ -48,10 +53,10 @@ async def preload_klines(symbol: str, on_kline, counts: dict, *, testnet: bool, 
                     try:
                         on_kline(interval, item)
                     except Exception:
-                        logging.getLogger("ws").exception("[PRELOAD] on_kline failed")
-                logging.getLogger("ws").info(f"[PRELOAD] emitted {len(data)} candles for {interval}m")
+                        log_ws.exception("[PRELOAD] on_kline failed")
+                log_ws.info(f"[PRELOAD] emitted {len(data)} candles for {interval}m (symbol={symbol})")
             except Exception:
-                logging.getLogger("ws").exception(f"[PRELOAD] failed to fetch {interval}m klines")
+                log_ws.exception(f"[PRELOAD] failed to fetch {interval}m klines")
 
 class PublicWS:
     def __init__(self, symbol: str, on_kline: Callable[[str, Dict[str, Any]], None], intervals=("1", "5"), deliver_only_confirm: bool = True):
