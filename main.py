@@ -1,4 +1,4 @@
-import os, time, asyncio, logging, html
+import os, time, asyncio, logging, html, httpx
 from typing import List, Dict, Any
 from config import BYBIT_SYMBOL, BYBIT_LEVERAGE, CATEGORY, DATA_DIR, DUMP_DIR, BYBIT_TESTNET
 from bybit_client import BybitClient
@@ -147,14 +147,28 @@ class Controller:
             await asyncio.sleep(5)
             now_ms = int(time.time()*1000)
             if now_ms - self._hour_start >= 3600*1000:
-                if self.notifier:
-                    await self.notifier.notify("⏱ Новый час: формируем дамп и шлём в ИИ")
-                path = await self.dump_now()
-                await send_to_openai_and_update_params(path, notifier=self.notifier)
-                # перечитать — ИИ мог обновить params.json
-                self.params = load_params()
-                self.dump = HourlyDump()
-                self._hour_start = int(time.time() // 3600 * 3600) * 1000
+                try:
+                    if self.notifier:
+                        await self.notifier.notify("⏱ Новый час: формируем дамп и шлём в ИИ")
+                    path = await self.dump_now()
+                    await send_to_openai_and_update_params(path, notifier=self.notifier)
+                    # перечитать — ИИ мог обновить params.json
+                    self.params = load_params()
+                    self.dump = HourlyDump()
+                    self._hour_start = int(time.time() // 3600 * 3600) * 1000
+                except (httpx.HTTPStatusError, httpx.RequestError) as e:
+                    self.log.error("hourly_job OpenAI error: %s", str(e))
+                    if self.notifier:
+                        await self.notifier.notify(
+                            f"⚠️ Hourly: сбой запроса к OpenAI, работаем дальше.\n<pre>{html.escape(str(e))}</pre>"
+                        )
+                    # не прерываем цикл — просто пропускаем этот час
+                except Exception as e:
+                    self.log.exception("hourly_job unexpected error")
+                    if self.notifier:
+                        await self.notifier.notify(
+                            f"⚠️ Hourly: непредвиденная ошибка, цикл не остановлен.\n<pre>{html.escape(str(e))}</pre>"
+                        )
 
     async def minute_job(self):
         while True:

@@ -63,27 +63,61 @@ async def send_to_openai_and_update_params(dump_path: str, notifier=None):
     with open(dump_path, "r", encoding="utf-8") as f:
         dump_text = f.read()
 
+    # Trim too-large dumps to avoid 400 due to payload size
+    MAX_CHARS = 200_000  # ~200k chars is a safe envelope for Responses API
+    trimmed_note = ""
+    if len(dump_text) > MAX_CHARS:
+        dump_text = dump_text[-MAX_CHARS:]
+        trimmed_note = "(усечено до последних ~200k символов)\n"
+
     import httpx
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    prompt = (
-        "Ты — квант-аналитик-скальпер. Изучив JSON-лог, предложи НОВЫЕ параметры стратегии.\n"
-        "Верни ТОЛЬКО JSON того же формата, что и params.json. Без комментариев и текста."
+
+    instruction = (
+        "Ты — квант-аналитик-скальпер. Проанализируй журнал торговли за последний час и предложи НОВЫЕ параметры стратегии.\n"
+        "Верни ТОЛЬКО JSON строго формата params.json (валидный JSON-объект) — без комментариев и лишнего текста."
     )
+
     body = {
         "model": OPENAI_MODEL,
         "input": [
-            {"role": "system", "content": "You are a helpful quant and return pure JSON."},
-            {"role": "user", "content": prompt},
-            {"role": "user", "content": dump_text}
+            {
+                "role": "system",
+                "content": [
+                    {"type": "input_text", "text": "Ты отвечаешь исключительно валидным JSON без преамбул и пояснений."}
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": instruction},
+                    {"type": "input_text", "text": f"Исходный журнал ниже {trimmed_note}"},
+                    {"type": "input_text", "text": dump_text}
+                ]
+            }
         ],
         "response_format": {"type": "json_object"}
     }
+
     log.info(f"Sending dump to OpenAI: {dump_path}")
-    async with httpx.AsyncClient(timeout=90) as cli:
-        r = await cli.post("https://api.openai.com/v1/responses", headers=headers, json=body)
-        log.debug(f"OpenAI resp status={r.status_code} len={len(r.text)}")
-        r.raise_for_status()
-        j = r.json()
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(90.0)) as cli:
+            r = await cli.post("https://api.openai.com/v1/responses", headers=headers, json=body)
+            log.debug(f"OpenAI resp status={r.status_code} len={len(r.text)}")
+            if r.status_code >= 400:
+                # Log body and notify, then exit gracefully without raising
+                err_text = r.text[:4000]
+                log.error(f"OpenAI 4xx/5xx body: {err_text}")
+                if notifier:
+                    safe_err = html.escape(err_text)
+                    await notifier.notify(f"❌ OpenAI отклонил запрос ({r.status_code}). Тело ответа:\n<pre>{safe_err}</pre>")
+                return
+            j = r.json()
+    except httpx.RequestError as e:
+        log.exception("OpenAI request failed")
+        if notifier:
+            await notifier.notify(f"❌ Сбой запроса к OpenAI: {html.escape(str(e))}")
+        return
 
     text = _extract_json_text_from_openai(j)
 

@@ -15,7 +15,7 @@ BYBIT_SYMBOL = os.getenv("BYBIT_SYMBOL", "BTCUSDT")
 BYBIT_LEVERAGE = int(os.getenv("BYBIT_LEVERAGE", "10"))
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 
 TG_TOKEN_LOCAL = os.getenv("TG_TOKEN_LOCAL", "").strip()
 TG_TOKEN_SERVER = os.getenv("TG_TOKEN_SERVER", "").strip()
