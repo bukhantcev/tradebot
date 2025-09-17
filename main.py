@@ -49,6 +49,26 @@ class Controller:
         self.notifier = notifier
         self.log = logging.getLogger("controller")
 
+    async def request_ai_params_from_latest_dump(self):
+        """On startup/restart: find the latest dump_*.json and request fresh params from OpenAI.
+        If nothing found, just log and continue.
+        """
+        try:
+            files = [f for f in os.listdir(DUMP_DIR) if f.endswith('.json')]
+            if not files:
+                self.log.info("No dump_*.json found for bootstrap; skipping initial OpenAI request")
+                return
+            paths = [os.path.join(DUMP_DIR, f) for f in files]
+            latest = max(paths, key=lambda p: os.path.getmtime(p))
+            if self.notifier:
+                await self.notifier.notify("🧠 Старт: обновляю параметры из последнего дампа через ИИ…")
+            await send_to_openai_and_update_params(latest, notifier=self.notifier)
+            # ИИ мог обновить params.json — перечитаем
+            self.params = load_params()
+            self.log.info("Startup params refreshed from AI via latest dump: %s", os.path.basename(latest))
+        except Exception:
+            self.log.exception("Failed to bootstrap params from latest dump")
+
     async def setup_instrument(self):
         info = await self.client.instruments_info(CATEGORY, self.symbol)
         lst = info.get("result", {}).get("list") or []
@@ -101,6 +121,7 @@ class Controller:
         self.running = True
         if self.notifier:
             await self.notifier.notify(f"▶️ Старт бота для {self.symbol} ({'testnet' if BYBIT_TESTNET else 'main'})")
+        await self.request_ai_params_from_latest_dump()
 
     async def stop(self):
         self.running = False

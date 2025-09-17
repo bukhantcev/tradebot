@@ -96,7 +96,9 @@ async def send_to_openai_and_update_params(dump_path: str, notifier=None):
                 ]
             }
         ],
-        "text": {"format": "json"}
+        "text": {
+            "format": {"type": "json_object"}
+        }
     }
 
     log.info(f"Sending dump to OpenAI: {dump_path}")
@@ -105,14 +107,37 @@ async def send_to_openai_and_update_params(dump_path: str, notifier=None):
             r = await cli.post("https://api.openai.com/v1/responses", headers=headers, json=body)
             log.debug(f"OpenAI resp status={r.status_code} len={len(r.text)}")
             if r.status_code >= 400:
-                # Log body and notify, then exit gracefully without raising
                 err_text = r.text[:4000]
-                log.error(f"OpenAI 4xx/5xx body: {err_text}")
-                if notifier:
-                    safe_err = html.escape(err_text)
-                    await notifier.notify(f"❌ OpenAI отклонил запрос ({r.status_code}). Тело ответа:\n<pre>{safe_err}</pre>")
-                return
-            j = r.json()
+                try:
+                    err_json = r.json()
+                except Exception:
+                    err_json = {}
+                err_obj = err_json.get("error") or {}
+                msg = (err_obj.get("message") or "")
+                param = (err_obj.get("param") or "")
+
+                # If the model/version doesn't support text.format or the type is wrong, retry without JSON mode
+                if (param in ("text.format", "response_format")) or ("not supported" in msg.lower()) or ("invalid type for 'text.format'" in msg.lower()):
+                    log.warning(f"Retrying OpenAI without text.format due to error: {msg or err_text}")
+                    body2 = {k: v for k, v in body.items() if k != "text"}
+                    r2 = await cli.post("https://api.openai.com/v1/responses", headers=headers, json=body2)
+                    log.debug(f"OpenAI retry resp status={r2.status_code} len={len(r2.text)}")
+                    if r2.status_code >= 400:
+                        err_text2 = r2.text[:4000]
+                        log.error(f"OpenAI retry 4xx/5xx body: {err_text2}")
+                        if notifier:
+                            safe_err2 = html.escape(err_text2)
+                            await notifier.notify(f"❌ OpenAI отклонил повторный запрос ({r2.status_code}). Тело ответа:\n<pre>{safe_err2}</pre>")
+                        return
+                    j = r2.json()
+                else:
+                    log.error(f"OpenAI 4xx/5xx body: {err_text}")
+                    if notifier:
+                        safe_err = html.escape(err_text)
+                        await notifier.notify(f"❌ OpenAI отклонил запрос ({r.status_code}). Тело ответа:\n<pre>{safe_err}</pre>")
+                    return
+            else:
+                j = r.json()
     except httpx.RequestError as e:
         log.exception("OpenAI request failed")
         if notifier:
