@@ -132,8 +132,23 @@ class Controller:
         self.running = True
         if self.notifier:
             await self.notifier.notify(f"▶️ Старт бота для {self.symbol} ({'testnet' if BYBIT_TESTNET else 'main'})")
-        await self.request_ai_params_from_latest_dump()
+
+        # 1) Сначала подтягиваем историю для прогрева индикаторов
         await self.preload_history()
+
+        # 2) Делаем моментальный дамп из прогретых данных и отправляем в ИИ,
+        # чтобы стартовые параметры были актуальными прямо на запуске
+        try:
+            bootstrap_dump = await self.dump_now()
+            await send_to_openai_and_update_params(bootstrap_dump, notifier=self.notifier)
+            self.params = load_params()
+            self.log.info("[BOOTSTRAP] AI params refreshed from preloaded dump")
+        except Exception:
+            self.log.exception("[BOOTSTRAP] failed to refresh params from AI; continue with existing params")
+
+        # 3) После этого подключаем вебсокет и идём в торговый цикл
+        await self.ws.connect()
+        self.log.info("[WS] connected after preload")
 
     async def stop(self):
         self.running = False
@@ -216,7 +231,7 @@ async def main():
     bot = TgBot(None)
     ctl = Controller(notifier=bot)
     bot.controller = ctl
-    await ctl.ws.connect()
+    await ctl.start()
 
     await asyncio.gather(
         bot.start(),
