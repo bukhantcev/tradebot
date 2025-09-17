@@ -2,7 +2,7 @@ import os, time, asyncio, logging, html, httpx
 from typing import List, Dict, Any
 from config import BYBIT_SYMBOL, BYBIT_LEVERAGE, CATEGORY, DATA_DIR, DUMP_DIR, BYBIT_TESTNET
 from bybit_client import BybitClient
-from ws import PublicWS
+from ws import PublicWS, preload_klines
 from params_store import load_params
 from hourly_dump import HourlyDump, send_to_openai_and_update_params
 from trader import Trader
@@ -113,6 +113,17 @@ class Controller:
             self.dump.add_trade({"dir": sig["decision"], "opened_at": int(time.time()*1000),
                                  "open_price": price, "tp": tp, "sl": sl, "reason": sig.get("reason","")})
 
+    async def preload_history(self):
+        """Load enough historical candles on startup to satisfy strategy warmup, then continue."""
+        try:
+            ema_slow = self.params["indicators"]["ema_slow"]
+            required_m1 = max(50, ema_slow) + 1
+            required_m5 = ema_slow + 1
+            self.log.info(f"[PRELOAD] requesting klines: m1={required_m1} m5={required_m5}")
+            await preload_klines(self.symbol, self.on_kline, {"1": required_m1, "5": required_m5}, testnet=BYBIT_TESTNET)
+        except Exception:
+            self.log.exception("[PRELOAD] failed (will continue with WS only)")
+
     async def start(self):
         if self.running: return
         await self.setup_instrument()
@@ -122,6 +133,7 @@ class Controller:
         if self.notifier:
             await self.notifier.notify(f"▶️ Старт бота для {self.symbol} ({'testnet' if BYBIT_TESTNET else 'main'})")
         await self.request_ai_params_from_latest_dump()
+        await self.preload_history()
 
     async def stop(self):
         self.running = False

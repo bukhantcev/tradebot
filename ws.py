@@ -1,9 +1,57 @@
 import json, asyncio, websockets, logging
+import httpx
 from typing import Callable, Dict, Any, Optional
 from config import BYBIT_TESTNET
 
 WS_PUBLIC_MAIN = "wss://stream.bybit.com/v5/public/linear"
 WS_PUBLIC_TEST = "wss://stream-testnet.bybit.com/v5/public/linear"
+
+async def preload_klines(symbol: str, on_kline, counts: dict, *, testnet: bool, category: str = "linear"):
+    """Fetch historical klines from Bybit REST v5 and emit them into on_kline(interval, item).
+    counts example: {"1": 300, "5": 200}. Emits oldest→newest, all with confirm=True.
+    """
+    base = "https://api-testnet.bybit.com" if testnet else "https://api.bybit.com"
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as cli:
+        for interval, need in counts.items():
+            if not need or need <= 0:
+                continue
+            limit = min(need, 1000)
+            url = f"{base}/v5/market/kline"
+            params = {"category": category, "symbol": symbol, "interval": interval, "limit": str(limit)}
+            try:
+                r = await cli.get(url, params=params)
+                if r.status_code != 200:
+                    logging.getLogger("ws").warning(f"[PRELOAD] kline {interval}m HTTP {r.status_code}: {r.text[:200]}")
+                    continue
+                data = r.json().get("result", {}).get("list") or []
+                # API returns newest→oldest; reverse to oldest→newest
+                data = list(reversed(data))
+                for row in data:
+                    # Bybit returns strings in list order: [start,end,open,high,low,close,volume,turnover]
+                    if isinstance(row, list) and len(row) >= 8:
+                        item = {
+                            "start": int(row[0]),
+                            "end": int(row[1]),
+                            "open": float(row[2]),
+                            "high": float(row[3]),
+                            "low": float(row[4]),
+                            "close": float(row[5]),
+                            "volume": float(row[6]),
+                            "turnover": float(row[7]),
+                            "confirm": True,
+                        }
+                    elif isinstance(row, dict):
+                        row["confirm"] = True
+                        item = row
+                    else:
+                        continue
+                    try:
+                        on_kline(interval, item)
+                    except Exception:
+                        logging.getLogger("ws").exception("[PRELOAD] on_kline failed")
+                logging.getLogger("ws").info(f"[PRELOAD] emitted {len(data)} candles for {interval}m")
+            except Exception:
+                logging.getLogger("ws").exception(f"[PRELOAD] failed to fetch {interval}m klines")
 
 class PublicWS:
     def __init__(self, symbol: str, on_kline: Callable[[str, Dict[str, Any]], None], intervals=("1", "5"), deliver_only_confirm: bool = True):

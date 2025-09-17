@@ -53,6 +53,41 @@ class HourlyDump:
         log.info(f"Dump written to {fpath}")
         return fpath
 
+
+# Smart shrinker: keep only recent tails of arrays and compact JSON to avoid TPM limits
+def _shrink_dump_payload(dump_text: str, *, m1_max=300, m5_max=200, ob_snaps_max=10, dens_max=60, signals_max=120, trades_max=120) -> str:
+    try:
+        j = json.loads(dump_text)
+        mkt = j.get("market", {})
+        # slice candles
+        if isinstance(mkt.get("m1"), list):
+            mkt["m1"] = mkt["m1"][-m1_max:]
+        if isinstance(mkt.get("m5"), list):
+            mkt["m5"] = mkt["m5"][-m5_max:]
+        ob = mkt.get("orderbook", {})
+        if isinstance(ob.get("snapshots"), list):
+            ob["snapshots"] = ob["snapshots"][-ob_snaps_max:]
+        if isinstance(ob.get("densities"), list):
+            ob["densities"] = ob["densities"][-dens_max:]
+        # signals / trades tails
+        if isinstance(j.get("signals"), list):
+            j["signals"] = j["signals"][-signals_max:]
+        if isinstance(j.get("trades"), list):
+            j["trades"] = j["trades"][-trades_max:]
+        # telemetry: keep only last errors and last 10 latency entries per key
+        tel = j.get("telemetry", {})
+        if isinstance(tel.get("errors"), list):
+            tel["errors"] = tel["errors"][-20:]
+        if isinstance(tel.get("latency_ms"), dict):
+            tel["latency_ms"] = {k: v[-10:] if isinstance(v, list) else v for k, v in tel["latency_ms"].items()}
+        j["telemetry"] = tel
+        # write compact JSON (no spaces) to reduce tokens
+        return json.dumps(j, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        # Fallback: if not JSON, return original text
+        return dump_text
+
+
 async def send_to_openai_and_update_params(dump_path: str, notifier=None):
     if not OPENAI_API_KEY:
         log.warning("OPENAI_API_KEY is empty, skip tuning")
@@ -63,12 +98,9 @@ async def send_to_openai_and_update_params(dump_path: str, notifier=None):
     with open(dump_path, "r", encoding="utf-8") as f:
         dump_text = f.read()
 
-    # Trim too-large dumps to avoid 400 due to payload size
-    MAX_CHARS = 200_000  # ~200k chars is a safe envelope for Responses API
-    trimmed_note = ""
-    if len(dump_text) > MAX_CHARS:
-        dump_text = dump_text[-MAX_CHARS:]
-        trimmed_note = "(усечено до последних ~200k символов)\n"
+    # Smart shrink to avoid TPM/token limits
+    dump_text = _shrink_dump_payload(dump_text)
+    trimmed_note = "(умно сжато для лимитов токенов)\n"
 
     import httpx
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
@@ -116,12 +148,15 @@ async def send_to_openai_and_update_params(dump_path: str, notifier=None):
                 msg = (err_obj.get("message") or "")
                 param = (err_obj.get("param") or "")
 
-                # If the model/version doesn't support text.format or the type is wrong, retry without JSON mode
-                if (param in ("text.format", "response_format")) or ("not supported" in msg.lower()) or ("invalid type for 'text.format'" in msg.lower()):
-                    log.warning(f"Retrying OpenAI without text.format due to error: {msg or err_text}")
-                    body2 = {k: v for k, v in body.items() if k != "text"}
-                    r2 = await cli.post("https://api.openai.com/v1/responses", headers=headers, json=body2)
-                    log.debug(f"OpenAI retry resp status={r2.status_code} len={len(r2.text)}")
+                # Handle TPM/rate limit by shrinking further and retrying once
+                if "tokens per min" in msg.lower() or "rate_limit_exceeded" in (err_obj.get("code") or "").lower():
+                    log.warning(f"Retrying OpenAI with extra shrink due to rate limit: {msg}")
+                    smaller = _shrink_dump_payload(dump_text, m1_max=180, m5_max=120, ob_snaps_max=6, dens_max=40, signals_max=80, trades_max=80)
+                    body_small = dict(body)
+                    # Replace only the user dump content part
+                    body_small["input"][1]["content"][2]["text"] = smaller
+                    r2 = await cli.post("https://api.openai.com/v1/responses", headers=headers, json=body_small)
+                    log.debug(f"OpenAI retry(resp-size) status={r2.status_code} len={len(r2.text)}")
                     if r2.status_code >= 400:
                         err_text2 = r2.text[:4000]
                         log.error(f"OpenAI retry 4xx/5xx body: {err_text2}")
@@ -130,12 +165,32 @@ async def send_to_openai_and_update_params(dump_path: str, notifier=None):
                             await notifier.notify(f"❌ OpenAI отклонил повторный запрос ({r2.status_code}). Тело ответа:\n<pre>{safe_err2}</pre>")
                         return
                     j = r2.json()
+                    # proceed with parsed response
+                    goto_after_error_handling = True
                 else:
-                    log.error(f"OpenAI 4xx/5xx body: {err_text}")
-                    if notifier:
-                        safe_err = html.escape(err_text)
-                        await notifier.notify(f"❌ OpenAI отклонил запрос ({r.status_code}). Тело ответа:\n<pre>{safe_err}</pre>")
-                    return
+                    goto_after_error_handling = False
+
+                if not goto_after_error_handling:
+                    # If the model/version doesn't support text.format or the type is wrong, retry without JSON mode
+                    if (param in ("text.format", "response_format")) or ("not supported" in msg.lower()) or ("invalid type for 'text.format'" in msg.lower()):
+                        log.warning(f"Retrying OpenAI without text.format due to error: {msg or err_text}")
+                        body2 = {k: v for k, v in body.items() if k != "text"}
+                        r2 = await cli.post("https://api.openai.com/v1/responses", headers=headers, json=body2)
+                        log.debug(f"OpenAI retry resp status={r2.status_code} len={len(r2.text)}")
+                        if r2.status_code >= 400:
+                            err_text2 = r2.text[:4000]
+                            log.error(f"OpenAI retry 4xx/5xx body: {err_text2}")
+                            if notifier:
+                                safe_err2 = html.escape(err_text2)
+                                await notifier.notify(f"❌ OpenAI отклонил повторный запрос ({r2.status_code}). Тело ответа:\n<pre>{safe_err2}</pre>")
+                            return
+                        j = r2.json()
+                    else:
+                        log.error(f"OpenAI 4xx/5xx body: {err_text}")
+                        if notifier:
+                            safe_err = html.escape(err_text)
+                            await notifier.notify(f"❌ OpenAI отклонил запрос ({r.status_code}). Тело ответа:\n<pre>{safe_err}</pre>")
+                        return
             else:
                 j = r.json()
     except httpx.RequestError as e:
