@@ -55,6 +55,14 @@ class Controller:
         self.last_entry_bar_ts: int = 0  # ts of the bar when we last opened a position
         self.bar_1m_ms: int = 60_000
 
+        # Runtime position context (for soft exits & reporting)
+        self.position_side: str | None = None   # 'long' | 'short' | None
+        self.position_qty: float = 0.0
+        self.entry_price: float | None = None
+        self.opened_at_ms: int | None = None
+        self.high_since_entry: float | None = None
+        self.low_since_entry: float | None = None
+
     async def request_ai_params_from_latest_dump(self):
         """On startup/restart: find the latest dump_*.json and request fresh params from OpenAI.
         If nothing found, just log and continue.
@@ -118,16 +126,34 @@ class Controller:
                     self.dump.add_candle("5", c)
                     self.log.debug(f"[WS] 5m closed ts={c['ts']} close={c['close']}")
 
+    def _inject_position_ctx(self):
+        ctx = {
+            "side": self.position_side or "",
+            "entry_price": self.entry_price,
+            "high_since_entry": self.high_since_entry,
+            "low_since_entry": self.low_since_entry,
+        }
+        self.params["position_ctx"] = ctx
+
     async def on_kline_tick(self):
         if not self.running or not self.candles_1 or not self.candles_5:
             return
         last = self.candles_1[-1]
         if not last.get("confirm"):
             return
-        # act only once per closed bar
+        # act only once per closed 1m bar
         if last["ts"] == self.last_processed_ts:
             self.log.debug(f"[SKIP] already processed bar ts={last['ts']}")
             return
+
+        # update run-up / drawdown trackers on closed bar
+        if self.position_side:
+            h = last.get("high", last.get("close"))
+            l = last.get("low", last.get("close"))
+            if self.high_since_entry is None or h > self.high_since_entry:
+                self.high_since_entry = h
+            if self.low_since_entry is None or l < self.low_since_entry:
+                self.low_since_entry = l
 
         # read cooldown from params (defaults to 3 bars)
         min_bars_between = int(self.params.get("min_bars_between_trades", 3))
@@ -137,30 +163,151 @@ class Controller:
             self.last_processed_ts = last["ts"]
             return
 
+        # pass live position context to strategy for soft exits
+        self._inject_position_ctx()
         sig = decide(self.candles_1, self.candles_5, self.params)
         self.dump.add_signal({"t": int(time.time()*1000), **sig})
 
+        # --- SOFT EXIT handling ---
+        if sig["decision"] == "exit_long" and self.position_side == "long":
+            # market-close via reduceOnly order (keep exchange TP/SL as insurance)
+            try:
+                resp = await self.trader.close_market("Sell", self.position_qty or None)
+            except Exception:
+                self.log.exception("[SOFT_EXIT] market close failed (long)")
+                resp = {}
+            close_px = resp.get("fill_price") or last["close"]
+            qty = self.position_qty or max(self.params["size_usdt"] / max(close_px, 1e-9), self.qty_step)
+            pnl_abs = (close_px - (self.entry_price or close_px)) * qty
+            pnl_pct = ((close_px / (self.entry_price or close_px) - 1.0) * 100.0)
+            self.dump.add_trade({
+                "event": "soft_exit",
+                "dir": "long",
+                "closed_at": int(time.time()*1000),
+                "close_price": close_px,
+                "qty": qty,
+                "pnl_abs": pnl_abs,
+                "pnl_pct": pnl_pct,
+                "reason": sig.get("reason", "")
+            })
+            if self.notifier:
+                await self.notifier.notify(f"✅ Софт-выход LONG @ {close_px} | PnL: {pnl_abs:.2f} ({pnl_pct:.2f}%)")
+            # reset runtime position state
+            self.position_side = None
+            self.position_qty = 0.0
+            self.entry_price = None
+            self.opened_at_ms = None
+            self.high_since_entry = None
+            self.low_since_entry = None
+            self.prev_decision = "hold"
+            self.last_processed_ts = last["ts"]
+            return
+
+        if sig["decision"] == "exit_short" and self.position_side == "short":
+            try:
+                resp = await self.trader.close_market("Buy", self.position_qty or None)
+            except Exception:
+                self.log.exception("[SOFT_EXIT] market close failed (short)")
+                resp = {}
+            close_px = resp.get("fill_price") or last["close"]
+            qty = self.position_qty or max(self.params["size_usdt"] / max(close_px, 1e-9), self.qty_step)
+            pnl_abs = ((self.entry_price or close_px) - close_px) * qty
+            pnl_pct = (((self.entry_price or close_px) / close_px - 1.0) * 100.0)
+            self.dump.add_trade({
+                "event": "soft_exit",
+                "dir": "short",
+                "closed_at": int(time.time()*1000),
+                "close_price": close_px,
+                "qty": qty,
+                "pnl_abs": pnl_abs,
+                "pnl_pct": pnl_pct,
+                "reason": sig.get("reason", "")
+            })
+            if self.notifier:
+                await self.notifier.notify(f"✅ Софт-выход SHORT @ {close_px} | PnL: {pnl_abs:.2f} ({pnl_pct:.2f}%)")
+            self.position_side = None
+            self.position_qty = 0.0
+            self.entry_price = None
+            self.opened_at_ms = None
+            self.high_since_entry = None
+            self.low_since_entry = None
+            self.prev_decision = "hold"
+            self.last_processed_ts = last["ts"]
+            return
+
         # process only on decision change and only for entries
         if sig["decision"] in ("long", "short"):
-            if sig["decision"] == self.prev_decision:
-                self.log.info(f"[SKIP] same decision as previous: {sig['decision']}")
-                self.last_processed_ts = last["ts"]
-                return
             price = last["close"]
             if self.notifier:
                 await self.notifier.notify(f"📊 Сигнал: {sig['decision']} @ {price}")
             qty = max(self.params["size_usdt"] / max(price, 1e-9), self.qty_step)
             tp = sig["tp"]; sl = sig["sl"]
             side = "Buy" if sig["decision"] == "long" else "Sell"
-            await self.trader.open_market(side, qty, tp, sl)
-            self.dump.add_trade({"dir": sig["decision"], "opened_at": int(time.time()*1000),
-                                 "open_price": price, "tp": tp, "sl": sl, "reason": sig.get("reason", "")})
-            # update anti-churn state
+            resp = await self.trader.open_market(side, qty, tp, sl)
+            opened_at = int(time.time()*1000)
+            entry_px = resp.get("fill_price") or price
+            self.dump.add_trade({
+                "event": "entry",
+                "dir": sig["decision"],
+                "opened_at": opened_at,
+                "open_price": entry_px,
+                "qty": qty,
+                "tp": tp, "sl": sl,
+                "reason": sig.get("reason", "")
+            })
+            # update runtime position context with actual fill
+            self.position_side = sig["decision"]
+            self.position_qty = qty
+            self.entry_price = entry_px
+            self.opened_at_ms = opened_at
+            self.high_since_entry = entry_px
+            self.low_since_entry = entry_px
+            # anti-churn state
             self.prev_decision = sig["decision"]
             self.last_entry_bar_ts = last["ts"]
         else:
             # reset prev decision on hold
             self.prev_decision = "hold"
+
+        # If the exchange closed the position via TP/SL (position qty became 0), record exit with close=last close
+        if self.position_side:
+            try:
+                pos = await self.client.position_list(CATEGORY, self.symbol)
+                size = 0.0
+                lst = pos.get("result", {}).get("list") or []
+                if lst:
+                    size = float(lst[0].get("size", 0) or 0)
+                if size == 0:
+                    close_px = last["close"]
+                    if self.position_side == "long":
+                        pnl_abs = (close_px - (self.entry_price or close_px)) * (self.position_qty or 0)
+                        pnl_pct = ((close_px / (self.entry_price or close_px) - 1.0) * 100.0)
+                        dirn = "long"
+                    else:
+                        pnl_abs = ((self.entry_price or close_px) - close_px) * (self.position_qty or 0)
+                        pnl_pct = (((self.entry_price or close_px) / close_px - 1.0) * 100.0)
+                        dirn = "short"
+                    self.dump.add_trade({
+                        "event": "exchange_exit",
+                        "dir": dirn,
+                        "closed_at": int(time.time()*1000),
+                        "close_price": close_px,
+                        "pnl_abs": pnl_abs,
+                        "pnl_pct": pnl_pct,
+                        "reason": "exchange_tp_sl"
+                    })
+                    if self.notifier:
+                        await self.notifier.notify(f"ℹ️ Биржевой выход ({dirn}) @ {close_px} | PnL: {pnl_abs:.2f} ({pnl_pct:.2f}%)")
+                    # reset runtime state
+                    self.position_side = None
+                    self.position_qty = 0.0
+                    self.entry_price = None
+                    self.opened_at_ms = None
+                    self.high_since_entry = None
+                    self.low_since_entry = None
+                    self.prev_decision = "hold"
+            except Exception:
+                self.log.exception("[EXCH_EXIT] failed to check/record position exit")
 
         self.last_processed_ts = last["ts"]
 

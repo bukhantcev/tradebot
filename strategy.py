@@ -83,6 +83,57 @@ def decide(m1_candles: List[dict], m5_candles: List[dict], params: Dict[str, Any
     up_5 = _persist_up(ema_fast_5, ema_slow_5, cross_confirm_bars)
     down_5 = _persist_down(ema_fast_5, ema_slow_5, cross_confirm_bars)
 
+    # --- SOFT EXIT SIGNALS ---
+    # Optional context about current position can be passed in params["position_ctx"], e.g.:
+    # {"side": "long|short", "entry_price": 12345.6, "high_since_entry": 12400.0, "low_since_entry": 12200.0}
+    pos_ctx = params.get("position_ctx", {}) or {}
+    pos_side = (pos_ctx.get("side") or "").lower()
+    entry_price = pos_ctx.get("entry_price")
+    high_se = pos_ctx.get("high_since_entry")
+    low_se = pos_ctx.get("low_since_entry")
+    atr_trail_k = float(ind.get("atr_trail_k", 1.5))
+
+    # ATR trail checks only if we have context
+    trail_hit_long = False
+    trail_hit_short = False
+    if isinstance(entry_price, (int, float)) and isinstance(atr, (int, float)):
+        if isinstance(high_se, (int, float)):
+            trail_long = high_se - atr_trail_k * atr
+            trail_hit_long = close < trail_long
+        if isinstance(low_se, (int, float)):
+            trail_short = low_se + atr_trail_k * atr
+            trail_hit_short = close > trail_short
+
+    # EMA cross persistence + RSI exit hysteresis
+    exit_long_cond = (down_1 and down_5) or (rsi >= rsi_exit_long) or trail_hit_long
+    exit_short_cond = (up_1 and up_5) or (rsi <= rsi_exit_short) or trail_hit_short
+
+    if pos_side == "long" and exit_long_cond:
+        reason = []
+        if (down_1 and down_5):
+            reason.append(f"ema_down({cross_confirm_bars}b)")
+        if rsi >= rsi_exit_long:
+            reason.append("rsi>=exit_long")
+        if trail_hit_long:
+            reason.append(f"atr_trail_k={atr_trail_k}")
+        d = {"decision": "exit_long", "reason": "+".join(reason) or "exit_long"}
+        log.info(f"[SIGNAL] EXIT_LONG price={close:.2f} rsi={rsi:.2f} ema1={ef:.2f}/{es:.2f} ema5={ema5_f:.2f}/{ema5_s:.2f} reason={d['reason']}")
+        log.debug(f"[DECIDE] {d}")
+        return d
+
+    if pos_side == "short" and exit_short_cond:
+        reason = []
+        if (up_1 and up_5):
+            reason.append(f"ema_up({cross_confirm_bars}b)")
+        if rsi <= rsi_exit_short:
+            reason.append("rsi<=exit_short")
+        if trail_hit_short:
+            reason.append(f"atr_trail_k={atr_trail_k}")
+        d = {"decision": "exit_short", "reason": "+".join(reason) or "exit_short"}
+        log.info(f"[SIGNAL] EXIT_SHORT price={close:.2f} rsi={rsi:.2f} ema1={ef:.2f}/{es:.2f} ema5={ema5_f:.2f}/{ema5_s:.2f} reason={d['reason']}")
+        log.debug(f"[DECIDE] {d}")
+        return d
+
     if up_1 and up_5 and rsi <= rsi_enter_long:
         d = {"decision": "long", "tp": close + tp, "sl": close - sl,
              "virt_tp": virt_tp, "virt_sl": virt_sl,
