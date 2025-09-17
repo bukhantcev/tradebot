@@ -55,31 +55,39 @@ async def preload_klines(symbol: str, on_kline, counts: dict, *, testnet: bool, 
                     # newest→oldest → oldest→newest
                     data = list(reversed(data))
                     # normalize and extend accumulator
+                    appended = 0
                     for row in data:
-                        if isinstance(row, list) and len(row) >= 8:
-                            item = {
-                                "start": int(row[0]),
-                                "end": int(row[1]),
-                                "open": float(row[2]),
-                                "high": float(row[3]),
-                                "low": float(row[4]),
-                                "close": float(row[5]),
-                                "volume": float(row[6]),
-                                "turnover": float(row[7]),
-                                "confirm": True,
-                            }
-                        elif isinstance(row, dict):
-                            row["confirm"] = True
-                            item = row
-                        else:
+                        try:
+                            if isinstance(row, list) and len(row) >= 8:
+                                item = {
+                                    "start": int(row[0]),
+                                    "end": int(row[1]),
+                                    "open": float(row[2]),
+                                    "high": float(row[3]),
+                                    "low": float(row[4]),
+                                    "close": float(row[5]),
+                                    "volume": float(row[6]),
+                                    "turnover": float(row[7]),
+                                    "confirm": True,
+                                }
+                            elif isinstance(row, dict) and {"start","end","open","high","low","close"}.issubset(row.keys()):
+                                row["confirm"] = True
+                                item = row
+                            else:
+                                continue
+                            acc.append(item)
+                            appended += 1
+                        except Exception:
                             continue
-                        acc.append(item)
                     got = len(acc)
-                    log_ws.info(f"[PRELOAD] page got={len(data)} acc={got} need={need} interval={interval}")
+                    log_ws.info(f"[PRELOAD] page got={len(data)} appended={appended} acc={got} need={need} interval={interval}")
                     if got >= need:
                         break
-                    # widen the window further back for next page
-                    start_ms = acc[0]["start"] - (step_ms * need)
+                    # widen the window further back for next page (safe if acc is empty)
+                    if acc:
+                        start_ms = acc[0]["start"] - (step_ms * need)
+                    else:
+                        start_ms = start_ms - (step_ms * need)
 
                 if got == 0:
                     log_ws.warning(f"[PRELOAD] no candles accumulated for {interval}m (symbol={symbol})")
