@@ -5,6 +5,7 @@ from typing import Optional, Dict, Any
 import asyncio
 import os
 import time
+from datetime import datetime, timezone
 from config import SYMBOL, RISK_PCT, LEVERAGE
 from bybit_client import BybitClient
 
@@ -267,8 +268,155 @@ class Trader:
                 return True
         return False
 
+    # ---------- ТИКИ / РЫНОЧНАЯ ЦЕНА ----------
+    def _last_price(self) -> float:
+        """Быстрый опрос последней цены через /v5/market/tickers (без лишних полей)."""
+        try:
+            r = self.client._request("GET", "/v5/market/tickers", params={"category": "linear", "symbol": self.symbol})
+            it = (r.get("result", {}) or {}).get("list", [])
+            if it:
+                return float(it[0].get("lastPrice") or 0.0)
+        except Exception:
+            pass
+        return 0.0
+
+    def _position_side_and_size(self) -> tuple[str|None, float]:
+        """Возвращает (side, size) по текущей позиции или (None, 0.0)."""
+        try:
+            pl = self.client.position_list(self.symbol)
+            lst = pl.get("result", {}).get("list", [])
+            for it in lst:
+                size = float(it.get("size") or 0.0)
+                if size > 0:
+                    return (it.get("side"), size)
+        except Exception:
+            pass
+        return (None, 0.0)
+
+    def _opposite(self, side: str) -> str:
+        return "Sell" if side == "Buy" else "Buy"
+
     # ---------- УСЛОВНЫЕ ОРДЕРА ПО ЭКСТРЕМАМ ----------
 
+    # ---------- ЖИВОЕ СОПРОВОЖДЕНИЕ ПО ЭКСТРЕМАМ (БЕЗ ОТЛОЖЕК) ----------
+    async def _follow_extremes(self, side: str, prev_high: float, prev_low: float, qty: float):
+        """
+        НЕ ставим отложки. Следим за ценой:
+          • side == "Sell": ждём достижения текущего high => Market Sell; далее ждём текущий low => Market Buy (фиксация)
+          • side == "Buy":  ждём достижения текущего low  => Market Buy;  далее ждём текущий high => Market Sell (фиксация)
+        Экстремы текущей незакрытой 1m-свечи обновляются на каждом тике.
+        """
+        if qty <= 0 or prev_high <= 0 or prev_low <= 0:
+            log.info("[EXT][SKIP] bad params")
+            return
+
+        # Инициализация динамических уровней экстремов текущей «живой» свечи
+        cur_high = float(prev_high)
+        cur_low = float(prev_low)
+
+        # От чего стартуем: точка входа и выхода
+        want_entry_on = "high" if side == "Sell" else "low"
+        want_exit_on = "low" if side == "Sell" else "high"
+
+        # Отметим границу текущей минуты, чтобы при переключении минуты продолжить обновлять экстремы
+        cur_minute = int(time.time() // 60)
+
+        # 1) Ожидание входа
+        log.info(f"[EXT][WAIT_ENTER] side={side} qty={self._fmt(qty)} startH={self._fmt(cur_high)} startL={self._fmt(cur_low)}")
+        while True:
+            px = self._last_price()
+            if px <= 0:
+                await asyncio.sleep(0.2)
+                continue
+
+            # Обновляем экстремы «живой» свечи (обновляются внутри минуты)
+            m = int(time.time() // 60)
+            if m != cur_minute:
+                # новая минута — начинаем с текущей цены как базой, но НЕ откатываем к prev_*
+                cur_minute = m
+                cur_high = px
+                cur_low = px
+            else:
+                if px > cur_high:
+                    cur_high = px
+                if px < cur_low:
+                    cur_low = px
+
+            # Нужное условие на вход
+            if want_entry_on == "high" and px >= cur_high:
+                # вход Sell по рынку
+                log.info(f"[EXT][ENTER] Sell @ {self._fmt(px)} (cur_high={self._fmt(cur_high)})")
+                r = self.client.place_order(self.symbol, "Sell", qty, order_type="Market", preferSmart=True)
+                if r.get("retCode") != 0:
+                    log.error(f"[EXT][ENTER][FAIL] {r}")
+                    return
+                order_id = r.get("result", {}).get("orderId", "")
+                if not await self._await_fill_or_retry(order_id, "Sell", qty):
+                    log.warning("[EXT][ENTER][ABORT] no fill")
+                    return
+                break
+
+            if want_entry_on == "low" and px <= cur_low:
+                # вход Buy по рынку
+                log.info(f"[EXT][ENTER] Buy @ {self._fmt(px)} (cur_low={self._fmt(cur_low)})")
+                r = self.client.place_order(self.symbol, "Buy", qty, order_type="Market", preferSmart=True)
+                if r.get("retCode") != 0:
+                    log.error(f"[EXT][ENTER][FAIL] {r}")
+                    return
+                order_id = r.get("result", {}).get("orderId", "")
+                if not await self._await_fill_or_retry(order_id, "Buy", qty):
+                    log.warning("[EXT][ENTER][ABORT] no fill")
+                    return
+                break
+
+            await asyncio.sleep(0.15)
+
+        # 2) Ожидание выхода (фиксации) по противоположному экстремуму в той же логике
+        # Обнулим экстремы от момента входа, чтобы ловить новые high/low после входа
+        cur_high = px
+        cur_low = px
+        cur_minute = int(time.time() // 60)
+
+        side_exit = self._opposite(side)
+        log.info(f"[EXT][WAIT_EXIT] want={want_exit_on} sideExit={side_exit}")
+        while True:
+            # Если позиция закрыта внешне — выходим из лупа
+            ps, sz = self._position_side_and_size()
+            if not ps or sz <= 0:
+                log.info("[EXT][DONE] position closed externally")
+                return
+
+            px = self._last_price()
+            if px <= 0:
+                await asyncio.sleep(0.2)
+                continue
+
+            m = int(time.time() // 60)
+            if m != cur_minute:
+                cur_minute = m
+                cur_high = px
+                cur_low = px
+            else:
+                if px > cur_high:
+                    cur_high = px
+                if px < cur_low:
+                    cur_low = px
+
+            if want_exit_on == "low" and px <= cur_low:
+                # фиксация по рынку (Buy закрывает Sell)
+                log.info(f"[EXT][EXIT] Buy @ {self._fmt(px)} (cur_low={self._fmt(cur_low)})")
+                await self.close_market("Buy", sz)
+                return
+
+            if want_exit_on == "high" and px >= cur_high:
+                # фиксация по рынку (Sell закрывает Buy)
+                log.info(f"[EXT][EXIT] Sell @ {self._fmt(px)} (cur_high={self._fmt(cur_high)})")
+                await self.close_market("Sell", sz)
+                return
+
+            await asyncio.sleep(0.15)
+
+    # NOTE: ниже — старая ветка с условными заявками; для live-follow она не используется.
     def _place_conditional(self, side: str, trigger_price: float, qty: float, trigger_direction: int) -> Dict[str, Any]:
         """
         Ставит условный маркет-ордер (IOC) по достижению trigger_price.
@@ -432,8 +580,8 @@ class Trader:
         prev_high = signal.get("prev_high")
         prev_low = signal.get("prev_low")
         if self.entry_extremes and prev_high and prev_low:
-            log.info(f"[COND][ENTER] use extremes: prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} qty={self._fmt(qty)}")
-            await self._enter_by_extremes(side, float(prev_high), float(prev_low), qty, sl_r, tp_r)
+            log.info(f"[EXT][FOLLOW] side={side} prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} qty={self._fmt(qty)}")
+            await self._follow_extremes(side, float(prev_high), float(prev_low), qty)
             return
 
         # Маркет-вход: сначала ордер БЕЗ TP/SL, затем TP/SL через trading-stop (устраняем 30208)
