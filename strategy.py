@@ -34,6 +34,10 @@ class StrategyEngine:
 
     async def on_kline_closed(self) -> Signal:
         df = await load_recent_1m(200, symbol=self.symbol)
+        if not df.empty:
+            from datetime import datetime, timezone
+            last_ts = int(df.iloc[-1]["ts_ms"]) // 1000
+            log.debug(f"[BAR] last_closed_1m={datetime.fromtimestamp(last_ts, tz=timezone.utc).isoformat()}")
         log.debug(f"[BAR] loaded rows={len(df)}")
         if len(df) < 60:
             return Signal(None, "warmup", None, None, None, None)

@@ -32,6 +32,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_PATH = os.getenv("DB_PATH", "./data/trades.sqlite")
 PARQUET_DIR = os.getenv("PARQUET_DIR", "./data/parquet")
 
+# --- History backfill ---
+BACKFILL_MINUTES = int(os.getenv("BACKFILL_MINUTES", "360"))  # сколько минут истории тянуть при старте (по умолчанию 6 часов)
+
 # --- Helpers ---
 def get_bybit_keys():
     if BYBIT_ENV == "real":

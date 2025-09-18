@@ -176,6 +176,19 @@ class DataManager:
     async def start(self):
         asyncio.current_task().set_name("data")
         await self.store.open()
+
+        # Бэкфилл если нужно (или всегда — как скажешь)
+        try:
+            have = await self._count_closed_1m()
+            if have < 60:  # хотим сразу закрыть прогрев
+                from config import BACKFILL_MINUTES
+                log.info(f"[BACKFILL] closed_1m_bars={have} < 60 → pull REST history for {BACKFILL_MINUTES} minutes")
+                await self.backfill_1m(BACKFILL_MINUTES)
+            else:
+                log.info(f"[BACKFILL] skip (closed_1m_bars={have})")
+        except Exception as e:
+            log.warning(f"[BACKFILL][SKIP] {e}")
+
         consumer_task = asyncio.create_task(self._consumer_loop(), name="data-consumer")
         agg_task = asyncio.create_task(self._aggregator_loop(), name="data-aggregator")
         ws_task = asyncio.create_task(self._ws_loop(), name="data-ws")
@@ -264,3 +277,55 @@ class DataManager:
             except Exception as e:
                 log.error(f"[AGG] {e}")
             await asyncio.sleep(10.0)
+    async def _count_closed_1m(self) -> int:
+        q = "SELECT COUNT(1) FROM bars_1m WHERE symbol=? AND confirm=1"
+        async with self.store._db.execute(q, (self.symbol,)) as cur:
+            row = await cur.fetchone()
+        return int(row[0] or 0)
+    async def backfill_1m(self, minutes: int):
+        """
+        Тянем закрытые 1m свечи за последние `minutes` через REST /v5/market/kline и кладём в bars_1m с confirm=1.
+        """
+        from config import BACKFILL_MINUTES  # если хочешь, можно игнорировать аргумент и брать из конфига
+        minutes = minutes or BACKFILL_MINUTES
+
+        end_ms = int(time.time() * 1000)
+        start_ms = end_ms - minutes * 60 * 1000
+        cursor = None
+        total = 0
+
+        log.info(f"[BACKFILL] start={start_ms} end={end_ms} minutes={minutes}")
+        while True:
+            # Bybit отдаёт страницы по cursor; limit макс ~200
+            resp = self.client.kline(category="linear", symbol=self.symbol, interval="1", start=start_ms, end=end_ms, limit=200, cursor=cursor)
+            if resp.get("retCode") != 0:
+                log.error(f"[BACKFILL][ERR] {resp}")
+                break
+            rows = resp.get("result", {}).get("list", []) or []
+            # ответ обычно в порядке от новее к старее — развернём
+            rows = list(reversed(rows))
+            for it in rows:
+                # поля: start, open, high, low, close, volume, turnover
+                try:
+                    b = Bar(
+                        ts=int(it[0]),
+                        open=float(it[1]),
+                        high=float(it[3]),
+                        low=float(it[4]),
+                        close=float(it[2]),
+                        volume=float(it[5]),
+                        turnover=float(it[6]),
+                        confirm=True
+                    )
+                    await self.store.upsert_bar_1m(self.symbol, b)
+                    total += 1
+                except Exception as e:
+                    log.warning(f"[BACKFILL][PARSE] skip {it}: {e}")
+            await self.store.commit()
+            log.debug(f"[BACKFILL] page rows={len(rows)} total={total}")
+
+            cursor = resp.get("result", {}).get("nextPageCursor")
+            if not cursor:
+                break
+
+        log.info(f"[BACKFILL] done total_rows={total}")

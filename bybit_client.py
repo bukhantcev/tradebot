@@ -31,7 +31,6 @@ class BybitClient:
         self.session = httpx.Client(verify=self.verify_ssl, timeout=15.0)
         log.debug(f"[INIT] recv_window={recv_window} verify_ssl={verify_ssl} env={BYBIT_ENV}")
 
-    # --- Sign helper ---
     def _sign(self, payload: str) -> str:
         return hmac.new(
             self.api_secret.encode("utf-8"),
@@ -39,7 +38,6 @@ class BybitClient:
             hashlib.sha256
         ).hexdigest()
 
-    # --- REST request ---
     def _request(self, method: str, path: str, params: Optional[Dict[str, Any]] = None, body: Optional[Dict[str, Any]] = None):
         url = self.rest_url + path
         ts = str(int(time.time() * 1000))
@@ -78,6 +76,21 @@ class BybitClient:
 
     def server_time(self):
         return self._request("GET", "/v5/market/time")
+
+    # --- Market Kline (REST) ---
+    def kline(self, category="linear", symbol="BTCUSDT", interval="1",
+              start: Optional[int]=None, end: Optional[int]=None,
+              limit: int = 200, cursor: Optional[str]=None):
+        params = {
+            "category": category,
+            "symbol": symbol,
+            "interval": str(interval),
+            "limit": str(limit),
+        }
+        if start is not None: params["start"] = str(start)
+        if end is not None: params["end"] = str(end)
+        if cursor is not None: params["cursor"] = cursor
+        return self._request("GET", "/v5/market/kline", params=params)
 
     # --- Private REST endpoints ---
     def wallet_balance(self, account_type="UNIFIED"):
