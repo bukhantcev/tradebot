@@ -320,6 +320,7 @@ class Trader:
 
         # Отметим границу текущей минуты, чтобы при переключении минуты продолжить обновлять экстремы
         cur_minute = int(time.time() // 60)
+        last_minute_logged = cur_minute
 
         # 1) Ожидание входа
         log.info(f"[EXT][WAIT_ENTER] side={side} qty={self._fmt(qty)} startH={self._fmt(cur_high)} startL={self._fmt(cur_low)}")
@@ -332,7 +333,6 @@ class Trader:
             # Обновляем экстремы «живой» свечи (обновляются внутри минуты)
             m = int(time.time() // 60)
             if m != cur_minute:
-                # новая минута — начинаем с текущей цены как базой, но НЕ откатываем к prev_*
                 cur_minute = m
                 cur_high = px
                 cur_low = px
@@ -341,6 +341,11 @@ class Trader:
                     cur_high = px
                 if px < cur_low:
                     cur_low = px
+
+            # ЛОГ КАЖДУЮ МИНУТУ: экстремы прошедшей свечи и текущей «живой»
+            if m != last_minute_logged:
+                last_minute_logged = m
+                log.info(f"[EXT][MINUTE][ENTER] prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} curH={self._fmt(cur_high)} curL={self._fmt(cur_low)} px={self._fmt(px)} want_entry_on={want_entry_on}")
 
             # Нужное условие на вход
             if want_entry_on == "high" and px >= cur_high:
@@ -379,6 +384,7 @@ class Trader:
 
         side_exit = self._opposite(side)
         log.info(f"[EXT][WAIT_EXIT] want={want_exit_on} sideExit={side_exit}")
+        last_minute_logged = cur_minute
         while True:
             # Если позиция закрыта внешне — выходим из лупа
             ps, sz = self._position_side_and_size()
@@ -401,6 +407,11 @@ class Trader:
                     cur_high = px
                 if px < cur_low:
                     cur_low = px
+
+            # ЛОГ КАЖДУЮ МИНУТУ: экстремы прошедшей свечи и текущей «живой»
+            if m != last_minute_logged:
+                last_minute_logged = m
+                log.info(f"[EXT][MINUTE][EXIT] prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} curH={self._fmt(cur_high)} curL={self._fmt(cur_low)} px={self._fmt(px)} want_exit_on={want_exit_on} sideExit={side_exit}")
 
             if want_exit_on == "low" and px <= cur_low:
                 # фиксация по рынку (Buy закрывает Sell)
