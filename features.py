@@ -4,7 +4,7 @@ import numpy as np
 from typing import Dict, Any
 import aiosqlite
 from config import DB_PATH, SYMBOL
-
+import asyncio
 logger = logging.getLogger("FEAT")
 
 def ema(series: pd.Series, span: int) -> pd.Series:

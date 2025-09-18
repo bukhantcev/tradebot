@@ -3,7 +3,7 @@ import os
 import json
 import logging
 from typing import Dict, Any
-
+import asyncio
 import httpx
 
 log = logging.getLogger("LLM")

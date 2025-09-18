@@ -2,7 +2,7 @@
 import math
 import logging
 from typing import Optional, Dict, Any
-
+import asyncio
 from config import SYMBOL, RISK_PCT, LEVERAGE
 from bybit_client import BybitClient
 

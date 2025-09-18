@@ -3,7 +3,7 @@ import logging
 import time
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
-
+import asyncio
 from config import SYMBOL, RISK_PCT
 from features import load_recent_1m, compute_features, last_feature_row
 from llm import ask_model
