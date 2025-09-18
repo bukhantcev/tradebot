@@ -563,19 +563,32 @@ class Trader:
         side: "Buy" | "Sell"
         signal: { 'sl': float, 'tp': float, 'atr': float, 'ts_ms': int, ... }
         """
+        # Унифицированный доступ к полям сигнала (dict или dataclass/объект)
+        def _sg(key, default=None):
+            if isinstance(signal, dict):
+                return signal.get(key, default)
+            return getattr(signal, key, default)
+
+        def _sg_multi(keys, default=None):
+            for k in keys:
+                v = _sg(k, None)
+                if v is not None:
+                    return v
+            return default
+
         # обновим equity/available (если 0) и фильтры/плечо
         if self.equity <= 0 or self.available <= 0:
             self.refresh_equity()
         self.ensure_filters()
         self.ensure_leverage()
 
-        price = float(signal.get("price") or signal.get("close") or 0.0)
+        price = float(_sg_multi(["price", "close"]) or 0.0)
         if price <= 0:
             # берём близкую оценку — без отдельного REST-запроса
-            price = float(signal.get("tp") or 0.0) or 1.0
+            price = float(_sg("tp") or 0.0) or 1.0
 
-        sl = float(signal.get("sl") or 0.0)
-        tp = float(signal.get("tp") or 0.0)
+        sl = float(_sg_multi(["sl", "stop_loss", "stopLoss"]) or 0.0)
+        tp = float(_sg_multi(["tp", "take_profit", "takeProfit"]) or 0.0)
         if sl <= 0 or tp <= 0:
             log.info("[ENTER][SKIP] bad SL/TP")
             return
@@ -594,8 +607,8 @@ class Trader:
         sl_r, tp_r = self._fix_tpsl(side, price, sl_r, tp_r, tick)
 
         # --- Диагностика режима экстремов ---
-        prev_high = signal.get("prev_high")
-        prev_low = signal.get("prev_low")
+        prev_high = _sg_multi(["prev_high", "prevHigh", "prevH", "previous_high", "prev_high_price"])
+        prev_low  = _sg_multi(["prev_low", "prevLow", "prevL", "previous_low", "prev_low_price"])
         use_ext = bool(self.entry_extremes and prev_high and prev_low)
         if use_ext:
             log.info(f"[EXT][MODE] ON  prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} qty={self._fmt(qty)}")
@@ -605,7 +618,12 @@ class Trader:
                 reason.append("flag_off")
             if not prev_high or not prev_low:
                 reason.append("no_prev_hl")
-            log.info(f"[EXT][MODE] OFF ({','.join(reason) if reason else 'n/a'})")
+            # Показать доступные поля сигнала для дебага (без значений)
+            try:
+                fields = list(signal.keys()) if isinstance(signal, dict) else list(vars(signal).keys())
+            except Exception:
+                fields = ["?"]
+            log.info(f"[EXT][MODE] OFF ({','.join(reason) if reason else 'n/a'}) fields={fields}")
 
         if use_ext:
             log.info(f"[EXT][FOLLOW] side={side} prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} qty={self._fmt(qty)}")
