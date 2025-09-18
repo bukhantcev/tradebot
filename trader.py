@@ -719,19 +719,27 @@ class Trader:
         # обновим режим минутного логгера
         await self._stop_minute_logger()
         self._start_minute_logger("ext" if use_ext else "normal", float(sl) if sl else None)
+        log.info("[EXT][CHECKPOINT] after minute logger start")
 
         # (3) Всегда форсируем flat перед новым входом
-        ps, sz = self._position_side_and_size()
-        if ps and sz > 0:
-            log.info(f"[ENTER][FLAT] close existing {ps} size={self._fmt(sz)} before new entry")
-            await self.close_market(self._opposite(ps), sz)
-            for _ in range(20):
-                p2, s2 = self._position_side_and_size()
-                if not p2 or s2 <= 0:
-                    break
-                await asyncio.sleep(0.25)
+        try:
+            ps, sz = self._position_side_and_size()
+            if ps and sz > 0:
+                log.info(f"[ENTER][FLAT] close existing {ps} size={self._fmt(sz)} before new entry")
+                await self.close_market(self._opposite(ps), sz)
+                for _ in range(20):
+                    p2, s2 = self._position_side_and_size()
+                    if not p2 or s2 <= 0:
+                        break
+                    await asyncio.sleep(0.25)
+            log.info("[EXT][CHECKPOINT] after flat enforcement")
+        except Exception as e:
+            log.exception(f"[EXT][FLAT][EXC] {e}")
+            log.info("[EXT][CHECKPOINT] after flat enforcement (with exception)")
 
+        log.info(f"[EXT][CHECKPOINT] before branch use_ext={use_ext}")
         if use_ext:
+            log.info("[EXT][CHECKPOINT] entering use_ext branch")
             log.info(f"[EXT][FOLLOW] side={side} prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} qty={self._fmt(qty)}")
             try:
                 await self._follow_extremes(side, float(prev_high), float(prev_low), qty)
