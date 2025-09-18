@@ -70,6 +70,8 @@ async def strategy_loop(strat: StrategyEngine, trader: Trader, poll_sec: float =
 async def main():
     # env
     TG_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
+    if not TG_TOKEN or ":" not in TG_TOKEN:
+        raise RuntimeError("[MAIN][ERR] TG_BOT_TOKEN not set or invalid")
     TG_CHAT = os.getenv("TG_CHAT_ID", "").strip()  # можно не задавать — подхватится из /start
     POLL_SEC = float(os.getenv("STRAT_POLL_SEC", "1.0"))
 
