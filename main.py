@@ -31,31 +31,42 @@ async def strategy_loop(strat: StrategyEngine, trader: Trader, poll_sec: float =
     last_ts: Optional[int] = None
     while True:
         try:
-            df = await load_recent_1m(limit=1)
-            if not df.empty:
-                ts = int(df.iloc[-1]["ts_ms"])
+            # Берём 2 последних бара: последний = текущий (может быть незакрыт), предпоследний = ЗАКРЫТЫЙ
+            df = await load_recent_1m(limit=2)
+            if df is not None and not df.empty and len(df) >= 2:
+                ts_closed = int(df.iloc[-2]["ts_ms"])
                 if last_ts is None:
-                    last_ts = ts
-                elif ts != last_ts:
+                    log.debug(f"[CANDLE][INIT] closed_ts={ts_closed}")
+                    last_ts = ts_closed
+                    # первый проход — инициализация без вызова ИИ (избегаем дубля на старте)
+                elif ts_closed != last_ts:
+                    log.debug(f"[CANDLE][NEW] prev_closed_ts={last_ts} -> {ts_closed}")
                     sig = await strat.on_kline_closed()
-                    last_ts = ts
+                    last_ts = ts_closed
                     if sig.side in ("Buy", "Sell"):
+                        # Используем последнюю известную цену (последний бар)
+                        px = float(df.iloc[-1]["close"])
                         payload: Dict[str, Any] = {
-                            "close": float(df.iloc[-1]["close"]),
-                            "price": float(df.iloc[-1]["close"]),
+                            "close": px,
+                            "price": px,
                             "sl": sig.sl,
                             "tp": sig.tp,
                             "atr": sig.atr,
-                            "ts_ms": sig.ts_ms or ts,
+                            "ts_ms": sig.ts_ms or ts_closed,
                             "prev_high": sig.prev_high,
                             "prev_low": sig.prev_low,
                         }
                         await trader.open_market(sig.side, payload)
+                else:
+                    log.debug(f"[CANDLE][WAIT] no new closed bar (closed_ts={ts_closed})")
+            else:
+                log.debug("[CANDLE][WAIT] insufficient bars (<2)")
+
             await asyncio.sleep(poll_sec)
         except asyncio.CancelledError:
             break
         except Exception as e:
-            log.error(f"[STRAT_LOOP] {e}")
+            log.error(f"[STRAT_LOOP] {e}", exc_info=True)
             await asyncio.sleep(1.0)
 
 
@@ -76,7 +87,7 @@ async def main():
     client = BybitClient()
     trader = Trader(client=client, notifier=None)
     bot = TgBot(TG_TOKEN, int(TG_CHAT) if TG_CHAT else None, trader=trader)
-    strat = StrategyEngine(client=client, notifier=bot)
+    strat = StrategyEngine(notifier=bot)
     trader.notifier = bot
     data = DataManager()
 
