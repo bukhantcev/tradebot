@@ -9,6 +9,8 @@ import httpx
 import websockets
 import asyncio
 
+from urllib.parse import urlencode
+
 from config import get_bybit_keys, BYBIT_ENV
 
 log = logging.getLogger("BYBIT")
@@ -43,8 +45,11 @@ class BybitClient:
         ts = str(int(time.time() * 1000))
         body_str = json.dumps(body) if body else ""
         query_str = ""
+        params_list = None
         if params:
-            query_str = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+            # preserve insertion order for both the URL and the signature
+            params_list = list(params.items())
+            query_str = urlencode(params_list)
         to_sign = ts + self.api_key + str(self.recv_window) + query_str + body_str
         sign = self._sign(to_sign)
 
@@ -53,11 +58,14 @@ class BybitClient:
             "X-BAPI-TIMESTAMP": ts,
             "X-BAPI-RECV-WINDOW": str(self.recv_window),
             "X-BAPI-SIGN": sign,
+            "X-BAPI-SIGN-TYPE": "2",
             "Content-Type": "application/json",
         }
 
         log.debug(f"[HTTP→] {method} {url} params={params} body={body}")
-        resp = self.session.request(method, url, params=params, content=body_str, headers=headers)
+        # For GET, do not send a JSON body; for POST send body_str (may be empty string)
+        content_payload = None if method.upper() == "GET" else body_str
+        resp = self.session.request(method, url, params=params_list or None, content=content_payload, headers=headers)
         try:
             data = resp.json()
         except Exception:

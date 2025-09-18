@@ -13,6 +13,7 @@ log = logging.getLogger("TRADER")
 
 
 class Trader:
+    __lp_fail = 0
     """
     Минималистичный трейдер:
     - refresh_equity(): получить equity (USDT) одной строкой
@@ -275,9 +276,13 @@ class Trader:
             r = self.client._request("GET", "/v5/market/tickers", params={"category": "linear", "symbol": self.symbol})
             it = (r.get("result", {}) or {}).get("list", [])
             if it:
+                self.__lp_fail = 0
                 return float(it[0].get("lastPrice") or 0.0)
         except Exception:
             pass
+        self.__lp_fail += 1
+        if self.__lp_fail % 20 == 0:
+            log.warning(f"[EXT][LP] lastPrice=0 (#{self.__lp_fail})")
         return 0.0
 
     def _position_side_and_size(self) -> tuple[str|None, float]:
@@ -309,6 +314,7 @@ class Trader:
         if qty <= 0 or prev_high <= 0 or prev_low <= 0:
             log.info("[EXT][SKIP] bad params")
             return
+        log.info(f"[EXT][START] side={side} init_prevH={self._fmt(prev_high)} init_prevL={self._fmt(prev_low)}")
 
         # Инициализация динамических уровней экстремов текущей «живой» свечи
         cur_high = float(prev_high)
@@ -587,10 +593,21 @@ class Trader:
         tp_r = self._round_step(tp, tick) if side == "Buy" else self._ceil_step(tp, tick)
         sl_r, tp_r = self._fix_tpsl(side, price, sl_r, tp_r, tick)
 
-        # Режим входа по экстремам предыдущей закрытой свечи (включается флагом ENTRY_EXTREMES=1)
+        # --- Диагностика режима экстремов ---
         prev_high = signal.get("prev_high")
         prev_low = signal.get("prev_low")
-        if self.entry_extremes and prev_high and prev_low:
+        use_ext = bool(self.entry_extremes and prev_high and prev_low)
+        if use_ext:
+            log.info(f"[EXT][MODE] ON  prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} qty={self._fmt(qty)}")
+        else:
+            reason = []
+            if not self.entry_extremes:
+                reason.append("flag_off")
+            if not prev_high or not prev_low:
+                reason.append("no_prev_hl")
+            log.info(f"[EXT][MODE] OFF ({','.join(reason) if reason else 'n/a'})")
+
+        if use_ext:
             log.info(f"[EXT][FOLLOW] side={side} prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} qty={self._fmt(qty)}")
             await self._follow_extremes(side, float(prev_high), float(prev_low), qty)
             return
