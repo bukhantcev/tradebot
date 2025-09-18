@@ -47,6 +47,8 @@ async def strategy_loop(strat: StrategyEngine, trader: Trader, poll_sec: float =
                             "tp": sig.tp,
                             "atr": sig.atr,
                             "ts_ms": sig.ts_ms or ts,
+                            "prev_high": sig.prev_high,
+                            "prev_low": sig.prev_low,
                         }
                         await trader.open_market(sig.side, payload)
             await asyncio.sleep(poll_sec)
