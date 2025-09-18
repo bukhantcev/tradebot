@@ -144,9 +144,17 @@ class StrategyEngine:
         if action == "Buy":
             sl = close - sl_mult * atr
             tp = body_high - tp_nudges
+            # Ensure TP is strictly higher than LastPrice (close)
+            if tp <= close:
+                tp = close + tick
+            log.info(f"[TPSL][MARK] Buy TP adjusted for LastPrice trigger: sl={sl:.2f} tp={tp:.2f}")
         else:  # Sell
             sl = close + sl_mult * atr
             tp = body_low + tp_nudges
+            # Ensure TP is strictly lower than LastPrice (close)
+            if tp >= close:
+                tp = close - tick
+            log.info(f"[TPSL][MARK] Sell TP adjusted for LastPrice trigger: sl={sl:.2f} tp={tp:.2f}")
 
         log.info(f"[DECIDE] {action} | sl={sl:.2f} tp={tp:.2f} • {reason}")
         if self._notifier:
