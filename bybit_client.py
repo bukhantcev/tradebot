@@ -127,11 +127,17 @@ class BybitClient:
             "side": side,
             "orderType": order_type,
             "qty": str(qty),
-            "timeInForce": timeInForce,
             "positionIdx": position_idx,
         }
         if price is not None:
             body["price"] = str(price)
+
+        if order_type.lower() == "market":
+            body.pop("price", None)
+            body["timeInForce"] = "IOC"
+        else:
+            body["timeInForce"] = timeInForce
+
         # TP/SL attach on order.create (v5 supports this)
         if takeProfit is not None:
             body["takeProfit"] = str(takeProfit)
@@ -149,7 +155,11 @@ class BybitClient:
 
         log.debug(f"[ORDER→] {body}")
         r = self._request("POST", "/v5/order/create", body=body)
-        log.debug(f"[ORDER←] retCode={r.get('retCode')} {str(r)[:400]}")
+        rc = r.get("retCode")
+        if rc and rc != 0:
+            log.error(f"[ORDER←][ERR] rc={rc} msg={r.get('retMsg')} body={body}")
+        else:
+            log.debug(f"[ORDER←] retCode={rc} {str(r)[:300]}")
         return r
 
     def position_list(self, symbol: str):
