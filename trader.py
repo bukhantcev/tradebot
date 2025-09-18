@@ -180,6 +180,37 @@ class Trader:
 
         return sl_f, tp_f
 
+    def _normalize_tpsl_with_anchor(self, side: str, base_price: float, sl: float, tp: float, tick: float) -> tuple[float, float]:
+        """
+        Корректирует SL/TP с учётом текущей рыночной цены (LastPrice) как «якоря»:
+          • Buy: TP > max(base_price, LastPrice), SL < max(...)
+          • Sell: TP < min(base_price, LastPrice), SL > min(...)
+        Затем прогоняем через _fix_tpsl(...), чтобы вписаться в тик.
+        """
+        try:
+            last = float(self._last_price()) or 0.0
+        except Exception:
+            last = 0.0
+
+        anchor = float(base_price or 0.0)
+        if side == "Buy":
+            if last > 0:
+                anchor = max(anchor, last)
+            if tp <= anchor:
+                tp = self._ceil_step(anchor + tick, tick)
+            if sl >= anchor:
+                sl = self._round_step(anchor - tick, tick)
+        else:  # Sell
+            if last > 0:
+                anchor = min(anchor, last) if anchor > 0 else last
+            if tp >= anchor:
+                tp = self._round_step(anchor - tick, tick)
+            if sl <= anchor:
+                sl = self._ceil_step(anchor + tick, tick)
+
+        sl_f, tp_f = self._fix_tpsl(side, anchor if anchor > 0 else (base_price or last or tp), sl, tp, tick)
+        return sl_f, tp_f
+
     # ---------- ПУБЛИЧНЫЕ МЕТОДЫ ----------
 
     def refresh_equity(self) -> float:
@@ -564,8 +595,8 @@ class Trader:
             except Exception:
                 pass
 
-            sl_final, tp_final = self._fix_tpsl(actual_side, base_price, sl_adj, tp_adj, tick)
-            log.info(f"[EXT][LIM][TPSL] side={actual_side} base={self._fmt(base_price)} sl={self._fmt(sl_final)} tp={self._fmt(tp_final)}")
+            sl_final, tp_final = self._normalize_tpsl_with_anchor(actual_side, base_price, sl_adj, tp_adj, tick)
+            log.info(f"[EXT][LIM][TPSL] side={actual_side} base={self._fmt(base_price)} sl={self._fmt(sl_final)} tp={self._fmt(tp_final)} (anchor=Last/base)")
 
             tr = self.client.trading_stop(
                 self.symbol,
@@ -573,6 +604,8 @@ class Trader:
                 stop_loss=sl_final,
                 take_profit=tp_final,
                 tpslMode="Full",
+                tpTriggerBy="MarkPrice",
+                slTriggerBy="MarkPrice",
                 positionIdx=0,
             )
             if tr.get("retCode") in (0, None):
@@ -928,6 +961,7 @@ class Trader:
                     side=side,
                     stop_loss=float(sl),
                     tpslMode="Full",
+                    slTriggerBy="MarkPrice",
                     positionIdx=0,
                 )
                 if tr.get("retCode") in (0, None):
@@ -955,12 +989,12 @@ class Trader:
 
         f = self.ensure_filters()
         tick = f["tickSize"]
-        if base_price and base_price > 0:
-            sl_adj, tp_adj = self._fix_tpsl(actual_side, base_price, sl_r, tp_r, tick)
-        else:
-            sl_adj, tp_adj = sl_r, tp_r
+        if not base_price or base_price <= 0:
+            base_price = float(self._last_price()) or price
 
-        log.info(f"[TPSL][NORM] side={actual_side} base={self._fmt(base_price) if base_price else 'n/a'} sl={self._fmt(sl_adj)} tp={self._fmt(tp_adj)}")
+        sl_adj, tp_adj = self._normalize_tpsl_with_anchor(actual_side, base_price, sl_r, tp_r, tick)
+
+        log.info(f"[TPSL][NORM] side={actual_side} base={self._fmt(base_price)} sl={self._fmt(sl_adj)} tp={self._fmt(tp_adj)} (anchor=Last/base)")
 
         r2 = self.client.trading_stop(
             self.symbol,
@@ -968,6 +1002,8 @@ class Trader:
             stop_loss=sl_adj,
             take_profit=tp_adj,
             tpslMode="Full",
+            tpTriggerBy="MarkPrice",
+            slTriggerBy="MarkPrice",
             positionIdx=0,
         )
         if r2.get("retCode") in (0, None):
