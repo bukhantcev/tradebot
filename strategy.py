@@ -41,7 +41,7 @@ class StrategyEngine:
         tick_size: float = 0.1,
         sl_mult: float = 1.5,
         tp_vs_sl: float = 2.0,
-        cooldown_sec: int = 180,
+        cooldown_sec: int = 0,
         notifier: Optional[Any] = None,  # опционально: объект с методом notify(str)
     ):
         self.risk_pct = risk_pct
@@ -92,12 +92,6 @@ class StrategyEngine:
             except Exception:
                 pass
 
-        # 3) Анти-спам: общий кулдаун между входами
-        now = time.time()
-        if now - self._last_trade_time < self.cooldown_sec:
-            log.debug(f"[SIGNAL][HL] prevH={prev_high} prevL={prev_low}")
-            return Signal(None, "cooldown", None, None, float(f0["atr14"]), int(f0["ts_ms"]), prev_high, prev_low, prev_open, prev_close)
-
         # 4) Вызов LLM (запрос/ответ логируются в llm.py как [LLM→]/[LLM←])
         ctx = {
             "symbol": self.symbol,
@@ -124,7 +118,7 @@ class StrategyEngine:
             log.info(f"[DECIDE] Hold | {reason}")
             if self._notifier:
                 try:
-                    await self._notifier.notify(f"🤖 LLM: Hold • {reason or 'no reason'}")
+                    await self._notifier.notify(f"🤖 ИИ: Hold • {reason or 'no reason'}")
                 except Exception:
                     pass
             log.debug(f"[SIGNAL][HL] prevH={prev_high} prevL={prev_low}")
@@ -147,25 +141,25 @@ class StrategyEngine:
             # Ensure TP is strictly higher than LastPrice (close)
             if tp <= close:
                 tp = close + tick
-            log.info(f"[TPSL][MARK] Buy TP adjusted for LastPrice trigger: sl={sl:.2f} tp={tp:.2f}")
+            log.info(f"[LLM][TPSL][MARK] Buy TP adjusted for LastPrice trigger: sl={sl:.2f} tp={tp:.2f}")
         else:  # Sell
             sl = close + sl_mult * atr
             tp = body_low + tp_nudges
             # Ensure TP is strictly lower than LastPrice (close)
             if tp >= close:
                 tp = close - tick
-            log.info(f"[TPSL][MARK] Sell TP adjusted for LastPrice trigger: sl={sl:.2f} tp={tp:.2f}")
+            log.info(f"[LLM][TPSL][MARK] Sell TP adjusted for LastPrice trigger: sl={sl:.2f} tp={tp:.2f}")
 
         log.info(f"[DECIDE] {action} | sl={sl:.2f} tp={tp:.2f} • {reason}")
         if self._notifier:
             try:
                 arrow = "🟢 Buy" if action == "Buy" else "🔴 Sell"
-                await self._notifier.notify(f"🤖 LLM: {arrow}\nSL {sl:.2f} / TP {tp:.2f}\n{('💬 ' + reason) if reason else ''}")
+                await self._notifier.notify(f"🤖 ИИ: {arrow}\nSL {sl:.2f} / TP {tp:.2f}\n{('💬 ' + reason) if reason else ''}")
             except Exception:
                 pass
 
         # фиксируем кулдаун
-        self._last_trade_time = now
+        self._last_trade_time = time.time()
 
         log.debug(f"[SIGNAL][HL] prevH={prev_high} prevL={prev_low}")
         return Signal(

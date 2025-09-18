@@ -435,8 +435,9 @@ class Trader:
                         positionIdx=0,
                     )
                     rc = r.get("retCode")
-                    if rc in (0, None):
-                        log.info(f"[REALIGN][OK] sl={self._fmt(sl_norm)} tp={self._fmt(tp_norm)} (try {tries})")
+                    if rc in (0, None, 34040):
+                        tag = "OK" if rc in (0, None) else "UNCHANGED"
+                        log.info(f"[REALIGN][{tag}] sl={self._fmt(sl_norm)} tp={self._fmt(tp_norm)} (try {tries})")
                         # If we successfully set within 2 ticks of desired, consider done
                         if abs(tp_norm - desired_tp) <= 2 * max(tick, 1e-9) and abs(sl_norm - desired_sl) <= 2 * max(tick, 1e-9):
                             break
@@ -709,21 +710,29 @@ class Trader:
             sl_final, tp_final = self._normalize_tpsl_with_anchor(actual_side, base_price, sl_adj, tp_adj, tick)
             log.info(f"[EXT][LIM][TPSL] side={actual_side} base={self._fmt(base_price)} sl={self._fmt(sl_final)} tp={self._fmt(tp_final)} (anchor=Last/base)")
 
-            tr = self.client.trading_stop(
-                self.symbol,
-                side=actual_side,
-                stop_loss=sl_final,
-                take_profit=tp_final,
-                tpslMode="Full",
-                tpTriggerBy="LastPrice",
-                slTriggerBy="MarkPrice",
-                tpOrderType="Market",
-                positionIdx=0,
-            )
-            if tr.get("retCode") in (0, None):
-                log.info(f"[EXT][LIM][TPSL][OK] sl={self._fmt(sl_final)} tp={self._fmt(tp_final)}")
+            # Apply TPSL only if position is not flat (guard against race right after fill)
+            ps, sz = self._position_side_and_size()
+            if not ps or sz <= 0:
+                log.debug("[EXT][LIM][TPSL][SKIP] position flat right after fill")
             else:
-                log.warning(f"[EXT][LIM][TPSL][FAIL] {tr}")
+                tr = self.client.trading_stop(
+                    self.symbol,
+                    side=actual_side,
+                    stop_loss=sl_final,
+                    take_profit=tp_final,
+                    tpslMode="Full",
+                    tpTriggerBy="LastPrice",
+                    slTriggerBy="MarkPrice",
+                    tpOrderType="Market",
+                    positionIdx=0,
+                )
+                rc = tr.get("retCode")
+                if rc in (0, None, 34040):  # 34040 = not modified
+                    tag = "OK" if rc in (0, None) else "UNCHANGED"
+                    log.info(f"[EXT][LIM][TPSL][{tag}] sl={self._fmt(sl_final)} tp={self._fmt(tp_final)}")
+                else:
+                    log.warning(f"[EXT][LIM][TPSL][FAIL] {tr}")
+
             # Start background realigner to move TP/SL toward desired (normalized on the fly)
             self._cancel_realigner()
             try:
@@ -736,7 +745,7 @@ class Trader:
 
             # --- Ждём закрытия позиции TP/SL и перезапускаем цикл с новым лимитником ---
             log.info("[EXT][LIM][WATCH] arming TP/SL watchdog (LastPrice cross)")
-            # Не останавливаем рабочий цикл из‑за таймаута.
+            # Не останавливаем рабочий цикл из-за таймаута.
             # Следим за TP/SL батчами по 5 минут; если таймаут — просто продолжаем мониторить,
             # пока позиция не станет flat.
             while True:
@@ -1091,21 +1100,27 @@ class Trader:
             await self._stop_minute_logger()
             return
 
-        # Сразу SL в Full-режиме (без TP) — затем нормализованный TP/SL ниже
+        # Сразу SL в Full-режиме (без TP) — но только если позиция реально открыта
         if sl:
             try:
-                tr = self.client.trading_stop(
-                    self.symbol,
-                    side=side,
-                    stop_loss=float(sl),
-                    tpslMode="Full",
-                    slTriggerBy="MarkPrice",
-                    positionIdx=0,
-                )
-                if tr.get("retCode") in (0, None):
-                    log.info(f"[SL][NORM] set SL={self._fmt(sl)} OK")
+                ps0, sz0 = self._position_side_and_size()
+                if not ps0 or sz0 <= 0:
+                    log.debug("[SL][NORM][SKIP] flat right after entry")
                 else:
-                    log.warning(f"[SL][NORM][FAIL] {tr}")
+                    tr = self.client.trading_stop(
+                        self.symbol,
+                        side=side,
+                        stop_loss=float(sl),
+                        tpslMode="Full",
+                        slTriggerBy="MarkPrice",
+                        positionIdx=0,
+                    )
+                    rc = tr.get("retCode")
+                    if rc in (0, None, 34040):
+                        tag = "OK" if rc in (0, None) else "UNCHANGED"
+                        log.info(f"[SL][NORM] set SL={self._fmt(sl)} {tag}")
+                    else:
+                        log.warning(f"[SL][NORM][FAIL] {tr}")
             except Exception as e:
                 log.warning(f"[SL][NORM][EXC] {e}")
 
@@ -1132,26 +1147,32 @@ class Trader:
 
         log.info(f"[TPSL][NORM] side={actual_side} base={self._fmt(base_price)} sl={self._fmt(sl_adj)} tp={self._fmt(tp_adj)} (anchor=Last/base)")
 
-        r2 = self.client.trading_stop(
-            self.symbol,
-            side=actual_side,
-            stop_loss=sl_adj,
-            take_profit=tp_adj,
-            tpslMode="Full",
-            tpTriggerBy="LastPrice",
-            slTriggerBy="MarkPrice",
-            tpOrderType="Market",
-            positionIdx=0,
-        )
-        if r2.get("retCode") in (0, None):
-            log.info(f"[TPSL] sl={self._fmt(sl_adj)} tp={self._fmt(tp_adj)} OK")
-            if self.notifier:
-                try:
-                    await self.notifier.notify(f"🎯 TP/SL set: SL {self._fmt(sl_adj)} / TP {self._fmt(tp_adj)}")
-                except Exception:
-                    pass
+        ps1, sz1 = self._position_side_and_size()
+        if not ps1 or sz1 <= 0:
+            log.debug("[TPSL][SKIP] flat before setting final TP/SL")
         else:
-            log.warning(f"[TPSL][FAIL] {r2}")
+            r2 = self.client.trading_stop(
+                self.symbol,
+                side=actual_side,
+                stop_loss=sl_adj,
+                take_profit=tp_adj,
+                tpslMode="Full",
+                tpTriggerBy="LastPrice",
+                slTriggerBy="MarkPrice",
+                tpOrderType="Market",
+                positionIdx=0,
+            )
+            rc2 = r2.get("retCode")
+            if rc2 in (0, None, 34040):
+                tag = "OK" if rc2 in (0, None) else "UNCHANGED"
+                log.info(f"[TPSL] sl={self._fmt(sl_adj)} tp={self._fmt(tp_adj)} {tag}")
+                if self.notifier:
+                    try:
+                        await self.notifier.notify(f"🎯 TP/SL set: SL {self._fmt(sl_adj)} / TP {self._fmt(tp_adj)}")
+                    except Exception:
+                        pass
+            else:
+                log.warning(f"[TPSL][FAIL] {r2}")
         # Start background realigner to migrate TP/SL toward desired values as the anchor allows
         self._cancel_realigner()
         try:
