@@ -54,6 +54,7 @@ class Trader:
         self._minute_task = None
         self._minute_mode: str = "normal"
         self._minute_sl: float | None = None
+        self._realign_task = None  # background TPSL realigner task
 
     def _round_down_qty(self, qty: float) -> float:
         """Округляет вниз с учётом шага количества; запасной шаг 0.001."""
@@ -206,76 +207,6 @@ class Trader:
 
         sl_f, tp_f = self._fix_tpsl(side, anchor if anchor > 0 else (base_price or last or tp), sl, tp, tick)
         return sl_f, tp_f
-
-    async def _tp_realign_watch(self, side: str, desired_tp: float, sl_price: float | None, check_interval: float = 0.5, max_wait: float = 1800.0):
-        """
-        Если TP пришлось поставить не там, где хотелось (из-за ограничений якоря/валидации),
-        периодически пытаемся переставить TP на нужный уровень (desired_tp), когда это станет валидно.
-        Условия валидации: для Buy — TP > LastPrice; для Sell — TP < LastPrice.
-        Используем tpTriggerBy=LastPrice. Как только позиция становится flat — выходим.
-        """
-        try:
-            f = self.ensure_filters()
-            tick = float(f.get("tickSize", 0.1) or 0.1)
-        except Exception:
-            tick = 0.1
-
-        side = "Buy" if side == "Buy" else "Sell"
-        deadline = time.monotonic() + max_wait
-
-        while time.monotonic() < deadline:
-            try:
-                # если позиции уже нет — выходим
-                ps, sz = self._position_side_and_size()
-                if not ps or sz <= 0:
-                    return True
-
-                last = self._last_price()
-                if last <= 0:
-                    await asyncio.sleep(check_interval)
-                    continue
-
-                # Проверяем, можем ли переставить TP на желаемый уровень с учётом LastPrice
-                can_set = False
-                if side == "Buy":
-                    if desired_tp > last + 0.5 * tick:
-                        can_set = True
-                else:
-                    if desired_tp < last - 0.5 * tick:
-                        can_set = True
-
-                if can_set:
-                    # Попытка обновить только TP (SL оставляем как есть, если передан)
-                    body = {
-                        "category": "linear",
-                        "symbol": self.symbol,
-                        "positionIdx": 0,
-                        "tpslMode": "Full",
-                        "tpTriggerBy": "LastPrice",
-                        "tpOrderType": "Market",
-                        "takeProfit": self._fmt(desired_tp),
-                    }
-                    if sl_price:
-                        # сохраняем SL вместе с TP, чтобы не обнулить его
-                        body["slTriggerBy"] = "MarkPrice"
-                        body["stopLoss"] = self._fmt(float(sl_price))
-
-                    r = self.client._request("POST", "/v5/position/trading-stop", body=body)
-                    rc = r.get("retCode")
-                    if rc in (0, None):
-                        log.info(f"[TP][REALIGN][OK] moved TP to {self._fmt(desired_tp)} (side={side})")
-                        return True
-                    else:
-                        log.debug(f"[TP][REALIGN][WAIT] rc={rc} msg={r.get('retMsg')}")
-                await asyncio.sleep(check_interval)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                log.debug(f"[TP][REALIGN][EXC] {e}")
-                await asyncio.sleep(check_interval)
-
-        log.debug("[TP][REALIGN][TIMEOUT] stop trying to move TP")
-        return False
 
     # ---------- ПУБЛИЧНЫЕ МЕТОДЫ ----------
 
@@ -442,11 +373,12 @@ class Trader:
 
                 if trigger:
                     log.info(f"[WATCH][CROSS] Last={self._fmt(last)} vs SL={self._fmt(sl_price)} / TP={self._fmt(tp_price)} -> force close")
+                    # stop any TP/SL realigner before force close
+                    self._cancel_realigner()
                     try:
                         await self.close_market(opp, sz)
                     except Exception as e:
                         log.warning(f"[WATCH][CLOSE][EXC] {e}")
-                    # ждём подтверждения flat и выходим
                     ok_flat = await self._wait_position_flat(timeout=30.0, interval=0.25)
                     return ok_flat
             except asyncio.CancelledError:
@@ -455,6 +387,71 @@ class Trader:
                 log.warning(f"[WATCH][EXC] {e}")
             await asyncio.sleep(check_interval)
         return False
+
+    def _cancel_realigner(self):
+        """Cancel TPSL realigner task if running."""
+        t = getattr(self, "_realign_task", None)
+        if t and not t.done():
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        self._realign_task = None
+
+    async def _realign_tpsl(self, side: str, desired_sl: float, desired_tp: float, tick: float, debounce: float = 0.8, max_tries: int = 30):
+        """
+        Periodically try to re-apply TP/SL to desired levels, but normalized
+        against the *current* anchor (Last/Mark) to satisfy Bybit constraints.
+        Stops automatically when position becomes flat or after max_tries.
+        """
+        try:
+            side = "Buy" if side == "Buy" else "Sell"
+            tries = 0
+            while tries < max_tries:
+                tries += 1
+
+                # if flat — stop
+                ps, sz = self._position_side_and_size()
+                if not ps or sz <= 0:
+                    log.debug("[REALIGN] flat — stop")
+                    break
+
+                # pick dynamic anchor (use last/base inside normalization)
+                # and bring desired targets into allowed ranges
+                # NOTE: we pass base_price=None; _normalize_tpsl_with_anchor will use LastPrice
+                sl_norm, tp_norm = self._normalize_tpsl_with_anchor(side, base_price=0.0, sl=desired_sl, tp=desired_tp, tick=tick)
+
+                # apply
+                try:
+                    r = self.client.trading_stop(
+                        self.symbol,
+                        side=side,
+                        stop_loss=sl_norm,
+                        take_profit=tp_norm,
+                        tpslMode="Full",
+                        tpTriggerBy="LastPrice",
+                        slTriggerBy="MarkPrice",
+                        tpOrderType="Market",
+                        positionIdx=0,
+                    )
+                    rc = r.get("retCode")
+                    if rc in (0, None):
+                        log.info(f"[REALIGN][OK] sl={self._fmt(sl_norm)} tp={self._fmt(tp_norm)} (try {tries})")
+                        # If we successfully set within 2 ticks of desired, consider done
+                        if abs(tp_norm - desired_tp) <= 2 * max(tick, 1e-9) and abs(sl_norm - desired_sl) <= 2 * max(tick, 1e-9):
+                            break
+                    else:
+                        log.debug(f"[REALIGN][RC] rc={rc} msg={r.get('retMsg')}")
+                except Exception as e:
+                    log.debug(f"[REALIGN][EXC] {e}")
+
+                await asyncio.sleep(max(0.1, float(debounce)))
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.debug(f"[REALIGN][STOP] {e}")
+        finally:
+            self._realign_task = None
 
     async def _await_fill_or_retry(self, order_id: str, side: str, qty: float) -> bool:
         """
@@ -545,6 +542,7 @@ class Trader:
         """
         if qty <= 0:
             log.info("[EXT][LIM][SKIP] qty<=0")
+            self._cancel_realigner()
             return
 
         f = self.ensure_filters()
@@ -611,9 +609,6 @@ class Trader:
                 sl_ref = float(sl) if (sl and sl > 0) else (entry_price + 1.5 * tick)
                 sl_adj, tp_adj = self._fix_tpsl("Sell", entry_price, sl_ref, tp_ref, tick)
 
-            # Запомним целевой TP до нормализации/якорения — туда хотим вернуться при первой возможности
-            tp_target = tp_adj
-
             log.info(f"[EXT][LIM][PLACE] {side} limit entry={self._fmt(entry_price)} tp={self._fmt(tp_adj)} sl={self._fmt(sl_adj)} qty={self._fmt(qty)}")
 
             # 3) Баланс и qty
@@ -633,6 +628,7 @@ class Trader:
                     log.info(f"[EXT][LIM][FORCE] adjusted qty up to min {self._fmt(min_qty)}")
                 else:
                     log.error(f"[EXT][LIM][SKIP] qty not affordable at entry={self._fmt(entry_price)} -> {self._fmt(attempt_qty)} < min {self._fmt(min_qty)}")
+                    self._cancel_realigner()
                     await asyncio.sleep(60)
                     cur_prev_high = cur_prev_low = 0.0
                     continue
@@ -670,6 +666,7 @@ class Trader:
                 break
 
             if not active_oid:
+                self._cancel_realigner()
                 await asyncio.sleep(60)
                 cur_prev_high = cur_prev_low = 0.0
                 continue
@@ -709,7 +706,7 @@ class Trader:
             except Exception:
                 pass
 
-            sl_final, tp_final = self._normalize_tpsl_with_anchor(actual_side, base_price, sl_adj, tp_target, tick)
+            sl_final, tp_final = self._normalize_tpsl_with_anchor(actual_side, base_price, sl_adj, tp_adj, tick)
             log.info(f"[EXT][LIM][TPSL] side={actual_side} base={self._fmt(base_price)} sl={self._fmt(sl_final)} tp={self._fmt(tp_final)} (anchor=Last/base)")
 
             tr = self.client.trading_stop(
@@ -725,13 +722,17 @@ class Trader:
             )
             if tr.get("retCode") in (0, None):
                 log.info(f"[EXT][LIM][TPSL][OK] sl={self._fmt(sl_final)} tp={self._fmt(tp_final)}")
-                # Если TP пришлось сдвинуть из‑за ограничений — сторож вернёт его на желаемый уровень при первой возможности
-                try:
-                    asyncio.create_task(self._tp_realign_watch(actual_side, desired_tp=tp_target, sl_price=sl_final, check_interval=0.5, max_wait=1800.0))
-                except Exception:
-                    pass
             else:
                 log.warning(f"[EXT][LIM][TPSL][FAIL] {tr}")
+            # Start background realigner to move TP/SL toward desired (normalized on the fly)
+            self._cancel_realigner()
+            try:
+                self._realign_task = asyncio.create_task(
+                    self._realign_tpsl(actual_side, sl_adj, tp_adj, tick),
+                    name="tpsl_realign"
+                )
+            except Exception:
+                self._realign_task = None
 
             # --- Ждём закрытия позиции TP/SL и перезапускаем цикл с новым лимитником ---
             log.info("[EXT][LIM][WATCH] arming TP/SL watchdog (LastPrice cross)")
@@ -745,6 +746,8 @@ class Trader:
                 if ok_flat:
                     break
                 log.warning("[EXT][LIM][WATCH][TIMEOUT] position still open; keep monitoring…")
+            # Ensure realigner is stopped once flat
+            self._cancel_realigner()
 
             # На всякий случай снимем все оставшиеся ордера по символу
             try:
@@ -923,6 +926,7 @@ class Trader:
         tp = float(_sg_multi(["tp", "take_profit", "takeProfit"]) or 0.0)
         if sl <= 0 or tp <= 0:
             log.info("[ENTER][SKIP] bad SL/TP")
+            self._cancel_realigner()
             await self._stop_minute_logger()
             return
 
@@ -932,6 +936,7 @@ class Trader:
         log.info(f"[QTY] risk%={self.risk_pct*100:.2f} stop={abs(price-sl):.2f} equity={self.equity:.2f} avail={self.available:.2f} -> qty={self._fmt(qty)}")
         if qty <= 0:
             log.info("[ENTER][SKIP] qty=0")
+            self._cancel_realigner()
             await self._stop_minute_logger()
             return
 
@@ -1030,6 +1035,7 @@ class Trader:
                     new_qty = self._round_down_qty(attempt_qty - step)
                 if new_qty < min_qty:
                     log.error(f"[ENTER][FAIL] insufficient balance for minimal qty; last={self._fmt(attempt_qty)}")
+                    self._cancel_realigner()
                     await self._stop_minute_logger()
                     return
                 log.info(f"[ENTER][RETRY_QTY] 110007 -> {self._fmt(attempt_qty)} -> {self._fmt(new_qty)}")
@@ -1065,19 +1071,23 @@ class Trader:
                             pass
                     break
                 log.error(f"[ENTER][FAIL] {r3}")
+                self._cancel_realigner()
                 await self._stop_minute_logger()
                 return
             log.error(f"[ENTER][FAIL] {r}")
+            self._cancel_realigner()
             await self._stop_minute_logger()
             return
 
         if not order_id:
             log.error("[ENTER][FAIL] no orderId")
+            self._cancel_realigner()
             await self._stop_minute_logger()
             return
 
         if not await self._await_fill_or_retry(order_id, side, attempt_qty):
             log.warning("[ENTER][ABORT] no fill")
+            self._cancel_realigner()
             await self._stop_minute_logger()
             return
 
@@ -1118,9 +1128,7 @@ class Trader:
         if not base_price or base_price <= 0:
             base_price = float(self._last_price()) or price
 
-        # целевой TP до нормализации — хотим там оказаться как только это станет валидно по LastPrice
-        tp_target = tp_r
-        sl_adj, tp_adj = self._normalize_tpsl_with_anchor(actual_side, base_price, sl_r, tp_target, tick)
+        sl_adj, tp_adj = self._normalize_tpsl_with_anchor(actual_side, base_price, sl_r, tp_r, tick)
 
         log.info(f"[TPSL][NORM] side={actual_side} base={self._fmt(base_price)} sl={self._fmt(sl_adj)} tp={self._fmt(tp_adj)} (anchor=Last/base)")
 
@@ -1137,11 +1145,6 @@ class Trader:
         )
         if r2.get("retCode") in (0, None):
             log.info(f"[TPSL] sl={self._fmt(sl_adj)} tp={self._fmt(tp_adj)} OK")
-            # Попробуем вернуть TP туда, где хотели изначально, когда это станет возможно
-            try:
-                asyncio.create_task(self._tp_realign_watch(actual_side, desired_tp=tp_target, sl_price=sl_adj, check_interval=0.5, max_wait=1800.0))
-            except Exception:
-                pass
             if self.notifier:
                 try:
                     await self.notifier.notify(f"🎯 TP/SL set: SL {self._fmt(sl_adj)} / TP {self._fmt(tp_adj)}")
@@ -1149,6 +1152,15 @@ class Trader:
                     pass
         else:
             log.warning(f"[TPSL][FAIL] {r2}")
+        # Start background realigner to migrate TP/SL toward desired values as the anchor allows
+        self._cancel_realigner()
+        try:
+            self._realign_task = asyncio.create_task(
+                self._realign_tpsl(actual_side, sl_r, tp_r, tick),
+                name="tpsl_realign"
+            )
+        except Exception:
+            self._realign_task = None
 
     async def close_market(self, side: str, qty: float):
         """
