@@ -38,6 +38,7 @@ class Trader:
         self._filters: Optional[Dict[str, float]] = None
         # последняя известная equity (USDT)
         self.equity: float = 0.0
+        self.available: float = 0.0  # доступный баланс для маржи (USDT)
 
     # ---------- УТИЛЫ ----------
 
@@ -57,19 +58,22 @@ class Trader:
     # ---------- ПУБЛИЧНЫЕ МЕТОДЫ ----------
 
     def refresh_equity(self) -> float:
-        """Запрос баланса без лишнего шума"""
+        """Запрос баланса: totalEquity и totalAvailableBalance"""
         try:
             r = self.client.wallet_balance(account_type="UNIFIED")
-            usdt = float(r["result"]["list"][0]["totalEquity"])
-            self.equity = usdt
-            log.info(f"[BALANCE] {usdt:.2f} USDT")
+            lst = r["result"]["list"][0]
+            usdt_total = float(lst["totalEquity"])
+            usdt_avail = float(lst.get("totalAvailableBalance") or lst.get("availableBalance") or usdt_total)
+            self.equity = usdt_total
+            self.available = usdt_avail
+            log.info(f"[BALANCE] equity={usdt_total:.2f} avail={usdt_avail:.2f} USDT")
             if self.notifier:
                 try:
                     import asyncio
-                    asyncio.create_task(self.notifier.notify(f"💰 Баланс: {usdt:.2f} USDT"))
+                    asyncio.create_task(self.notifier.notify(f"💰 Баланс: {usdt_total:.2f} USDT (доступно {usdt_avail:.2f})"))
                 except Exception:
                     pass
-            return usdt
+            return usdt_total
         except Exception as e:
             log.error(f"[BALANCE][ERR] {e}")
             return 0.0
@@ -83,7 +87,8 @@ class Trader:
         tick = float(it.get("priceFilter", {}).get("tickSize", "0.1"))
         qty_step = float(it.get("lotSizeFilter", {}).get("qtyStep", "0.001"))
         min_qty = float(it.get("lotSizeFilter", {}).get("minOrderQty", "0.001"))
-        self._filters = {"tickSize": tick, "qtyStep": qty_step, "minQty": min_qty}
+        mov = float(it.get("lotSizeFilter", {}).get("minOrderValue", "0") or 0.0)
+        self._filters = {"tickSize": tick, "qtyStep": qty_step, "minQty": min_qty, "minNotional": mov}
         log.debug(f"[FILTERS] {self._filters}")
         return self._filters
 
@@ -109,19 +114,37 @@ class Trader:
 
     def _calc_qty(self, side: str, price: float, sl: float) -> float:
         """
-        К-во рассчитываем по риску:
-        risk_amt = equity * risk_pct
-        stop_dist = |price - sl|
-        qty = risk_amt / stop_dist
-        затем приводим к шагу и к минимуму биржи.
+        Считаем qty как минимум из:
+          • риск-бейзд:  qty_risk = (equity * risk_pct) / stop_dist
+          • по доступной марже: qty_afford = available / (price/leverage * fee_buf)
+        Затем приводим к шагу qtyStep и проверяем минимальные ограничения.
         """
         f = self.ensure_filters()
-        risk_amt = max(self.equity * self.risk_pct / max(self.leverage, 1.0), 1e-8)
         stop_dist = abs(price - sl)
         if stop_dist <= 0:
             return 0.0
-        raw_qty = risk_amt / stop_dist
-        qty = max(f["minQty"], self._round_step(raw_qty, f["qtyStep"]))
+
+        # 1) по риску (леверидж не влияет на риск в $)
+        risk_amt = max(self.equity * self.risk_pct, 0.0)
+        qty_risk = risk_amt / stop_dist
+
+        # 2) по доступной марже (учтём буфер на комиссии/плавающие требования)
+        FEE_BUF = 1.003
+        margin_per_qty = price / max(self.leverage, 1.0)
+        if margin_per_qty <= 0:
+            return 0.0
+        qty_afford = (self.available / (margin_per_qty * FEE_BUF)) if self.available > 0 else qty_risk
+
+        # 3) итог
+        raw = max(0.0, min(qty_risk, qty_afford))
+        qty = self._round_step(raw, f["qtyStep"])
+        # Минимальные ограничения
+        if qty < f["minQty"]:
+            return 0.0
+        # Минимальная нотация (если биржа требует)
+        min_notional = f.get("minNotional", 0.0) or 0.0
+        if min_notional > 0 and (qty * price) < min_notional:
+            return 0.0
         return qty
 
     # ---------- ОРДЕРА ----------
@@ -131,8 +154,8 @@ class Trader:
         side: "Buy" | "Sell"
         signal: { 'sl': float, 'tp': float, 'atr': float, 'ts_ms': int, ... }
         """
-        # обновим equity (если 0) и фильтры/плечо
-        if self.equity <= 0:
+        # обновим equity/available (если 0) и фильтры/плечо
+        if self.equity <= 0 or self.available <= 0:
             self.refresh_equity()
         self.ensure_filters()
         self.ensure_leverage()
@@ -149,6 +172,7 @@ class Trader:
             return
 
         qty = self._calc_qty(side, price, sl)
+        log.info(f"[QTY] risk%={self.risk_pct*100:.2f} stop={abs(price-sl):.2f} equity={self.equity:.2f} avail={self.available:.2f} -> qty={self._fmt(qty)}")
         if qty <= 0:
             log.info("[ENTER][SKIP] qty=0")
             return
@@ -156,17 +180,39 @@ class Trader:
         # Маркет-вход
         log.info(f"[ENTER] {side} qty={self._fmt(qty)}")
         r = self.client.place_order(self.symbol, side, qty)
-        if r.get("retCode") != 0:
+        rc = r.get("retCode")
+        if rc == 0:
+            order_id = r.get("result", {}).get("orderId", "")
+            log.info(f"[ORDER←] OK id={order_id}")
+            if self.notifier:
+                try:
+                    await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(qty)} (id {order_id})")
+                except Exception:
+                    pass
+        elif rc == 110007:  # ab not enough for new order
+            # попробуем уменьшить qty и повторить один раз
+            f = self.ensure_filters()
+            qty2 = max(f["minQty"], self._round_step(qty * 0.9, f["qtyStep"]))
+            if qty2 < f["minQty"]:
+                log.error(f"[ORDER][FAIL] rc=110007 (no balance), qty too small after retry")
+                return
+            log.info(f"[ENTER][RETRY] reduce qty -> {self._fmt(qty2)}")
+            r = self.client.place_order(self.symbol, side, qty2)
+            if r.get("retCode") == 0:
+                order_id = r.get("result", {}).get("orderId", "")
+                log.info(f"[ORDER←] OK id={order_id}")
+                if self.notifier:
+                    try:
+                        await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(qty2)} (id {order_id})")
+                    except Exception:
+                        pass
+                qty = qty2  # использовать фактическое qty далее
+            else:
+                log.error(f"[ORDER][FAIL] {r}")
+                return
+        else:
             log.error(f"[ORDER][FAIL] {r}")
             return
-
-        order_id = r.get("result", {}).get("orderId", "")
-        log.info(f"[ORDER←] OK id={order_id}")
-        if self.notifier:
-            try:
-                await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(qty)} (id {order_id})")
-            except Exception:
-                pass
 
         # Установка TP/SL
         f = self.ensure_filters()
