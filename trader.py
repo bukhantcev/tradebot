@@ -717,9 +717,13 @@ class Trader:
             log.info(f"[EXT][MODE] OFF ({','.join(reason) if reason else 'n/a'}) fields={fields}")
 
         # обновим режим минутного логгера
-        await self._stop_minute_logger()
-        self._start_minute_logger("ext" if use_ext else "normal", float(sl) if sl else None)
-        log.info("[EXT][CHECKPOINT] after minute logger start")
+        log.info("[EXT][CHECKPOINT] before minute logger stop/start")
+        try:
+            await self._stop_minute_logger()
+            self._start_minute_logger("ext" if use_ext else "normal", float(sl) if sl else None)
+            log.info("[EXT][CHECKPOINT] after minute logger start")
+        except Exception as e:
+            log.exception(f"[EXT][LOGGER][EXC] {e}")
 
         # (3) Всегда форсируем flat перед новым входом
         try:
@@ -737,7 +741,10 @@ class Trader:
             log.exception(f"[EXT][FLAT][EXC] {e}")
             log.info("[EXT][CHECKPOINT] after flat enforcement (with exception)")
 
-        log.info(f"[EXT][CHECKPOINT] before branch use_ext={use_ext}")
+        try:
+            log.info(f"[EXT][CHECKPOINT] before branch use_ext={use_ext}")
+        except Exception:
+            log.exception("[EXT][CHECKPOINT][EXC] before branch")
         if use_ext:
             log.info("[EXT][CHECKPOINT] entering use_ext branch")
             log.info(f"[EXT][FOLLOW] side={side} prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} qty={self._fmt(qty)}")
