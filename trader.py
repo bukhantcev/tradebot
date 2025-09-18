@@ -54,6 +54,7 @@ class Trader:
         self._minute_task = None
         self._minute_mode: str = "normal"
         self._minute_sl: float | None = None
+
     def _round_down_qty(self, qty: float) -> float:
         """Округляет вниз с учётом шага количества; запасной шаг 0.001."""
         try:
@@ -70,7 +71,7 @@ class Trader:
         """Запускает один общий минутный логгер; режим/SL берутся из self._minute_mode/_minute_sl."""
         if self._minute_task and not self._minute_task.done():
             return
-        import asyncio, time
+
         async def _loop():
             last_min = int(time.time() // 60)
             while True:
@@ -99,6 +100,7 @@ class Trader:
                 except Exception:
                     # backoff on any unexpected exception to avoid tight spinning
                     await asyncio.sleep(2.0)
+
         self._minute_task = asyncio.create_task(_loop(), name="minute_stat")
         log.info("[MIN][START] minute logger started")
 
@@ -113,11 +115,10 @@ class Trader:
         if t and not t.done():
             try:
                 t.cancel()
-                import asyncio as _a
                 try:
-                    await _a.wait_for(t, timeout=1.0)
+                    await asyncio.wait_for(t, timeout=1.0)
                     log.info("[MIN][STOP] minute logger stopped")
-                except _a.TimeoutError:
+                except asyncio.TimeoutError:
                     log.warning("[MIN][STOP][TIMEOUT] cancel wait timed out; detaching task")
                 except Exception as e:
                     log.warning(f"[MIN][STOP][EXC] {e}")
@@ -153,15 +154,12 @@ class Trader:
         t = max(float(tick), 0.0) or 0.1
 
         if side == "Buy":
-            # SL должен быть строго ниже цены, TP — строго выше
             if sl_f >= p:
                 sl_f = p - t
             if tp_f <= p:
                 tp_f = p + t
-            # округление в сторону, совместимую с правилами биржи
-            sl_f = self._round_step(sl_f, t)  # вниз по тику
-            tp_f = self._ceil_step(tp_f, t)   # вверх по тику
-            # дополнительная страховка: разнести хотя бы на 1 тик
+            sl_f = self._round_step(sl_f, t)
+            tp_f = self._ceil_step(tp_f, t)
             if sl_f >= p:
                 sl_f = p - 2 * t
             if tp_f <= p:
@@ -171,8 +169,8 @@ class Trader:
                 sl_f = p + t
             if tp_f >= p:
                 tp_f = p - t
-            sl_f = self._ceil_step(sl_f, t)   # вверх по тику
-            tp_f = self._round_step(tp_f, t)  # вниз по тику
+            sl_f = self._ceil_step(sl_f, t)
+            tp_f = self._round_step(tp_f, t)
             if sl_f <= p:
                 sl_f = p + 2 * t
             if tp_f >= p:
@@ -182,9 +180,7 @@ class Trader:
 
     def _normalize_tpsl_with_anchor(self, side: str, base_price: float, sl: float, tp: float, tick: float) -> tuple[float, float]:
         """
-        Корректирует SL/TP с учётом текущей рыночной цены (LastPrice) как «якоря»:
-          • Buy: TP > max(base_price, LastPrice), SL < max(...)
-          • Sell: TP < min(base_price, LastPrice), SL > min(...)
+        Корректирует SL/TP с учётом текущей рыночной цены (LastPrice) как «якоря».
         Затем прогоняем через _fix_tpsl(...), чтобы вписаться в тик.
         """
         try:
@@ -225,7 +221,6 @@ class Trader:
             log.info(f"[BALANCE] equity={usdt_total:.2f} avail={usdt_avail:.2f} USDT")
             if self.notifier:
                 try:
-                    import asyncio
                     asyncio.create_task(self.notifier.notify(f"💰 Баланс: {usdt_total:.2f} USDT (доступно {usdt_avail:.2f})"))
                 except Exception:
                     pass
@@ -252,7 +247,6 @@ class Trader:
         """Ставит плечо только если отличается (подавляем 110043 как норму)"""
         try:
             pl = self.client.position_list(self.symbol)
-            # Bybit может отдавать пустой список, если позиции нет
             cur_lev = float(pl.get("result", {}).get("list", [{}])[0].get("leverage") or 0.0)
             if abs(cur_lev - self.leverage) < 1e-9:
                 log.debug(f"[LEV] already {cur_lev}x")
@@ -280,11 +274,11 @@ class Trader:
         if stop_dist <= 0:
             return 0.0
 
-        # 1) по риску (леверидж не влияет на риск в $)
+        # 1) по риску
         risk_amt = max(self.equity * self.risk_pct, 0.0)
         qty_risk = risk_amt / stop_dist
 
-        # 2) по доступной марже (учтём буфер на комиссии/плавающие требования)
+        # 2) по доступной марже (буфер на комиссии/маржу)
         FEE_BUF = 1.003
         margin_per_qty = price / max(self.leverage, 1.0)
         if margin_per_qty <= 0:
@@ -294,10 +288,8 @@ class Trader:
         # 3) итог
         raw = max(0.0, min(qty_risk, qty_afford))
         qty = self._round_step(raw, f["qtyStep"])
-        # Минимальные ограничения
         if qty < f["minQty"]:
             return 0.0
-        # Минимальная нотация (если биржа требует)
         min_notional = f.get("minNotional", 0.0) or 0.0
         if min_notional > 0 and (qty * price) < min_notional:
             return 0.0
@@ -305,16 +297,14 @@ class Trader:
 
     async def _wait_position_open(self, timeout: float = 10.0, interval: float = 0.3) -> bool:
         """
-        Короткое ожидание появления позиции (size&gt;0), чтобы fallback trading-stop не падал rc=10001.
+        Короткое ожидание появления позиции (size>0), чтобы fallback trading-stop не падал rc=10001.
         Возвращает True, если позиция открылась в течение timeout.
         """
-        import time
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
                 pl = self.client.position_list(self.symbol)
                 lst = pl.get("result", {}).get("list", [])
-                # Пройдём по всем позициям (на случай hedge-mode/двух сторон)
                 for it in lst:
                     size_str = it.get("size") or it.get("positionValue") or ""
                     try:
@@ -328,18 +318,37 @@ class Trader:
             await asyncio.sleep(interval)
         return False
 
+    async def _wait_position_flat(self, timeout: float = 3600.0, interval: float = 0.5) -> bool:
+        """
+        Ждём, пока позиция станет плоской (size == 0).
+        Возвращает True, если успели за timeout.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                pl = self.client.position_list(self.symbol)
+                lst = pl.get("result", {}).get("list", [])
+                any_size = 0.0
+                for it in lst:
+                    sz = float(it.get("size") or 0.0)
+                    any_size += sz
+                if any_size <= 0:
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(interval)
+        return False
+
     async def _await_fill_or_retry(self, order_id: str, side: str, qty: float) -> bool:
         """
         Ждём исполнения текущего ордера. Если он отменён без фила — делаем до двух ретраев
         с умным маркетом и повышением допусков.
         Возвращает True, если позиция открылась; иначе False.
         """
-        # 1) Подождать быстрое появление позиции
         ok = await self._wait_position_open(timeout=10.0, interval=0.3)
         if ok:
             return True
 
-        # 2) Узнать статус исходного ордера
         try:
             st = self.client.get_order_status(self.symbol, order_id)
         except Exception:
@@ -348,14 +357,12 @@ class Trader:
         filled = float(st.get("cumExecQty") or 0.0) > 0.0
 
         if filled or status in ("filled", "partiallyfilled"):
-            # иногда позиция появится с задержкой — проверим ещё чуть-чуть
             ok2 = await self._wait_position_open(timeout=5.0, interval=0.3)
             return ok2
 
         if status in ("cancelled", "rejected") or not status:
             log.warning(f"[ORDER][CANCELLED] status={status or 'n/a'} -> retry smart market")
 
-            # Ретрай #1: умный маркет с 0.10% допуска
             r = self.client.place_market_safe(self.symbol, side, qty, position_idx=0, slip_percent=0.10)
             if r.get("retCode") == 0:
                 oid = r.get("result", {}).get("orderId", "")
@@ -363,7 +370,6 @@ class Trader:
                 if await self._wait_position_open(timeout=10.0, interval=0.3):
                     return True
 
-            # Ретрай #2: 0.20%
             r = self.client.place_market_safe(self.symbol, side, qty, position_idx=0, slip_percent=0.20)
             if r.get("retCode") == 0:
                 oid = r.get("result", {}).get("orderId", "")
@@ -374,7 +380,6 @@ class Trader:
             log.error("[ORDER][FAIL] no fill after retries")
             return False
 
-        # Если статус «new/created» — подождём еще немного
         for _ in range(20):
             if await self._wait_position_open(timeout=1.0, interval=0.3):
                 return True
@@ -396,7 +401,7 @@ class Trader:
             log.warning(f"[EXT][LP] lastPrice=0 (#{self.__lp_fail})")
         return 0.0
 
-    def _position_side_and_size(self) -> tuple[str|None, float]:
+    def _position_side_and_size(self) -> tuple[str | None, float]:
         """Возвращает (side, size) по текущей позиции или (None, 0.0)."""
         try:
             pl = self.client.position_list(self.symbol)
@@ -412,8 +417,6 @@ class Trader:
     def _opposite(self, side: str) -> str:
         return "Sell" if side == "Buy" else "Buy"
 
-    # ---------- УСЛОВНЫЕ ОРДЕРА ПО ЭКСТРЕМАМ ----------
-
     # ---------- ЛИМИТНЫЕ ОРДЕРА ПО ЭКСТРЕМАМ ----------
     async def _enter_extremes_with_limits(self, side: str, prev_high: float, prev_low: float, qty: float, sl: float, tp: float):
         """
@@ -421,9 +424,8 @@ class Trader:
           • Каждую минуту получаем экстремумы предыдущей ЗАКРЫТОЙ 1m-свечи через REST /v5/market/kline.
           • Ставим лимит на вход чуть внутри уровня (ε = EXT_EPS_TICKS * tickSize).
           • Ждём до 60с. Если не исполнился — отменяем, переставляем по новым экстремам и повторяем.
-          • После фила — ставим TP/SL через trading-stop (Full) и выходим.
+          • После фила — ставим TP/SL через trading-stop (Full) и ждём закрытия позиции, затем ставим новый лимитник.
         """
-        # sanity
         if qty <= 0:
             log.info("[EXT][LIM][SKIP] qty<=0")
             return
@@ -433,7 +435,7 @@ class Trader:
         eps_ticks = max(1, int(self.ext_eps_ticks))
         eps = max(tick * eps_ticks, tick)
 
-        async def _prev_hl_rest() -> tuple[float|None, float|None]:
+        async def _prev_hl_rest() -> tuple[float | None, float | None]:
             """Быстро получаем экстремумы предыдущей ЗАКРЫТОЙ 1m-свечи через /v5/market/kline."""
             try:
                 r = self.client._request(
@@ -442,17 +444,13 @@ class Trader:
                     params={"category": "linear", "symbol": self.symbol, "interval": "1", "limit": 3},
                 )
                 kl = (r.get("result", {}) or {}).get("list", [])
-                # Ответ Bybit для kline — список от старой к новой или наоборот; нормализуем
-                # Возьмём последнюю подтверждённую свечу (confirm=true); если нет — предпоследнюю
-                # Элементы могут быть массивами строк: [start,open,high,low,close,volume,turnover]
-                # В V5 REST confirm может отсутствовать — считаем предпоследнюю как закрытую.
                 if not kl:
                     return (None, None)
                 if len(kl) >= 2:
                     last = kl[-2]
                 else:
                     last = kl[-1]
-                # Форматы бывают dict или list
+
                 def _get(v, idx):
                     try:
                         if isinstance(v, dict):
@@ -460,24 +458,21 @@ class Trader:
                         return float(v[idx])
                     except Exception:
                         return 0.0
-                # В REST v5 list формат: [start,open,high,low,close,volume,turnover]
+
                 ph = _get(last, 2)
                 pl = _get(last, 3)
                 return (ph if ph > 0 else None, pl if pl > 0 else None)
             except Exception:
                 return (None, None)
 
-        # если вызвали с начальными prev_high/prev_low — используем как первый шаг
         cur_prev_high = float(prev_high or 0.0)
-        cur_prev_low  = float(prev_low or 0.0)
+        cur_prev_low = float(prev_low or 0.0)
 
-        # активный id текущего лимитника (если стоит)
         active_oid: str | None = None
-        # охранный счётчик, чтобы не зациклиться бесконечно при проблемах кансела
         max_cycles = 120  # максимум 2 часа перестановок по 1 минуте
 
         for cycle in range(max_cycles):
-            # 1) если нет актуальных экстремумов — подтянем по REST
+            # 1) HL предыдущей свечи
             if cur_prev_high <= 0 or cur_prev_low <= 0:
                 ph, pl = await _prev_hl_rest()
                 if ph and pl:
@@ -487,22 +482,21 @@ class Trader:
                     await asyncio.sleep(5)
                     continue
 
-            # 2) Рассчитать цену входа и целевые SL/TP от текущих экстремумов
+            # 2) Рассчитать вход и целевые SL/TP
             if side == "Buy":
                 entry_price = self._ceil_step(cur_prev_low + eps, tick)
-                tp_ref = float(tp) if (tp and tp > 0) else (cur_prev_high - eps)
+                tp_ref = float(tp) if (tp and tp > 0) else (max(cur_prev_high - eps, entry_price + tick))
                 sl_ref = float(sl) if (sl and sl > 0) else (entry_price - 2 * tick)
                 sl_adj, tp_adj = self._fix_tpsl("Buy", entry_price, sl_ref, tp_ref, tick)
             else:
                 entry_price = self._round_step(cur_prev_high - eps, tick)
-                tp_ref = float(tp) if (tp and tp > 0) else (cur_prev_low + eps)
+                tp_ref = float(tp) if (tp and tp > 0) else (min(cur_prev_low + eps, entry_price - tick))
                 sl_ref = float(sl) if (sl and sl > 0) else (entry_price + 2 * tick)
                 sl_adj, tp_adj = self._fix_tpsl("Sell", entry_price, sl_ref, tp_ref, tick)
 
             log.info(f"[EXT][LIM][PLACE] {side} limit entry={self._fmt(entry_price)} tp={self._fmt(tp_adj)} sl={self._fmt(sl_adj)} qty={self._fmt(qty)}")
 
-            # 3) Поставить лимитник GTC с проверкой доступности qty и ретраями по 110007
-            # Перед постановкой — убедимся, что qty доступен по балансу на этой цене
+            # 3) Баланс и qty
             try:
                 if self.available <= 0 or self.equity <= 0:
                     self.refresh_equity()
@@ -513,11 +507,11 @@ class Trader:
             min_qty = float(f_loc.get("minQty", 0.001))
             if attempt_qty < min_qty:
                 log.error(f"[EXT][LIM][SKIP] qty not affordable at entry={self._fmt(entry_price)} -> {self._fmt(attempt_qty)} < min {self._fmt(min_qty)}")
-                # подождём минуту и попробуем снова со свежими HL
                 await asyncio.sleep(60)
                 cur_prev_high = cur_prev_low = 0.0
                 continue
-            # Попытки отправки с ужесточённым ретраем по 110007
+
+            # 4) Постановка лимитника с ретраями 110007
             active_oid = None
             for _try in range(6):
                 r = self.client.place_order(
@@ -535,7 +529,6 @@ class Trader:
                     log.info(f"[EXT][LIM][ORDER] id={active_oid} price={self._fmt(entry_price)} qty={self._fmt(attempt_qty)}")
                     break
                 if rc == 110007:
-                    # не хватает средств — уменьшаем qty до следующего шага
                     new_qty = self._round_down_qty(attempt_qty * 0.75)
                     if new_qty >= attempt_qty:
                         new_qty = self._round_down_qty(attempt_qty - float(f_loc.get('qtyStep', 0.001)))
@@ -545,42 +538,37 @@ class Trader:
                         break
                     log.info(f"[EXT][LIM][RETRY_QTY] 110007 -> {self._fmt(attempt_qty)} -> {self._fmt(new_qty)}")
                     attempt_qty = new_qty
-                    # пробуем снова циклом
                     continue
-                # иные ошибки
                 log.error(f"[EXT][LIM][FAIL] place_order {r}")
                 active_oid = None
                 break
-            # если не удалось выставить — перейти к следующему минутному циклу
+
             if not active_oid:
                 await asyncio.sleep(60)
                 cur_prev_high = cur_prev_low = 0.0
                 continue
 
-            # 4) Ждать до 60с исполнения; если не исполнилось — отменить и переставить на новые HL
+            # 5) Ждать до 60с исполнения
             end_ts = time.time() + 60
             filled = False
             while time.time() < end_ts:
-                # быстрое появление позиции
                 if await self._wait_position_open(timeout=1.0, interval=0.25):
                     filled = True
                     break
                 await asyncio.sleep(0.5)
 
             if not filled:
-                # отменяем текущий лимитник
                 try:
                     self._cancel_order(order_id=active_oid)
                 except Exception:
                     pass
                 log.warning("[EXT][LIM][REPLACE] no fill in 60s — re-evaluate last closed HL")
-                # обновим экстремумы
                 ph, pl = await _prev_hl_rest()
                 cur_prev_high = float(ph or 0.0)
                 cur_prev_low = float(pl or 0.0)
-                continue  # следующий цикл
+                continue
 
-            # 5) Исполнилось — узнаем факт. базовую цену и ставим TP/SL
+            # 6) Исполнилось — определить фактический side/price и поставить TP/SL
             actual_side = side
             base_price = entry_price
             try:
@@ -613,11 +601,33 @@ class Trader:
             else:
                 log.warning(f"[EXT][LIM][TPSL][FAIL] {tr}")
 
-            return  # выходим после успешного входа
+            # --- Ждём закрытия позиции TP/SL и перезапускаем цикл с новым лимитником ---
+            log.info("[EXT][LIM][WAIT_FLAT] waiting position to be flat after TP/SL")
+            ok_flat = await self._wait_position_flat(timeout=3600.0, interval=0.5)
+            if not ok_flat:
+                log.warning("[EXT][LIM][WAIT_FLAT][TIMEOUT] position still open; abort loop")
+                return
+
+            # На всякий случай снимем все оставшиеся ордера по символу
+            try:
+                ca = self._cancel_all_orders()
+                rc = ca.get("retCode")
+                if rc in (0, None):
+                    log.info("[EXT][LIM][CANCEL_ALL][OK]")
+                else:
+                    log.warning(f"[EXT][LIM][CANCEL_ALL][WARN] rc={rc} msg={ca.get('retMsg')}")
+            except Exception as e:
+                log.warning(f"[EXT][LIM][CANCEL_ALL][EXC] {e}")
+
+            # Обновим экстремумы на следующей итерации и продолжим цикл
+            cur_prev_high = 0.0
+            cur_prev_low = 0.0
+            active_oid = None
+            continue
 
         log.warning("[EXT][LIM][ABORT] max cycles reached; stop")
 
-    # вспомогательная проверка статуса лимитника по orderId (если потребуется где-то ещё)
+    # вспомогательная проверка статуса лимитника по orderId
     def _order_status_brief(self, order_id: str) -> str:
         try:
             st = self.client.get_order_status(self.symbol, order_id)
@@ -628,13 +638,8 @@ class Trader:
         except Exception:
             return "n/a"
 
-    # NOTE: ниже — старая ветка с условными заявками; для live-follow она не используется.
+    # NOTE: старая ветка с условными заявками (не используется в live-follow)
     def _place_conditional(self, side: str, trigger_price: float, qty: float, trigger_direction: int) -> Dict[str, Any]:
-        """
-        Ставит условный маркет-ордер (IOC) по достижению trigger_price.
-        trigger_direction: 1 = триггер при росте до цены, 2 = при падении до цены.
-        Возвращает ответ API.
-        """
         body = {
             "category": "linear",
             "symbol": self.symbol,
@@ -646,14 +651,10 @@ class Trader:
             "triggerPrice": self._fmt(trigger_price),
             "triggerDirection": trigger_direction,
         }
-        # Уникальный orderLinkId для удобной отмены/отслеживания
         body["orderLinkId"] = f"ext-{int(time.time()*1000)}-{side[0].lower()}"
         return self.client._request("POST", "/v5/order/create", body=body)
 
     def _cancel_order(self, order_id: Optional[str] = None, order_link_id: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Отмена одного активного/условного ордера.
-        """
         body = {
             "category": "linear",
             "symbol": self.symbol,
@@ -664,26 +665,31 @@ class Trader:
             body["orderLinkId"] = order_link_id
         return self.client._request("POST", "/v5/order/cancel", body=body)
 
+    def _cancel_all_orders(self) -> Dict[str, Any]:
+        """
+        Отмена всех активных/условных ордеров по символу.
+        """
+        body = {
+            "category": "linear",
+            "symbol": self.symbol,
+        }
+        return self.client._request("POST", "/v5/order/cancel-all", body=body)
+
     # ---------- ОРДЕРА ----------
 
     async def _enter_by_extremes(self, side: str, prev_high: float, prev_low: float, qty: float, sl_r: float, tp_r: float):
         """
-        Ставит две условные заявки:
-          • Sell при достижении prev_high (triggerDirection=1),
-          • Buy при достижении prev_low (triggerDirection=2).
-        Как только одна исполняется — вторая отменяется. Затем ставим TP/SL через trading-stop.
+        (не используется в live-follow) Ставит две условные заявки.
         """
-        # sanity
         if qty <= 0 or prev_high <= 0 or prev_low <= 0:
             log.info("[COND][SKIP] bad params")
             return
 
-        # 1) Ставим оба условных
         r_sell = self._place_conditional("Sell", prev_high, qty, trigger_direction=1)
-        r_buy  = self._place_conditional("Buy",  prev_low,  qty, trigger_direction=2)
+        r_buy = self._place_conditional("Buy", prev_low, qty, trigger_direction=2)
 
         oid_sell = r_sell.get("result", {}).get("orderId") if r_sell.get("retCode") == 0 else None
-        oid_buy  = r_buy.get("result", {}).get("orderId")  if r_buy.get("retCode") == 0 else None
+        oid_buy = r_buy.get("result", {}).get("orderId") if r_buy.get("retCode") == 0 else None
 
         if r_sell.get("retCode") != 0:
             log.warning(f"[COND][ERR] sell {r_sell}")
@@ -696,7 +702,6 @@ class Trader:
             except Exception:
                 pass
 
-        # 2) Ждём, пока появится позиция (значит одна из заявок сработала)
         ok = await self._wait_position_open(timeout=300.0, interval=0.5)
         if not ok:
             log.warning("[COND][TIMEOUT] no fill within 5m — cancel both")
@@ -706,13 +711,11 @@ class Trader:
                 self._cancel_order(order_id=oid_buy)
             return
 
-        # 3) Позиция появилась — снимаем вторую заявку (если ещё активна)
         if oid_sell:
             self._cancel_order(order_id=oid_sell)
         if oid_buy:
             self._cancel_order(order_id=oid_buy)
 
-        # 4) Определяем фактическую сторону/цену позиции и нормализуем TP/SL
         actual_side = side
         base_price = None
         try:
@@ -734,7 +737,6 @@ class Trader:
 
         log.info(f"[TPSL][NORM] side={actual_side} base={self._fmt(base_price) if base_price else 'n/a'} sl={self._fmt(sl_adj)} tp={self._fmt(tp_adj)}")
 
-        # 5) Ставим TP/SL для открытой позиции
         r2 = self.client.trading_stop(
             self.symbol,
             side=actual_side,
@@ -758,7 +760,6 @@ class Trader:
         side: "Buy" | "Sell"
         signal: { 'sl': float, 'tp': float, 'atr': float, 'ts_ms': int, ... }
         """
-        # Унифицированный доступ к полям сигнала (dict или dataclass/объект)
         def _sg(key, default=None):
             if isinstance(signal, dict):
                 return signal.get(key, default)
@@ -771,7 +772,6 @@ class Trader:
                     return v
             return default
 
-        # обновим equity/available (если 0) и фильтры/плечо
         if self.equity <= 0 or self.available <= 0:
             self.refresh_equity()
         self.ensure_filters()
@@ -779,7 +779,6 @@ class Trader:
 
         price = float(_sg_multi(["price", "close"]) or 0.0)
         if price <= 0:
-            # берём близкую оценку — без отдельного REST-запроса
             price = float(_sg("tp") or 0.0) or 1.0
 
         sl = float(_sg_multi(["sl", "stop_loss", "stopLoss"]) or 0.0)
@@ -789,7 +788,6 @@ class Trader:
             await self._stop_minute_logger()
             return
 
-        # старт/обновление минутного логгера (без перезапуска задачи)
         self.set_minute_status("normal", float(sl) if sl else None)
 
         qty = self._calc_qty(side, price, sl)
@@ -799,16 +797,14 @@ class Trader:
             await self._stop_minute_logger()
             return
 
-        # Подготовим округлённые SL/TP заранее (для передачи в order/create)
         f = self.ensure_filters()
         tick = f["tickSize"]
         sl_r = self._ceil_step(sl, tick) if side == "Buy" else self._round_step(sl, tick)
         tp_r = self._round_step(tp, tick) if side == "Buy" else self._ceil_step(tp, tick)
         sl_r, tp_r = self._fix_tpsl(side, price, sl_r, tp_r, tick)
 
-        # --- Диагностика режима экстремов ---
         prev_high = _sg_multi(["prev_high", "prevHigh", "prevH", "previous_high", "prev_high_price"])
-        prev_low  = _sg_multi(["prev_low", "prevLow", "prevL", "previous_low", "prev_low_price"])
+        prev_low = _sg_multi(["prev_low", "prevLow", "prevL", "previous_low", "prev_low_price"])
         use_ext = bool(self.entry_extremes and prev_high and prev_low)
         if use_ext:
             log.info(f"[EXT][MODE] ON  prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} qty={self._fmt(qty)}")
@@ -818,21 +814,18 @@ class Trader:
                 reason.append("flag_off")
             if not prev_high or not prev_low:
                 reason.append("no_prev_hl")
-            # Показать доступные поля сигнала для дебага (без значений)
             try:
                 fields = list(signal.keys()) if isinstance(signal, dict) else list(vars(signal).keys())
             except Exception:
                 fields = ["?"]
             log.info(f"[EXT][MODE] OFF ({','.join(reason) if reason else 'n/a'}) fields={fields}")
 
-        # обновим режим минутного логгера
         log.info("[EXT][CHECKPOINT] minute logger set status")
         try:
             self.set_minute_status("ext" if use_ext else "normal", float(sl) if sl else None)
         except Exception as e:
             log.exception(f"[EXT][LOGGER][EXC] {e}")
 
-        # (3) Всегда форсируем flat перед новым входом
         if not use_ext:
             try:
                 ps, sz = self._position_side_and_size()
@@ -855,6 +848,7 @@ class Trader:
             log.info(f"[EXT][CHECKPOINT] before branch use_ext={use_ext}")
         except Exception:
             log.exception("[EXT][CHECKPOINT][EXC] before branch")
+
         if use_ext:
             log.info("[EXT][CHECKPOINT] entering use_ext branch")
             log.info(f"[EXT][LIM][FLOW] side={side} prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} qty={self._fmt(qty)}")
@@ -867,11 +861,10 @@ class Trader:
                 await self._stop_minute_logger()
             return
 
-        # Маркет-вход: БЕЗ TP/SL, с жёстким ретраем 110007 (уменьшаем qty до минимума)
+        # --- Маркет-вход (обычный) ---
         log.info(f"[ENTER] {side} qty={self._fmt(qty)}")
         attempt_qty = qty
         order_id = None
-        # максимум 6 попыток, уменьшая до минимального шага
         for attempt in range(6):
             r = self.client.place_order(
                 self.symbol,
@@ -891,9 +884,9 @@ class Trader:
                         pass
                 break
             if rc == 110007:
-                f = self.ensure_filters()
-                step = f.get("qtyStep", 0.001)
-                min_qty = f.get("minQty", 0.001)
+                f2 = self.ensure_filters()
+                step = f2.get("qtyStep", 0.001)
+                min_qty = f2.get("minQty", 0.001)
                 new_qty = self._round_down_qty(attempt_qty * 0.75)
                 if new_qty >= attempt_qty:
                     new_qty = self._round_down_qty(attempt_qty - step)
@@ -905,7 +898,6 @@ class Trader:
                 attempt_qty = new_qty
                 continue
             if rc == 30208:
-                # прайс-защита: используем мягкую толерантность
                 log.warning("[ENTER][RETRY] 30208: add slippage Percent=0.05")
                 r2 = self.client.place_order(
                     self.symbol, side, attempt_qty, order_type="Market",
@@ -920,7 +912,6 @@ class Trader:
                         except Exception:
                             pass
                     break
-                # ещё попытка с TickSize=5
                 log.warning("[ENTER][RETRY] 30208: add slippage TickSize=5")
                 r3 = self.client.place_order(
                     self.symbol, side, attempt_qty, order_type="Market",
@@ -947,13 +938,12 @@ class Trader:
             await self._stop_minute_logger()
             return
 
-        # Дождаться фактического фила или ретраиться
         if not await self._await_fill_or_retry(order_id, side, attempt_qty):
             log.warning("[ENTER][ABORT] no fill")
             await self._stop_minute_logger()
             return
 
-        # ← NEW: сразу ставим SL после обычного входа по рынку
+        # Сразу SL в Full-режиме (без TP) — затем нормализованный TP/SL ниже
         if sl:
             try:
                 tr = self.client.trading_stop(
@@ -971,10 +961,8 @@ class Trader:
             except Exception as e:
                 log.warning(f"[SL][NORM][EXC] {e}")
 
-        # Обновим qty на фактический
         qty = attempt_qty
 
-        # Нормализуем TP/SL относительно ФАКТИЧЕСКОЙ стороны и базовой цены позиции
         actual_side = side
         base_price = None
         try:
@@ -987,8 +975,8 @@ class Trader:
         except Exception:
             pass
 
-        f = self.ensure_filters()
-        tick = f["tickSize"]
+        f3 = self.ensure_filters()
+        tick = f3["tickSize"]
         if not base_price or base_price <= 0:
             base_price = float(self._last_price()) or price
 
@@ -1015,8 +1003,6 @@ class Trader:
                     pass
         else:
             log.warning(f"[TPSL][FAIL] {r2}")
-
-
 
     async def close_market(self, side: str, qty: float):
         """
