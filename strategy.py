@@ -58,6 +58,7 @@ class StrategyEngine:
         if len(df) < 60:
             # короткий факт-лог — без шума
             log.info("[SKIP] warmup (<60 closed 1m bars)")
+            log.debug(f"[SIGNAL][HL] prevH=None prevL=None")
             return Signal(None, "warmup", None, None, None, None, None, None)
 
         # Экстремы предыдущей ЗАКРЫТОЙ 1m свечи
@@ -68,6 +69,7 @@ class StrategyEngine:
         dff = compute_features(df)
         f0: Dict[str, Any] = last_feature_row(dff)
         if not f0:
+            log.debug(f"[SIGNAL][HL] prevH={prev_high} prevL={prev_low}")
             return Signal(None, "no_features", None, None, None, None, prev_high, prev_low)
 
         # Ключевой лог «сигнал/срез фич» — компактно
@@ -83,6 +85,7 @@ class StrategyEngine:
         # 3) Анти-спам: общий кулдаун между входами
         now = time.time()
         if now - self._last_trade_time < self.cooldown_sec:
+            log.debug(f"[SIGNAL][HL] prevH={prev_high} prevL={prev_low}")
             return Signal(None, "cooldown", None, None, float(f0["atr14"]), int(f0["ts_ms"]), prev_high, prev_low)
 
         # 4) Вызов LLM (запрос/ответ логируются в llm.py как [LLM→]/[LLM←])
@@ -114,6 +117,7 @@ class StrategyEngine:
                     await self._notifier.notify(f"🤖 LLM: Hold • {reason or 'no reason'}")
                 except Exception:
                     pass
+            log.debug(f"[SIGNAL][HL] prevH={prev_high} prevL={prev_low}")
             return Signal(None, "hold", None, None, float(f0["atr14"]), int(f0["ts_ms"]), prev_high, prev_low)
 
         # 5) Построение SL/TP из ATR
@@ -140,6 +144,7 @@ class StrategyEngine:
         # фиксируем кулдаун
         self._last_trade_time = now
 
+        log.debug(f"[SIGNAL][HL] prevH={prev_high} prevL={prev_low}")
         return Signal(
             side=action,
             reason=reason or "llm",
