@@ -76,7 +76,7 @@ async def main():
     client = BybitClient()
     trader = Trader(client=client, notifier=None)
     bot = TgBot(TG_TOKEN, int(TG_CHAT) if TG_CHAT else None, trader=trader)
-    strat = StrategyEngine(notifier=bot)
+    strat = StrategyEngine(client=client, notifier=bot)
     trader.notifier = bot
     data = DataManager()
 
