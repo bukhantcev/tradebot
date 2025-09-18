@@ -81,20 +81,30 @@ class Trader:
                         log.info(f"[STAT][MIN] mode={mode} px={self._fmt(px)} pos={side or 'Flat'} size={self._fmt(sz)} SL={(self._fmt(sl_price) if sl_price else 'None')}")
                     await asyncio.sleep(0.25)
                 except asyncio.CancelledError:
+                    log.info("[MIN][LOOP] cancelled")
                     break
                 except Exception:
                     await asyncio.sleep(0.5)
         self._minute_task = asyncio.create_task(_loop(), name="minute_stat")
+        log.info("[MIN][START] minute logger started")
 
     async def _stop_minute_logger(self):
         t = self._minute_task
         if t and not t.done():
-            t.cancel()
             try:
-                await t
-            except Exception:
-                pass
-        self._minute_task = None
+                t.cancel()
+                import asyncio as _a
+                try:
+                    await _a.wait_for(t, timeout=1.0)
+                    log.info("[MIN][STOP] minute logger stopped")
+                except _a.TimeoutError:
+                    log.warning("[MIN][STOP][TIMEOUT] cancel wait timed out; detaching task")
+                except Exception as e:
+                    log.warning(f"[MIN][STOP][EXC] {e}")
+            finally:
+                self._minute_task = None
+        else:
+            self._minute_task = None
 
     # ---------- УТИЛЫ ----------
 
@@ -720,6 +730,7 @@ class Trader:
         log.info("[EXT][CHECKPOINT] before minute logger stop/start")
         try:
             await self._stop_minute_logger()
+            log.info("[EXT][CHECKPOINT] minute logger stopped")
             self._start_minute_logger("ext" if use_ext else "normal", float(sl) if sl else None)
             log.info("[EXT][CHECKPOINT] after minute logger start")
         except Exception as e:
