@@ -3,45 +3,37 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ==== РЕЖИМЫ/ТОКЕНЫ ====
+# --- General ---
 HOST_ROLE = os.getenv("HOST_ROLE", "local")  # local | server
-BYBIT_TESTNET = os.getenv("BYBIT_TESTNET", "true").lower() == "true"
-BYBIT_VERIFY_SSL = os.getenv("BYBIT_VERIFY_SSL", "true").lower() == "true"
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+FILE_LOG_LEVEL = os.getenv("FILE_LOG_LEVEL", "DEBUG")
 
-BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
-BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
-BYBIT_RECV_WINDOW = int(os.getenv("BYBIT_RECV_WINDOW", "5000"))
-BYBIT_SYMBOL = os.getenv("BYBIT_SYMBOL", "BTCUSDT")
-BYBIT_LEVERAGE = int(os.getenv("BYBIT_LEVERAGE", "10"))
+# --- Bybit ---
+BYBIT_ENV = os.getenv("BYBIT_ENV", "testnet")  # real | testnet
+SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
+LEVERAGE = int(os.getenv("LEVERAGE", "1"))
+RISK_PCT = float(os.getenv("RISK_PCT", "1.0"))  # % от equity
+LLM_BUDGET_DAILY_USD = float(os.getenv("LLM_BUDGET_DAILY_USD", "3"))
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+BYBIT_KEY_TESTNET = os.getenv("BYBIT_KEY_TESTNET")
+BYBIT_SECRET_TESTNET = os.getenv("BYBIT_SECRET_TESTNET")
+BYBIT_KEY_REAL = os.getenv("BYBIT_KEY_REAL")
+BYBIT_SECRET_REAL = os.getenv("BYBIT_SECRET_REAL")
 
-TG_TOKEN_LOCAL = os.getenv("TG_TOKEN_LOCAL", "").strip()
-TG_TOKEN_SERVER = os.getenv("TG_TOKEN_SERVER", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()  # один и тот же для обоих окружений
+# --- OpenAI ---
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-def get_tg_token() -> str:
-    return TG_TOKEN_SERVER if HOST_ROLE == "server" else TG_TOKEN_LOCAL
+# --- Telegram ---
+TELEGRAM_TOKEN_LOCAL = os.getenv("TELEGRAM_TOKEN_LOCAL")
+TELEGRAM_TOKEN_SERVER = os.getenv("TELEGRAM_TOKEN_SERVER")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# ==== ПУТИ ====
-DATA_DIR = os.getenv("DATA_DIR", "./data")
-DUMP_DIR = os.path.join(DATA_DIR, "dumps")
-PARAMS_PATH = os.path.join(DATA_DIR, "params.json")
+# --- Data / Storage ---
+DB_PATH = os.getenv("DB_PATH", "./data/trades.sqlite")
+PARQUET_DIR = os.getenv("PARQUET_DIR", "./data/parquet")
 
-# ==== КАТЕГОРИЯ ====
-CATEGORY = "linear"  # USDT Perp
-
-# ==== ДЕФОЛТ ПАРАМЕТРЫ СТРАТЕГИИ ====
-DEFAULT_PARAMS = {
-    "risk": 0.02,
-    "size_usdt": 50,
-    "indicators": {
-        "ema_fast": 9, "ema_slow": 50,
-        "rsi_len": 7, "rsi_overbought": 68, "rsi_oversold": 32,
-        "atr_len": 14,
-        "virtual_tp_atr": 0.35, "virtual_sl_atr": 0.60,
-        "tp_widen_mult": 1.2, "sl_widen_mult": 1.2
-    },
-    "execution": {"order_type": "Market", "tif": "IOC", "tpsl_mode": "Full", "trigger_by": "LastPrice"}
-}
+# --- Helpers ---
+def get_bybit_keys():
+    if BYBIT_ENV == "real":
+        return BYBIT_KEY_REAL, BYBIT_SECRET_REAL
+    return BYBIT_KEY_TESTNET, BYBIT_SECRET_TESTNET
