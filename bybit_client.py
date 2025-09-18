@@ -4,10 +4,8 @@ import hashlib
 import json
 import logging
 from typing import Any, Dict, Optional
-import asyncio
 import httpx
 import websockets
-import asyncio
 
 from urllib.parse import urlencode
 
@@ -15,7 +13,60 @@ from config import get_bybit_keys, BYBIT_ENV
 
 log = logging.getLogger("BYBIT")
 
+from decimal import Decimal, ROUND_DOWN
+
 class BybitClient:
+    _filters_cache: dict[str, dict] = {}
+
+    def _get_filters(self, symbol: str) -> dict:
+        if symbol in self._filters_cache:
+            return self._filters_cache[symbol]
+        ins = self.instruments_info("linear", symbol)
+        tick = 0.1
+        qty_step = 0.001
+        min_qty = 0.001
+        try:
+            lst = ins.get("result", {}).get("list", [])
+            if lst:
+                pf = lst[0].get("priceFilter", {})
+                lf = lst[0].get("lotSizeFilter", {})
+                tick = float(pf.get("tickSize", tick))
+                qty_step = float(lf.get("qtyStep", qty_step))
+                # minOrderQty может называться minOrderQty или minTradingQty в некоторых маркетах
+                min_qty = float(lf.get("minOrderQty", lf.get("minTradingQty", min_qty)))
+        except Exception:
+            pass
+        self._filters_cache[symbol] = {"tickSize": tick, "qtyStep": qty_step, "minQty": min_qty}
+        return self._filters_cache[symbol]
+
+    def _fmt_step(self, value: float, step: float) -> str:
+        if step <= 0:
+            return str(value)
+        d_val = Decimal(str(value))
+        d_step = Decimal(str(step))
+        # quantize to step using ROUND_DOWN
+        q = (d_val / d_step).quantize(Decimal("1"), rounding=ROUND_DOWN) * d_step
+        # strip trailing zeros
+        s = format(q, 'f')
+        if '.' in s:
+            s = s.rstrip('0').rstrip('.')
+        return s
+
+    def _fmt_price(self, symbol: str, price: float) -> str:
+        f = self._get_filters(symbol)
+        return self._fmt_step(price, f["tickSize"])
+
+    def _fmt_qty(self, symbol: str, qty: float) -> Optional[str]:
+        f = self._get_filters(symbol)
+        qs = max(qty, f["minQty"])  # not less than min
+        s = self._fmt_step(qs, f["qtyStep"])
+        # convert back to float to check strictly >= minQty after rounding
+        try:
+            if float(s) < f["minQty"]:
+                return None
+        except Exception:
+            return None
+        return s
     def __init__(self, recv_window: int = 5000, verify_ssl: bool = True):
         self.api_key, self.api_secret = get_bybit_keys()
         self.recv_window = recv_window
@@ -131,14 +182,8 @@ class BybitClient:
         чтобы не ловить 30208 (прайс-лимит) на деривативах.
         """
         # 1) Получаем тик и топ стакана
-        ins = self.instruments_info("linear", symbol)
-        tick = 0.1
-        try:
-            lst = ins.get("result", {}).get("list", [])
-            if lst:
-                tick = float(lst[0]["priceFilter"]["tickSize"])
-        except Exception:
-            pass
+        filters = self._get_filters(symbol)
+        tick = filters["tickSize"]
 
         ob = self.orderbook_top(symbol, "linear")
         ask1 = bid1 = None
@@ -153,12 +198,15 @@ class BybitClient:
 
         if ask1 is None or bid1 is None:
             # Если стакан не получили — отправляем чистый Market IOC
+            qty_str = self._fmt_qty(symbol, qty)
+            if qty_str is None:
+                return {"retCode": 10001, "retMsg": "Qty invalid (below min after format)"}
             body = {
                 "category": "linear",
                 "symbol": symbol,
                 "side": side,
                 "orderType": "Market",
-                "qty": str(qty),
+                "qty": qty_str,
                 "positionIdx": position_idx,
                 "timeInForce": "IOC",
             }
@@ -175,14 +223,18 @@ class BybitClient:
             # округление вниз к тику
             price = (int(price / tick)) * tick
 
+        qty_str = self._fmt_qty(symbol, qty)
+        if qty_str is None:
+            return {"retCode": 10001, "retMsg": "Qty invalid (below min after format)"}
+        price_str = self._fmt_price(symbol, price)
         # 3) Отправляем как Limit + IOC
         body = {
             "category": "linear",
             "symbol": symbol,
             "side": side,
             "orderType": "Limit",
-            "qty": str(qty),
-            "price": f"{price:.8f}".rstrip("0").rstrip("."),
+            "qty": qty_str,
+            "price": price_str,
             "positionIdx": position_idx,
             "timeInForce": "IOC",
         }
@@ -210,17 +262,24 @@ class BybitClient:
         # Smart routing for Market: use Limit+IOC near top-of-book to avoid 30208
         if (order_type or "").lower() == "market" and preferSmart:
             return self.place_market_safe(symbol, side, qty, position_idx=position_idx)
+        qty_str = self._fmt_qty(symbol, qty)
+        if qty_str is None:
+            return {"retCode": 10001, "retMsg": "Qty invalid (below min after format)"}
+
+        price_str = None
+        if price is not None and (order_type or "").lower() != "market":
+            price_str = self._fmt_price(symbol, float(price))
 
         body = {
             "category": "linear",
             "symbol": symbol,
             "side": side,
             "orderType": order_type,
-            "qty": str(qty),
+            "qty": qty_str,
             "positionIdx": position_idx,
         }
-        if price is not None:
-            body["price"] = str(price)
+        if price_str is not None:
+            body["price"] = price_str
 
         if order_type.lower() == "market":
             body.pop("price", None)
