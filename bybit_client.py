@@ -252,6 +252,54 @@ class BybitClient:
     def position_list(self, symbol: str):
         return self._request("GET", "/v5/position/list", params={"category": "linear", "symbol": symbol})
 
+    # --- Order status helpers ---
+    def order_realtime(self, symbol: str, order_id: Optional[str] = None, order_link_id: Optional[str] = None, category: str = "linear"):
+        params = {"category": category, "symbol": symbol}
+        if order_id:
+            params["orderId"] = order_id
+        if order_link_id:
+            params["orderLinkId"] = order_link_id
+        return self._request("GET", "/v5/order/realtime", params=params)
+
+    def order_history(self, symbol: str, order_id: Optional[str] = None, order_link_id: Optional[str] = None, category: str = "linear"):
+        params = {"category": category, "symbol": symbol}
+        if order_id:
+            params["orderId"] = order_id
+        if order_link_id:
+            params["orderLinkId"] = order_link_id
+        return self._request("GET", "/v5/order/history", params=params)
+
+    def get_order_status(self, symbol: str, order_id: str) -> Dict[str, Any]:
+        """
+        Возвращает {"status": str|None, "cumExecQty": float, "qty": float}
+        Сначала смотрит realtime (открытые), затем history (закрытые/отменённые).
+        """
+        try:
+            rt = self.order_realtime(symbol, order_id=order_id)
+            lst = rt.get("result", {}).get("list", [])
+            if lst:
+                it = lst[0]
+                return {
+                    "status": it.get("orderStatus"),
+                    "cumExecQty": float(it.get("cumExecQty") or 0.0),
+                    "qty": float(it.get("qty") or 0.0),
+                }
+        except Exception:
+            pass
+        try:
+            hs = self.order_history(symbol, order_id=order_id)
+            lst = hs.get("result", {}).get("list", [])
+            if lst:
+                it = lst[0]
+                return {
+                    "status": it.get("orderStatus"),
+                    "cumExecQty": float(it.get("cumExecQty") or 0.0),
+                    "qty": float(it.get("qty") or 0.0),
+                }
+        except Exception:
+            pass
+        return {"status": None, "cumExecQty": 0.0, "qty": 0.0}
+
     def trading_stop(
         self,
         symbol: str,

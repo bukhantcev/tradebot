@@ -215,6 +215,58 @@ class Trader:
             await asyncio.sleep(interval)
         return False
 
+    async def _await_fill_or_retry(self, order_id: str, side: str, qty: float) -> bool:
+        """
+        Ждём исполнения текущего ордера. Если он отменён без фила — делаем до двух ретраев
+        с умным маркетом и повышением допусков.
+        Возвращает True, если позиция открылась; иначе False.
+        """
+        # 1) Подождать быстрое появление позиции
+        ok = await self._wait_position_open(timeout=10.0, interval=0.3)
+        if ok:
+            return True
+
+        # 2) Узнать статус исходного ордера
+        try:
+            st = self.client.get_order_status(self.symbol, order_id)
+        except Exception:
+            st = {"status": None, "cumExecQty": 0.0, "qty": 0.0}
+        status = (st.get("status") or "").lower()
+        filled = float(st.get("cumExecQty") or 0.0) > 0.0
+
+        if filled or status in ("filled", "partiallyfilled"):
+            # иногда позиция появится с задержкой — проверим ещё чуть-чуть
+            ok2 = await self._wait_position_open(timeout=5.0, interval=0.3)
+            return ok2
+
+        if status in ("cancelled", "rejected") or not status:
+            log.warning(f"[ORDER][CANCELLED] status={status or 'n/a'} -> retry smart market")
+
+            # Ретрай #1: умный маркет с 0.10% допуска
+            r = self.client.place_market_safe(self.symbol, side, qty, position_idx=0, slip_percent=0.10)
+            if r.get("retCode") == 0:
+                oid = r.get("result", {}).get("orderId", "")
+                log.info(f"[ORDER][RETRY1] OK id={oid}")
+                if await self._wait_position_open(timeout=10.0, interval=0.3):
+                    return True
+
+            # Ретрай #2: 0.20%
+            r = self.client.place_market_safe(self.symbol, side, qty, position_idx=0, slip_percent=0.20)
+            if r.get("retCode") == 0:
+                oid = r.get("result", {}).get("orderId", "")
+                log.info(f"[ORDER][RETRY2] OK id={oid}")
+                if await self._wait_position_open(timeout=10.0, interval=0.3):
+                    return True
+
+            log.error("[ORDER][FAIL] no fill after retries")
+            return False
+
+        # Если статус «new/created» — подождём еще немного
+        for _ in range(20):
+            if await self._wait_position_open(timeout=1.0, interval=0.3):
+                return True
+        return False
+
     # ---------- УСЛОВНЫЕ ОРДЕРА ПО ЭКСТРЕМАМ ----------
 
     def _place_conditional(self, side: str, trigger_price: float, qty: float, trigger_direction: int) -> Dict[str, Any]:
@@ -402,6 +454,10 @@ class Trader:
                     await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(qty)} (id {order_id})")
                 except Exception:
                     pass
+            # Дождаться фактического фила или ретраиться
+            if not await self._await_fill_or_retry(order_id, side, qty):
+                log.warning("[ENTER][ABORT] no fill")
+                return
         elif rc == 110007:  # ab not enough for new order — уменьшим объём и повторим один раз
             f = self.ensure_filters()
             qty2 = max(f["minQty"], self._round_step(qty * 0.9, f["qtyStep"]))
@@ -424,6 +480,10 @@ class Trader:
                         await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(qty2)} (id {order_id})")
                     except Exception:
                         pass
+                # Дождаться фактического фила или ретраиться
+                if not await self._await_fill_or_retry(order_id, side, qty2):
+                    log.warning("[ENTER][ABORT] no fill")
+                    return
                 qty = qty2  # используем фактическое qty далее
             else:
                 log.error(f"[ORDER][FAIL] {r}")
@@ -448,6 +508,10 @@ class Trader:
                         await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(qty)} (id {order_id}, slip 0.05%)")
                     except Exception:
                         pass
+                # Дождаться фактического фила или ретраиться
+                if not await self._await_fill_or_retry(order_id, side, qty):
+                    log.warning("[ENTER][ABORT] no fill")
+                    return
             elif rc2 == 30208:
                 # 2-й ретрай: толерантность в тиках (5 тиков)
                 log.warning("[ORDER][RETRY] 30208: add slippage TickSize=5")
@@ -467,6 +531,10 @@ class Trader:
                             await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(qty)} (id {order_id}, slip 5 ticks)")
                         except Exception:
                             pass
+                    # Дождаться фактического фила или ретраиться
+                    if not await self._await_fill_or_retry(order_id, side, qty):
+                        log.warning("[ENTER][ABORT] no fill")
+                        return
                 else:
                     log.error(f"[ORDER][FAIL] {r}")
                     return
@@ -477,11 +545,7 @@ class Trader:
             log.error(f"[ORDER][FAIL] {r}")
             return
 
-        # После успешного входа — подождём открытия позиции и поставим TP/SL отдельным вызовом
-        ok = await self._wait_position_open(timeout=10.0, interval=0.3)
-        if not ok:
-            log.warning("[TPSL][SKIP] position not opened")
-            return
+        # Позиция открыта (либо после ретраев) — ставим TP/SL
 
         # Нормализуем TP/SL относительно ФАКТИЧЕСКОЙ стороны и базовой цены позиции
         actual_side = side
