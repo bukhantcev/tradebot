@@ -55,6 +55,14 @@ class TgBot:
 
         self._register_handlers()
 
+    async def announce_online(self):
+        if not self.chat_id:
+            return
+        try:
+            await self.bot.send_message(self.chat_id, "🟢 Bot online")
+        except Exception as e:
+            log.error(f"[BOT][ANNOUNCE][ERR] {e}")
+
     # ---------------- Handlers ----------------
 
     def _register_handlers(self):
@@ -102,6 +110,14 @@ class TgBot:
                 "• Уведомления: сигналы, ответы ИИ, ордера"
             )
 
+        @self.router.message(Command("ping"))
+        async def on_ping(message: Message):
+            await message.answer("pong")
+
+        @self.router.message(Command("id"))
+        async def on_id(message: Message):
+            await message.answer(f"chat_id: <code>{message.chat.id}</code>")
+
     # ---------------- Public API ----------------
 
     async def start_background(self):
@@ -112,12 +128,16 @@ class TgBot:
         async def _poll():
             try:
                 log.info("[BOT] polling start")
+                # ensure polling mode (drop webhook if it was set before)
+                try:
+                    await self.bot.delete_webhook(drop_pending_updates=False)
+                except Exception:
+                    pass
                 await self.dp.start_polling(self.bot)
             except asyncio.CancelledError:
                 pass
             except Exception as e:
                 log.error(f"[BOT] polling error: {e}")
-
         asyncio.create_task(_poll(), name="tg-polling")
 
     async def notify(self, text: str):
