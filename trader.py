@@ -470,25 +470,61 @@ class Trader:
 
             log.info(f"[EXT][LIM][PLACE] {side} limit entry={self._fmt(entry_price)} tp={self._fmt(tp_adj)} sl={self._fmt(sl_adj)} qty={self._fmt(qty)}")
 
-            # 3) Поставить лимитник GTC
-            r = self.client.place_order(
-                self.symbol,
-                side,
-                qty,
-                order_type="Limit",
-                price=entry_price,
-                timeInForce="GTC",
-                position_idx=0,
-            )
-            if r.get("retCode") != 0:
-                log.error(f"[EXT][LIM][FAIL] place_order {r}")
+            # 3) Поставить лимитник GTC с проверкой доступности qty и ретраями по 110007
+            # Перед постановкой — убедимся, что qty доступен по балансу на этой цене
+            try:
+                if self.available <= 0 or self.equity <= 0:
+                    self.refresh_equity()
+            except Exception:
+                pass
+            attempt_qty = min(qty, self._calc_qty(side, entry_price, sl_adj))
+            f_loc = self.ensure_filters()
+            min_qty = float(f_loc.get("minQty", 0.001))
+            if attempt_qty < min_qty:
+                log.error(f"[EXT][LIM][SKIP] qty not affordable at entry={self._fmt(entry_price)} -> {self._fmt(attempt_qty)} < min {self._fmt(min_qty)}")
                 # подождём минуту и попробуем снова со свежими HL
                 await asyncio.sleep(60)
                 cur_prev_high = cur_prev_low = 0.0
                 continue
-
-            active_oid = r.get("result", {}).get("orderId", "")
-            log.info(f"[EXT][LIM][ORDER] id={active_oid} price={self._fmt(entry_price)}")
+            # Попытки отправки с ужесточённым ретраем по 110007
+            active_oid = None
+            for _try in range(6):
+                r = self.client.place_order(
+                    self.symbol,
+                    side,
+                    attempt_qty,
+                    order_type="Limit",
+                    price=entry_price,
+                    timeInForce="GTC",
+                    position_idx=0,
+                )
+                rc = r.get("retCode")
+                if rc == 0:
+                    active_oid = r.get("result", {}).get("orderId", "")
+                    log.info(f"[EXT][LIM][ORDER] id={active_oid} price={self._fmt(entry_price)} qty={self._fmt(attempt_qty)}")
+                    break
+                if rc == 110007:
+                    # не хватает средств — уменьшаем qty до следующего шага
+                    new_qty = self._round_down_qty(attempt_qty * 0.75)
+                    if new_qty >= attempt_qty:
+                        new_qty = self._round_down_qty(attempt_qty - float(f_loc.get('qtyStep', 0.001)))
+                    if new_qty < min_qty:
+                        log.error(f"[EXT][LIM][FAIL] 110007: insufficient balance, last qty={self._fmt(attempt_qty)} < min {self._fmt(min_qty)}")
+                        active_oid = None
+                        break
+                    log.info(f"[EXT][LIM][RETRY_QTY] 110007 -> {self._fmt(attempt_qty)} -> {self._fmt(new_qty)}")
+                    attempt_qty = new_qty
+                    # пробуем снова циклом
+                    continue
+                # иные ошибки
+                log.error(f"[EXT][LIM][FAIL] place_order {r}")
+                active_oid = None
+                break
+            # если не удалось выставить — перейти к следующему минутному циклу
+            if not active_oid:
+                await asyncio.sleep(60)
+                cur_prev_high = cur_prev_low = 0.0
+                continue
 
             # 4) Ждать до 60с исполнения; если не исполнилось — отменить и переставить на новые HL
             end_ts = time.time() + 60
