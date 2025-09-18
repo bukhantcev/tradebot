@@ -207,6 +207,76 @@ class Trader:
         sl_f, tp_f = self._fix_tpsl(side, anchor if anchor > 0 else (base_price or last or tp), sl, tp, tick)
         return sl_f, tp_f
 
+    async def _tp_realign_watch(self, side: str, desired_tp: float, sl_price: float | None, check_interval: float = 0.5, max_wait: float = 1800.0):
+        """
+        Если TP пришлось поставить не там, где хотелось (из-за ограничений якоря/валидации),
+        периодически пытаемся переставить TP на нужный уровень (desired_tp), когда это станет валидно.
+        Условия валидации: для Buy — TP > LastPrice; для Sell — TP < LastPrice.
+        Используем tpTriggerBy=LastPrice. Как только позиция становится flat — выходим.
+        """
+        try:
+            f = self.ensure_filters()
+            tick = float(f.get("tickSize", 0.1) or 0.1)
+        except Exception:
+            tick = 0.1
+
+        side = "Buy" if side == "Buy" else "Sell"
+        deadline = time.monotonic() + max_wait
+
+        while time.monotonic() < deadline:
+            try:
+                # если позиции уже нет — выходим
+                ps, sz = self._position_side_and_size()
+                if not ps or sz <= 0:
+                    return True
+
+                last = self._last_price()
+                if last <= 0:
+                    await asyncio.sleep(check_interval)
+                    continue
+
+                # Проверяем, можем ли переставить TP на желаемый уровень с учётом LastPrice
+                can_set = False
+                if side == "Buy":
+                    if desired_tp > last + 0.5 * tick:
+                        can_set = True
+                else:
+                    if desired_tp < last - 0.5 * tick:
+                        can_set = True
+
+                if can_set:
+                    # Попытка обновить только TP (SL оставляем как есть, если передан)
+                    body = {
+                        "category": "linear",
+                        "symbol": self.symbol,
+                        "positionIdx": 0,
+                        "tpslMode": "Full",
+                        "tpTriggerBy": "LastPrice",
+                        "tpOrderType": "Market",
+                        "takeProfit": self._fmt(desired_tp),
+                    }
+                    if sl_price:
+                        # сохраняем SL вместе с TP, чтобы не обнулить его
+                        body["slTriggerBy"] = "MarkPrice"
+                        body["stopLoss"] = self._fmt(float(sl_price))
+
+                    r = self.client._request("POST", "/v5/position/trading-stop", body=body)
+                    rc = r.get("retCode")
+                    if rc in (0, None):
+                        log.info(f"[TP][REALIGN][OK] moved TP to {self._fmt(desired_tp)} (side={side})")
+                        return True
+                    else:
+                        log.debug(f"[TP][REALIGN][WAIT] rc={rc} msg={r.get('retMsg')}")
+                await asyncio.sleep(check_interval)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.debug(f"[TP][REALIGN][EXC] {e}")
+                await asyncio.sleep(check_interval)
+
+        log.debug("[TP][REALIGN][TIMEOUT] stop trying to move TP")
+        return False
+
     # ---------- ПУБЛИЧНЫЕ МЕТОДЫ ----------
 
     def refresh_equity(self) -> float:
@@ -541,6 +611,9 @@ class Trader:
                 sl_ref = float(sl) if (sl and sl > 0) else (entry_price + 1.5 * tick)
                 sl_adj, tp_adj = self._fix_tpsl("Sell", entry_price, sl_ref, tp_ref, tick)
 
+            # Запомним целевой TP до нормализации/якорения — туда хотим вернуться при первой возможности
+            tp_target = tp_adj
+
             log.info(f"[EXT][LIM][PLACE] {side} limit entry={self._fmt(entry_price)} tp={self._fmt(tp_adj)} sl={self._fmt(sl_adj)} qty={self._fmt(qty)}")
 
             # 3) Баланс и qty
@@ -636,7 +709,7 @@ class Trader:
             except Exception:
                 pass
 
-            sl_final, tp_final = self._normalize_tpsl_with_anchor(actual_side, base_price, sl_adj, tp_adj, tick)
+            sl_final, tp_final = self._normalize_tpsl_with_anchor(actual_side, base_price, sl_adj, tp_target, tick)
             log.info(f"[EXT][LIM][TPSL] side={actual_side} base={self._fmt(base_price)} sl={self._fmt(sl_final)} tp={self._fmt(tp_final)} (anchor=Last/base)")
 
             tr = self.client.trading_stop(
@@ -652,6 +725,11 @@ class Trader:
             )
             if tr.get("retCode") in (0, None):
                 log.info(f"[EXT][LIM][TPSL][OK] sl={self._fmt(sl_final)} tp={self._fmt(tp_final)}")
+                # Если TP пришлось сдвинуть из‑за ограничений — сторож вернёт его на желаемый уровень при первой возможности
+                try:
+                    asyncio.create_task(self._tp_realign_watch(actual_side, desired_tp=tp_target, sl_price=sl_final, check_interval=0.5, max_wait=1800.0))
+                except Exception:
+                    pass
             else:
                 log.warning(f"[EXT][LIM][TPSL][FAIL] {tr}")
 
@@ -1040,7 +1118,9 @@ class Trader:
         if not base_price or base_price <= 0:
             base_price = float(self._last_price()) or price
 
-        sl_adj, tp_adj = self._normalize_tpsl_with_anchor(actual_side, base_price, sl_r, tp_r, tick)
+        # целевой TP до нормализации — хотим там оказаться как только это станет валидно по LastPrice
+        tp_target = tp_r
+        sl_adj, tp_adj = self._normalize_tpsl_with_anchor(actual_side, base_price, sl_r, tp_target, tick)
 
         log.info(f"[TPSL][NORM] side={actual_side} base={self._fmt(base_price)} sl={self._fmt(sl_adj)} tp={self._fmt(tp_adj)} (anchor=Last/base)")
 
@@ -1057,6 +1137,11 @@ class Trader:
         )
         if r2.get("retCode") in (0, None):
             log.info(f"[TPSL] sl={self._fmt(sl_adj)} tp={self._fmt(tp_adj)} OK")
+            # Попробуем вернуть TP туда, где хотели изначально, когда это станет возможно
+            try:
+                asyncio.create_task(self._tp_realign_watch(actual_side, desired_tp=tp_target, sl_price=sl_adj, check_interval=0.5, max_wait=1800.0))
+            except Exception:
+                pass
             if self.notifier:
                 try:
                     await self.notifier.notify(f"🎯 TP/SL set: SL {self._fmt(sl_adj)} / TP {self._fmt(tp_adj)}")
