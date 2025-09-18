@@ -55,11 +55,13 @@ class StrategyEngine:
     async def on_kline_closed(self) -> Signal:
         # 1) История только из закрытых минут
         df = await load_recent_1m(200, symbol=self.symbol)
+        prev_high = None
+        prev_low = None
         if len(df) < 60:
             # короткий факт-лог — без шума
             log.info("[SKIP] warmup (<60 closed 1m bars)")
-            log.debug(f"[SIGNAL][HL] prevH=None prevL=None")
-            return Signal(None, "warmup", None, None, None, None, None, None)
+            log.debug(f"[SIGNAL][HL] prevH={prev_high} prevL={prev_low}")
+            return Signal(None, "warmup", None, None, None, None, prev_high, prev_low)
 
         # Экстремы предыдущей ЗАКРЫТОЙ 1m свечи
         prev_high = float(df.iloc[-1]["high"])
