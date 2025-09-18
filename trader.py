@@ -1,116 +1,206 @@
+# trader.py
+import math
 import logging
-import time
 from typing import Optional, Dict, Any
 
+from config import SYMBOL, RISK_PCT, LEVERAGE
 from bybit_client import BybitClient
-from config import SYMBOL, LEVERAGE, RISK_PCT
 
 log = logging.getLogger("TRADER")
 
+
 class Trader:
-    def __init__(self, symbol: str = SYMBOL, risk_pct: float = RISK_PCT):
-        self.client = BybitClient()
+    """
+    Минималистичный трейдер:
+    - refresh_equity(): получить equity (USDT) одной строкой
+    - ensure_filters(): разово подтянуть tickSize/qtyStep/min
+    - ensure_leverage(): ставит плечо только если отличается
+    - open_market(side, signal): маркет-вход + TPSL
+    - close_market(side, qty): маркет-выход
+    Опциональный notifier: объект с notify(str).
+    """
+
+    def __init__(
+        self,
+        client: BybitClient,
+        symbol: str = SYMBOL,
+        risk_pct: float = RISK_PCT,
+        leverage: float = LEVERAGE,
+        notifier: Optional[Any] = None,
+    ):
+        self.client = client
         self.symbol = symbol
-        self.risk_pct = risk_pct
-        self.position_open = False
+        self.risk_pct = float(risk_pct)
+        self.leverage = float(leverage)
+        self.notifier = notifier
 
-    def _equity_usdt(self) -> float:
-        data = self.client.wallet_balance(account_type="UNIFIED")
+        # кэш маркет-фильтров
+        self._filters: Optional[Dict[str, float]] = None
+        # последняя известная equity (USDT)
+        self.equity: float = 0.0
+
+    # ---------- УТИЛЫ ----------
+
+    def _round_step(self, value: float, step: float) -> float:
+        if step <= 0:
+            return value
+        return math.floor(value / step + 1e-12) * step
+
+    def _ceil_step(self, value: float, step: float) -> float:
+        if step <= 0:
+            return value
+        return math.ceil(value / step - 1e-12) * step
+
+    def _fmt(self, x: float) -> str:
+        return f"{x:.6f}".rstrip("0").rstrip(".")
+
+    # ---------- ПУБЛИЧНЫЕ МЕТОДЫ ----------
+
+    def refresh_equity(self) -> float:
+        """Запрос баланса без лишнего шума"""
         try:
-            coins = data["result"]["list"][0]["coin"]
-            for c in coins:
-                if c["coin"] == "USDT":
-                    eq = float(c["equity"])
-                    log.debug(f"[EQUITY] USDT={eq}")
-                    return eq
+            r = self.client.wallet_balance(account_type="UNIFIED")
+            usdt = float(r["result"]["list"][0]["totalEquity"])
+            self.equity = usdt
+            log.info(f"[BALANCE] {usdt:.2f} USDT")
+            if self.notifier:
+                try:
+                    import asyncio
+                    asyncio.create_task(self.notifier.notify(f"💰 Баланс: {usdt:.2f} USDT"))
+                except Exception:
+                    pass
+            return usdt
         except Exception as e:
-            log.error(f"[EQUITY][ERR] {e}")
-        return 0.0
+            log.error(f"[BALANCE][ERR] {e}")
+            return 0.0
 
-    def _filters(self) -> Dict[str, Any]:
-        info = self.client.instruments_info(category="linear", symbol=self.symbol)
-        it = info.get("result", {}).get("list", [])[0]
-        pf = it["priceFilter"]; lf = it["lotSizeFilter"]
-        out = {
-            "tickSize": float(pf["tickSize"]),
-            "qtyStep": float(lf["qtyStep"]),
-            "minNotional": float(lf.get("minNotional", "0") or 0.0)
-        }
-        log.debug(f"[FILTERS] {out}")
-        return out
+    def ensure_filters(self) -> Dict[str, float]:
+        """Получить tickSize / qtyStep / minOrderQty (кэшируется)"""
+        if self._filters:
+            return self._filters
+        r = self.client.instruments_info(category="linear", symbol=self.symbol)
+        it = r.get("result", {}).get("list", [{}])[0]
+        tick = float(it.get("priceFilter", {}).get("tickSize", "0.1"))
+        qty_step = float(it.get("lotSizeFilter", {}).get("qtyStep", "0.001"))
+        min_qty = float(it.get("lotSizeFilter", {}).get("minOrderQty", "0.001"))
+        self._filters = {"tickSize": tick, "qtyStep": qty_step, "minQty": min_qty}
+        log.debug(f"[FILTERS] {self._filters}")
+        return self._filters
 
     def ensure_leverage(self):
-        log.debug(f"[LEV] ensure {LEVERAGE}x")
-        self.client.set_leverage(self.symbol, LEVERAGE, LEVERAGE)
+        """Ставит плечо только если отличается (подавляем 110043 как норму)"""
+        try:
+            pl = self.client.position_list(self.symbol)
+            # Bybit может отдавать пустой список, если позиции нет
+            cur_lev = float(pl.get("result", {}).get("list", [{}])[0].get("leverage") or 0.0)
+            if abs(cur_lev - self.leverage) < 1e-9:
+                log.debug(f"[LEV] already {cur_lev}x")
+                return
+        except Exception as e:
+            log.debug(f"[LEV] read failed: {e}")
+        r = self.client.set_leverage(self.symbol, self.leverage, self.leverage)
+        rc = r.get("retCode")
+        if rc in (0, 110043):  # 110043 = leverage not modified
+            log.info(f"[LEV] {self.leverage}x OK")
+        else:
+            log.warning(f"[LEV] rc={rc} msg={r.get('retMsg')}")
 
-    def calc_qty(self, entry: float, sl: float, equity_usdt: float, qty_step: float, min_notional: float) -> float:
-        risk_amount = max(equity_usdt * (self.risk_pct / 100.0), 1.0)
-        stop_dist = abs(entry - sl)
+    # ---------- РАСЧЁТ QTY ----------
+
+    def _calc_qty(self, side: str, price: float, sl: float) -> float:
+        """
+        К-во рассчитываем по риску:
+        risk_amt = equity * risk_pct
+        stop_dist = |price - sl|
+        qty = risk_amt / stop_dist
+        затем приводим к шагу и к минимуму биржи.
+        """
+        f = self.ensure_filters()
+        risk_amt = max(self.equity * self.risk_pct / max(self.leverage, 1.0), 1e-8)
+        stop_dist = abs(price - sl)
         if stop_dist <= 0:
             return 0.0
-        raw_qty = risk_amount / stop_dist
-        min_qty = min_notional / max(entry, 1e-8)
-        qty = max(raw_qty, min_qty)
-        # округлим к шагу
-        if qty_step > 0:
-            qty = round(qty / qty_step) * qty_step
-        log.debug(f"[QTY] eq={equity_usdt:.2f} risk%={self.risk_pct} risk_amt={risk_amount:.4f} stop={stop_dist:.4f} raw={raw_qty:.6f} min_qty={min_qty:.6f} -> qty={qty:.6f}")
-        return max(qty, qty_step)
+        raw_qty = risk_amt / stop_dist
+        qty = max(f["minQty"], self._round_step(raw_qty, f["qtyStep"]))
+        return qty
 
-    def _confirm_open(self) -> bool:
-        pl = self.client.position_list(self.symbol)
-        try:
-            sz = float(pl["result"]["list"][0]["size"])
-            log.debug(f"[CONFIRM] size={sz}")
-            return sz > 0
-        except Exception as e:
-            log.error(f"[CONFIRM][ERR] {e}")
-            return False
+    # ---------- ОРДЕРА ----------
 
-    def place_trade(self, side: str, sl: float, tp: float) -> Optional[Dict[str, Any]]:
+    async def open_market(self, side: str, signal: Dict[str, Any]):
+        """
+        side: "Buy" | "Sell"
+        signal: { 'sl': float, 'tp': float, 'atr': float, 'ts_ms': int, ... }
+        """
+        # обновим equity (если 0) и фильтры/плечо
+        if self.equity <= 0:
+            self.refresh_equity()
+        self.ensure_filters()
         self.ensure_leverage()
-        filters = self._filters()
-        eq = self._equity_usdt()
-        # приблизим entry текущей ценой из tp/sl — достаточно для логов формулы
-        entry_estimate = (tp + sl) / 2.0
-        qty = self.calc_qty(entry=entry_estimate, sl=sl, equity_usdt=eq, qty_step=filters["qtyStep"], min_notional=filters["minNotional"])
+
+        price = float(signal.get("price") or signal.get("close") or 0.0)
+        if price <= 0:
+            # берём близкую оценку — без отдельного REST-запроса
+            price = float(signal.get("tp") or 0.0) or 1.0
+
+        sl = float(signal.get("sl") or 0.0)
+        tp = float(signal.get("tp") or 0.0)
+        if sl <= 0 or tp <= 0:
+            log.info("[ENTER][SKIP] bad SL/TP")
+            return
+
+        qty = self._calc_qty(side, price, sl)
         if qty <= 0:
-            log.error("[TRADE] qty<=0 — отмена")
-            return None
+            log.info("[ENTER][SKIP] qty=0")
+            return
 
-        log.info(f"[ENTER] side={side} qty={qty}")
-        resp = self.client.place_order(self.symbol, side=side, qty=qty, order_type="Market")
-        rc = resp.get("retCode")
-        if rc != 0:
-            log.error(f"[ORDER][FAIL] rc={rc} msg={resp.get('retMsg')}")
-            return None
+        # Маркет-вход
+        log.info(f"[ENTER] {side} qty={self._fmt(qty)}")
+        r = self.client.place_order(self.symbol, side, qty)
+        if r.get("retCode") != 0:
+            log.error(f"[ORDER][FAIL] {r}")
+            return
 
-        time.sleep(0.5)
-        if not self._confirm_open():
-            log.error("[ORDER] не подтверждено /position/list")
-            return None
+        order_id = r.get("result", {}).get("orderId", "")
+        log.info(f"[ORDER←] OK id={order_id}")
+        if self.notifier:
+            try:
+                await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(qty)} (id {order_id})")
+            except Exception:
+                pass
 
-        log.info(f"[TPSL] side={side} SL={sl:.2f} TP={tp:.2f}")
-        ts = self.client.trading_stop(self.symbol, side=side, stop_loss=sl, take_profit=tp)
-        if ts.get("retCode") != 0:
-            log.warning(f"[TPSL][WARN] {ts}")
+        # Установка TP/SL
+        f = self.ensure_filters()
+        tick = f["tickSize"]
+        sl_r = self._ceil_step(sl, tick) if side == "Buy" else self._round_step(sl, tick)
+        tp_r = self._round_step(tp, tick) if side == "Buy" else self._ceil_step(tp, tick)
 
-        self.position_open = True
-        return {"order": resp, "qty": qty, "sl": sl, "tp": tp}
+        r2 = self.client.trading_stop(self.symbol, side=side, stop_loss=sl_r, take_profit=tp_r)
+        if r2.get("retCode") in (0, None):
+            log.info(f"[TPSL] sl={self._fmt(sl_r)} tp={self._fmt(tp_r)} OK")
+            if self.notifier:
+                try:
+                    await self.notifier.notify(f"🎯 TP/SL set: SL {self._fmt(sl_r)} / TP {self._fmt(tp_r)}")
+                except Exception:
+                    pass
+        else:
+            log.warning(f"[TPSL][FAIL] {r2}")
 
-    def close_all(self):
-        log.info("[CLOSE_ALL] try")
-        pl = self.client.position_list(self.symbol)
-        try:
-            pos = pl["result"]["list"][0]
-            size = float(pos["size"])
-            if size == 0:
-                log.info("[CLOSE_ALL] no position")
-                return
-            side = pos.get("side", "").lower()
-            close_side = "Sell" if side == "buy" else "Buy"
-            log.info(f"[CLOSE] size={size} side={side} -> {close_side}")
-            self.client.place_order(self.symbol, side=close_side, qty=size, order_type="Market")
-        except Exception as e:
-            log.error(f"[CLOSE_ALL][ERR] {e}")
-        self.position_open = False
+    async def close_market(self, side: str, qty: float):
+        """
+        Закрытие позиции маркетом (на твой выбор side / qty).
+        """
+        if qty <= 0:
+            log.info("[EXIT][SKIP] qty=0")
+            return
+        log.info(f"[EXIT] {side} qty={self._fmt(qty)}")
+        r = self.client.place_order(self.symbol, side, qty)
+        if r.get("retCode") == 0:
+            oid = r.get("result", {}).get("orderId", "")
+            log.info(f"[ORDER←] CLOSE OK id={oid}")
+            if self.notifier:
+                try:
+                    await self.notifier.notify(f"❌ Close {side} {self.symbol} qty={self._fmt(qty)} (id {oid})")
+                except Exception:
+                    pass
+        else:
+            log.error(f"[ORDER][FAIL] {r}")

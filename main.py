@@ -1,94 +1,129 @@
+# main.py
+import os
 import asyncio
+import signal
 import logging
+from typing import Optional, Dict, Any
 
-from log import logger  # init logs
-from config import SYMBOL, RISK_PCT
+from bybit_client import BybitClient
 from data import DataManager
-from strategy import StrategyEngine
 from trader import Trader
-from llm import LLMAdvisor
-from bot import ControlBus, build_app
+from strategy import StrategyEngine
+from bot import TgBot
+from features import load_recent_1m
 
+# ---------------- logging ----------------
+
+def setup_logging():
+    level = os.getenv("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, level, logging.INFO),
+        format="%(asctime)s | %(levelname)s | %(name)s:%(lineno)d | %(message)s",
+    )
+    # приглушим шумные библиотеки
+    for noisy in ("aiosqlite", "httpcore", "httpx", "websockets", "asyncio", "aiogram"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+setup_logging()
 log = logging.getLogger("MAIN")
 
-async def llm_loop(bus: ControlBus, strat: StrategyEngine, advisor: LLMAdvisor):
-    asyncio.current_task().set_name("llm")
+# ---------------- strategy loop ----------------
+
+async def strategy_loop(strat: StrategyEngine, trader: Trader, poll_sec: float = 1.0):
+    """
+    Пуллим БД раз в poll_sec и вызываем стратегию,
+    когда появляется НОВАЯ закрытая 1m свеча.
+    """
+    last_ts: Optional[int] = None
     while True:
         try:
-            kpis = {"cooldown": 180, "risk": strat.risk_pct}
-            market = {"symbol": SYMBOL}
-            rec = advisor.advise(kpis, market)
-            if "mode" in rec:
-                strat.set_mode(rec["mode"]); bus.mode = rec["mode"]
-            if "risk_pct" in rec:
-                strat.risk_pct = rec["risk_pct"]; bus.risk_pct = rec["risk_pct"]
-        except Exception as e:
-            log.warning(f"[LLM_LOOP] {e}")
-        await asyncio.sleep(600)
+            df = await load_recent_1m(limit=1)  # только последняя закрытая минута
+            if not df.empty:
+                ts = int(df.iloc[-1]["ts_ms"])
+                if last_ts is None:
+                    last_ts = ts  # инициализируем, не триггерим
+                elif ts != last_ts:
+                    # появилась новая закрытая минута → спросим стратегию
+                    sig = await strat.on_kline_closed()
+                    last_ts = ts
 
-async def tg_commands_loop(bus: ControlBus, strat: StrategyEngine, trader: Trader, data: DataManager):
-    asyncio.current_task().set_name("tg-cmds")
-    while True:
-        cmd = await bus.get()
-        if cmd["cmd"] == "start":
-            bus.started = True; bus.status = "running"; log.info("[CMD] start")
-        elif cmd["cmd"] == "stop":
-            log.info("[CMD] stop -> close_all + halt")
-            trader.close_all()
-            bus.started = False; bus.status = "stopped"
-        elif cmd["cmd"] == "close_all":
-            log.info("[CMD] close_all")
-            trader.close_all()
-        elif cmd["cmd"] == "mode":
-            strat.set_mode(cmd["value"]); bus.mode = cmd["value"]; log.info(f"[CMD] mode={cmd['value']}")
-        elif cmd["cmd"] == "risk":
-            strat.risk_pct = cmd["value"]; bus.risk_pct = cmd["value"]; log.info(f"[CMD] risk={cmd['value']}%")
-
-async def trading_loop(bus: ControlBus, strat: StrategyEngine, trader: Trader):
-    asyncio.current_task().set_name("trading")
-    while True:
-        try:
-            if not bus.started:
-                await asyncio.sleep(1.0)
-                continue
-            sig = await strat.on_kline_closed()
-            if sig.side:
-                log.info(f"[TRADE] side={sig.side} reason={sig.reason} SL={sig.sl:.2f} TP={sig.tp:.2f} ATR={sig.atr:.2f}")
-                trader.place_trade(sig.side, sig.sl, sig.tp)
-            else:
-                log.debug(f"[SKIP] {sig.reason}")
+                    # если есть вход — отдаём трейдеру
+                    if sig.side in ("Buy", "Sell"):
+                        payload: Dict[str, Any] = {
+                            "close": float(df.iloc[-1]["close"]),
+                            "price": float(df.iloc[-1]["close"]),
+                            "sl": sig.sl,
+                            "tp": sig.tp,
+                            "atr": sig.atr,
+                            "ts_ms": sig.ts_ms or ts,
+                        }
+                        await trader.open_market(sig.side, payload)
+            await asyncio.sleep(poll_sec)
+        except asyncio.CancelledError:
+            break
         except Exception as e:
-            log.error(f"[TRADING_LOOP] {e}")
-        await asyncio.sleep(2.0)
+            log.error(f"[STRAT_LOOP] {e}")
+            await asyncio.sleep(1.0)
+
+# ---------------- app wiring ----------------
 
 async def main():
-    asyncio.current_task().set_name("main")
-    bus = ControlBus()
-    bot, dp = build_app(bus)
+    # env
+    TG_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
+    TG_CHAT = os.getenv("TG_CHAT_ID", "").strip()  # можно не задавать — подхватится из /start
+    POLL_SEC = float(os.getenv("STRAT_POLL_SEC", "1.0"))
 
-    data = DataManager(symbol=SYMBOL)
-    strat = StrategyEngine(risk_pct=RISK_PCT, symbol=SYMBOL)
-    trader = Trader(symbol=SYMBOL, risk_pct=RISK_PCT)
-    advisor = LLMAdvisor()
+    # клиенты/сервисы
+    client = BybitClient()
+    bot = TgBot(TG_TOKEN, int(TG_CHAT) if TG_CHAT else None)
+    trader = Trader(client=client, notifier=bot)
+    strat = StrategyEngine(trader=trader, notifier=bot)
+    data = DataManager()  # WS + агрегатор + backfill
 
-    tasks = [
-        asyncio.create_task(data.start(), name="data"),
-        asyncio.create_task(trading_loop(bus, strat, trader), name="trading"),
-        asyncio.create_task(llm_loop(bus, strat, advisor), name="llm"),
-        asyncio.create_task(dp.start_polling(bot), name="tg"),
-        asyncio.create_task(tg_commands_loop(bus, strat, trader, data), name="tg-cmds"),
-    ]
-    log.info("[MAIN] started")
+    # старт бота в фоне
+    await bot.start_background()
+
+    # старт датапайплайна
+    data_task = asyncio.create_task(data.start(), name="data")
+
+    # стратегический цикл
+    strat_task = asyncio.create_task(strategy_loop(strat, trader, poll_sec=POLL_SEC), name="strategy")
+
+    log.info("🚀 Bot online. Отправь /start в Telegram для кнопок.")
+
+    # graceful shutdown по сигналам
+    stop_event = asyncio.Event()
+
+    def _on_signal(sig_name):
+        log.info(f"[SHUTDOWN] {sig_name}")
+        stop_event.set()
+
+    loop = asyncio.get_running_loop()
+    for s in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(s, _on_signal, s.name)
+        except NotImplementedError:
+            # Windows
+            pass
+
+    await stop_event.wait()
+
+    # останавливаем таски
+    for t in (strat_task, data_task):
+        if not t.done():
+            t.cancel()
     try:
-        await asyncio.gather(*tasks)
-    except asyncio.CancelledError:
-        pass
+        await asyncio.gather(strat_task, data_task, return_exceptions=True)
     finally:
-        await data.stop()
-        log.info("[MAIN] stopped")
+        try:
+            await data.stop()
+        except Exception:
+            pass
+        try:
+            await bot.shutdown()
+        except Exception:
+            pass
+        log.info("👋 bye")
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(main())

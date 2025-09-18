@@ -1,59 +1,117 @@
-import os, json, time, logging
+# llm.py
+import os
+import json
+import logging
 from typing import Dict, Any
+
 import httpx
-from config import OPENAI_API_KEY
 
 log = logging.getLogger("LLM")
 
-SAFE = {"risk_min":0.5,"risk_max":1.0,"sl_min":1.0,"sl_max":2.0,"tpvs_min":1.5,"tpvs_max":3.0}
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
-def _clip(v, lo, hi): return max(lo, min(hi, v))
 
-class LLMAdvisor:
-    def __init__(self, budget_daily_usd: float = 3.0, model: str = "gpt-4o-mini"):
-        self.budget_daily_usd = budget_daily_usd
-        self.model = model
-        self._spent_today = 0.0
-        self._day = time.strftime("%Y-%m-%d")
+def _shorten(obj: Any, maxlen: int = 220) -> str:
+    """
+    Короткий человекочитаемый дамп для логов.
+    """
+    try:
+        s = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        s = str(obj)
+    return (s[: maxlen] + "...") if len(s) > maxlen else s
 
-    def _check_budget(self) -> bool:
-        today = time.strftime("%Y-%m-%d")
-        if today != self._day:
-            self._day = today
-            self._spent_today = 0.0
-        return self._spent_today < self.budget_daily_usd
 
-    def advise(self, kpis: Dict[str, Any], market_brief: Dict[str, Any]) -> Dict[str, Any]:
-        if not OPENAI_API_KEY or not self._check_budget():
-            log.debug("[LLM] skip (no key or budget)")
-            return {}
+async def ask_model(features: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Делает короткий запрос к OpenAI и возвращает решение.
+    Логи только по факту: [LLM→] и [LLM←].
+    Формат ответа: словарь с ключами:
+      - decision: "Buy" | "Sell" | "Hold"
+      - reason: краткое объяснение (строка)
+    """
+    if not OPENAI_API_KEY:
+        log.info("[LLM] skip (no OPENAI_API_KEY) → Hold")
+        return {"decision": "Hold", "reason": "no_api_key"}
 
-        prompt = {
-            "role": "user",
-            "content": f"""Return JSON with fields: mode in ["trend","range"], risk_pct [{SAFE['risk_min']}, {SAFE['risk_max']}], sl_mult [{SAFE['sl_min']},{SAFE['sl_max']}], tp_vs_sl [{SAFE['tpvs_min']},{SAFE['tpvs_max']}]. KPIs={json.dumps(kpis)} Market={json.dumps(market_brief)}"""
-        }
-        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-        payload = {"model": self.model, "input": [prompt], "temperature": 0.2}
+    system = (
+        "Ты помощник-трейдер. Дай одно из решений: Buy, Sell или Hold. "
+        "Ответ возвращай JSON с ключами decision и reason. Коротко и по делу."
+    )
+    user = {
+        "features": features,
+        "context": ctx,
+    }
 
-        try:
-            log.debug(f"[LLM→] {payload}")
-            r = httpx.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=20.0)
+    log.info(f"[LLM→] {_shorten(user)}")
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": (
+                    "На основе следующих данных верни JSON: {decision: Buy|Sell|Hold, reason: string}.\n"
+                    f"{json.dumps(user, ensure_ascii=False)}"
+                ),
+            },
+        ],
+        "temperature": 0.2,
+        "max_tokens": 150,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+            r.raise_for_status()
             data = r.json()
-            text = data.get("output", [{}])[0].get("content", [{}])[0].get("text", "").strip()
-            log.debug(f"[LLM←] {text[:400]}")
-            rec = {}
-            try: rec = json.loads(text)
-            except Exception: pass
 
-            mode = rec.get("mode") if rec.get("mode") in ("trend","range") else None
-            rp = rec.get("risk_pct"); sl = rec.get("sl_mult"); tvs = rec.get("tp_vs_sl")
-            out = {}
-            if mode: out["mode"] = mode
-            if isinstance(rp,(int,float)): out["risk_pct"] = _clip(float(rp), SAFE["risk_min"], SAFE["risk_max"])
-            if isinstance(sl,(int,float)): out["sl_mult"]  = _clip(float(sl), SAFE["sl_min"], SAFE["sl_max"])
-            if isinstance(tvs,(int,float)): out["tp_vs_sl"]= _clip(float(tvs), SAFE["tpvs_min"], SAFE["tpvs_max"])
-            log.info(f"[LLM][APPLY] {out}")
-            return out
-        except Exception as e:
-            log.warning(f"[LLM][ERR] {e}")
-            return {}
+        content = (
+            data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+            .strip()
+        )
+
+        # Пытаемся распарсить JSON, но если не удалось — вернём raw
+        decision = {"decision": "Hold", "reason": "parse_error", "raw": content}
+        try:
+            parsed = json.loads(content)
+            if isinstance(parsed, dict):
+                d = str(parsed.get("decision", "Hold"))
+                reason = str(parsed.get("reason", "") or "").strip()
+                # нормализуем
+                d_norm = d.capitalize()
+                if d_norm not in ("Buy", "Sell", "Hold"):
+                    d_norm = "Hold"
+                decision = {"decision": d_norm, "reason": reason or "ok"}
+        except Exception:
+            # не JSON — пытаемся угадать по ключевому слову
+            lc = content.lower()
+            if "buy" in lc:
+                decision = {"decision": "Buy", "reason": "model_text", "raw": content}
+            elif "sell" in lc:
+                decision = {"decision": "Sell", "reason": "model_text", "raw": content}
+            else:
+                decision = {"decision": "Hold", "reason": "model_text", "raw": content}
+
+        log.info(f"[LLM←] {decision['decision']} | {decision.get('reason','')}")
+        return decision
+
+    except httpx.HTTPError as e:
+        log.error(f"[LLM][HTTP] {e}")
+        return {"decision": "Hold", "reason": "http_error"}
+    except Exception as e:
+        log.error(f"[LLM][ERR] {e}")
+        return {"decision": "Hold", "reason": "error"}

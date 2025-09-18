@@ -1,13 +1,15 @@
+# strategy.py
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Dict, Any
 
-from config import RISK_PCT, SYMBOL
+from config import SYMBOL, RISK_PCT
 from features import load_recent_1m, compute_features, last_feature_row
-from ml import OnlineModel
+from llm import ask_model
 
 log = logging.getLogger("STRATEGY")
+
 
 @dataclass
 class Signal:
@@ -18,89 +20,125 @@ class Signal:
     atr: Optional[float]
     ts_ms: Optional[int]
 
+
 class StrategyEngine:
-    def __init__(self, risk_pct: float = RISK_PCT, symbol: str = SYMBOL):
+    """
+    Минималистичная стратегия:
+    - Берёт закрытые 1m бары из БД
+    - Считает базовые фичи
+    - Делает запрос к LLM и по ответу формирует сигнал
+    - SL/TP — из ATR (настраиваемые множители)
+    Логи только по факту: [SIGNAL] и [DECIDE] (сам запрос/ответ ЛЛМ логируются в llm.py).
+    """
+    def __init__(
+        self,
+        risk_pct: float = RISK_PCT,
+        symbol: str = SYMBOL,
+        sl_mult: float = 1.5,
+        tp_vs_sl: float = 2.0,
+        cooldown_sec: int = 180,
+        notifier: Optional[Any] = None,  # опционально: объект с методом notify(str)
+    ):
         self.risk_pct = risk_pct
         self.symbol = symbol
-        self.model = OnlineModel()
-        self.cooldown_sec = 180
+        self.sl_mult = sl_mult
+        self.tp_vs_sl = tp_vs_sl
+        self.cooldown_sec = cooldown_sec
         self._last_trade_time = 0.0
-        self._mode = "auto"
+        self._notifier = notifier
 
-    def set_mode(self, mode: str):
-        if mode in ("auto","trend","range"):
-            log.debug(f"[MODE] {self._mode} -> {mode}")
-            self._mode = mode
+    def set_notifier(self, notifier: Any):
+        self._notifier = notifier
 
     async def on_kline_closed(self) -> Signal:
+        # 1) История только из закрытых минут
         df = await load_recent_1m(200, symbol=self.symbol)
-        if not df.empty:
-            from datetime import datetime, timezone
-            last_ts = int(df.iloc[-1]["ts_ms"]) // 1000
-            log.debug(f"[BAR] last_closed_1m={datetime.fromtimestamp(last_ts, tz=timezone.utc).isoformat()}")
-        log.debug(f"[BAR] loaded rows={len(df)}")
         if len(df) < 60:
+            # короткий факт-лог — без шума
+            log.info("[SKIP] warmup (<60 closed 1m bars)")
             return Signal(None, "warmup", None, None, None, None)
 
+        # 2) Признаки
         dff = compute_features(df)
-        f0 = last_feature_row(dff)
-        log.debug(f"[FEAT] last={f0}")
+        f0: Dict[str, Any] = last_feature_row(dff)
+        if not f0:
+            return Signal(None, "no_features", None, None, None, None)
 
-        # онлайн-апдейт модели на предыдущем шаге
-        if len(dff) >= 2:
-            prev = dff.iloc[-2]
-            curr = dff.iloc[-1]
+        # Ключевой лог «сигнал/срез фич» — компактно
+        log.info(f"[SIGNAL] c={f0['close']:.2f} emaF={f0['ema_fast']:.2f} emaS={f0['ema_slow']:.2f} atr={f0['atr14']:.2f}")
+        if self._notifier:
             try:
-                self.model.update(
-                    {"ts_ms": int(prev["ts_ms"]), "close": float(prev["close"]),
-                     "ema_fast": float(prev["ema_fast"]), "ema_slow": float(prev["ema_slow"]),
-                     "atr14": float(prev["atr14"]), "roc1": float(prev["roc1"]),
-                     "spread_proxy": float(prev["spread_proxy"]), "vol_roll": float(prev["vol_roll"])},
-                    float(curr["close"])
+                await self._notifier.notify(
+                    f"📊 Signal\nc={f0['close']:.2f}  emaF={f0['ema_fast']:.2f}  emaS={f0['ema_slow']:.2f}  atr={f0['atr14']:.2f}"
                 )
-            except Exception as e:
-                log.debug(f"[ML] update skip: {e}")
+            except Exception:
+                pass
 
-        prob_up = self.model.predict(f0)
-        atr = max(f0["atr14"], 1e-8)
-        close = f0["close"]
-        ema_fast, ema_slow = f0["ema_fast"], f0["ema_slow"]
-        trend_up = ema_fast > ema_slow
-        roc = f0["roc1"]
-        log.debug(f"[ML] p_up={prob_up:.3f} trend_up={trend_up} roc={roc:.4f}")
-
+        # 3) Анти-спам: общий кулдаун между входами
         now = time.time()
         if now - self._last_trade_time < self.cooldown_sec:
-            return Signal(None, "cooldown", None, None, atr, f0["ts_ms"])
+            return Signal(None, "cooldown", None, None, float(f0["atr14"]), int(f0["ts_ms"]))
 
-        side = None
-        reasons = []
-        if self._mode in ("auto","trend"):
-            if trend_up and prob_up > 0.52 and roc >= -0.001:
-                side = "Buy"; reasons.append("trend_up+ml")
-            elif (not trend_up) and prob_up < 0.48 and roc <= 0.001:
-                side = "Sell"; reasons.append("trend_dn+ml")
-        if side is None and self._mode in ("auto","range"):
-            dev = (close - ema_slow) / max(close, 1e-8)
-            if dev > 0.004 and prob_up < 0.5:
-                side = "Sell"; reasons.append("revert_down")
-            elif dev < -0.004 and prob_up > 0.5:
-                side = "Buy"; reasons.append("revert_up")
+        # 4) Вызов LLM (запрос/ответ логируются в llm.py как [LLM→]/[LLM←])
+        ctx = {
+            "symbol": self.symbol,
+            "risk_pct": self.risk_pct,
+        }
+        decision = await ask_model(
+            features={
+                "ts_ms": f0["ts_ms"],
+                "close": f0["close"],
+                "ema_fast": f0["ema_fast"],
+                "ema_slow": f0["ema_slow"],
+                "atr14": f0["atr14"],
+                "roc1": f0["roc1"],
+                "spread_proxy": f0["spread_proxy"],
+                "vol_roll": f0["vol_roll"],
+            },
+            ctx=ctx,
+        )
 
-        if side is None:
-            log.debug("[DECIDE] no_entry")
-            return Signal(None, "no_entry", None, None, atr, f0["ts_ms"])
+        action_raw = str(decision.get("decision", "Hold"))
+        reason = str(decision.get("reason", "") or "").strip()
+        action = action_raw.capitalize()
+        if action not in ("Buy", "Sell"):
+            log.info(f"[DECIDE] Hold | {reason}")
+            if self._notifier:
+                try:
+                    await self._notifier.notify(f"🤖 LLM: Hold • {reason or 'no reason'}")
+                except Exception:
+                    pass
+            return Signal(None, "hold", None, None, float(f0["atr14"]), int(f0["ts_ms"]))
 
-        sl_mult = 1.5
-        tp_mult_vs_sl = 2.0
-        if side == "Buy":
+        # 5) Построение SL/TP из ATR
+        close = float(f0["close"])
+        atr = max(float(f0["atr14"]), 1e-8)
+        sl_mult = float(self.sl_mult)
+        tp_vs_sl = float(self.tp_vs_sl)
+
+        if action == "Buy":
             sl = close - sl_mult * atr
-            tp = close + tp_mult_vs_sl * (close - sl)
-        else:
+            tp = close + tp_vs_sl * (close - sl)
+        else:  # Sell
             sl = close + sl_mult * atr
-            tp = close - tp_mult_vs_sl * (sl - close)
+            tp = close - tp_vs_sl * (sl - close)
 
+        log.info(f"[DECIDE] {action} | sl={sl:.2f} tp={tp:.2f} • {reason}")
+        if self._notifier:
+            try:
+                arrow = "🟢 Buy" if action == "Buy" else "🔴 Sell"
+                await self._notifier.notify(f"🤖 LLM: {arrow}\nSL {sl:.2f} / TP {tp:.2f}\n{('💬 ' + reason) if reason else ''}")
+            except Exception:
+                pass
+
+        # фиксируем кулдаун
         self._last_trade_time = now
-        reason = "+".join(reasons)
-        log.info(f"[SIGNAL] side={side} reason={reason} close={close:.2f} atr={atr:.2f} sl={sl:.2f} tp={tp:.2f}")
-        return Signal(side, reason, sl, tp, atr, f0["ts_ms"])
+
+        return Signal(
+            side=action,
+            reason=reason or "llm",
+            sl=float(sl),
+            tp=float(tp),
+            atr=float(atr),
+            ts_ms=int(f0["ts_ms"]),
+        )

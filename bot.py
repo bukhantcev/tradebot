@@ -1,87 +1,142 @@
+# bot.py
 import asyncio
 import logging
-from aiogram import Bot, Dispatcher
-from aiogram.types import Message
+from typing import Optional
+
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.enums import ParseMode
 from aiogram.filters import Command
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 
-from config import HOST_ROLE, TELEGRAM_TOKEN_LOCAL, TELEGRAM_TOKEN_SERVER, TELEGRAM_CHAT_ID
+log = logging.getLogger("BOT")
 
-log = logging.getLogger("TGBOT")
 
-def get_token() -> str:
-    return TELEGRAM_TOKEN_SERVER if HOST_ROLE == "server" else TELEGRAM_TOKEN_LOCAL
+def kb_main() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 Баланс", callback_data="balance")],
+        [
+            InlineKeyboardButton(text="🟢 Старт", callback_data="start"),
+            InlineKeyboardButton(text="🔴 Стоп", callback_data="stop"),
+        ],
+    ])
 
-class ControlBus:
-    def __init__(self):
-        self.started = False
-        self.status = "idle"
-        self.mode = "auto"
-        self.risk_pct = 1.0
-        self.commands = asyncio.Queue()
 
-    async def put(self, cmd: dict):
-        log.debug(f"[BUS→] {cmd}")
-        await self.commands.put(cmd)
+class TgBot:
+    """
+    Лёгкий Telegram-бот:
+      - /start показывает кнопки
+      - «Баланс» вызывает trader.refresh_equity()
+      - «Старт/Стоп» — просто статусы (переключение оставляем за стратегией/лупом)
+      - notify(text) — отправка кратких апдейтов (сигнал, LLM-решение, ордера)
 
-    async def get(self):
-        cmd = await self.commands.get()
-        log.debug(f"[BUS←] {cmd}")
-        return cmd
+    Инициализация:
+        tg = TgBot(token=..., chat_id=..., trader=trader)
+        await tg.start_background()   # запустить поллинг
+        await tg.notify("бот готов")
 
-def build_app(bus: ControlBus):
-    bot = Bot(get_token(), parse_mode=None)
-    dp = Dispatcher()
+    Примечание:
+      chat_id можно не указывать — бот сам подхватит первый /start и кэшнет chat_id.
+    """
 
-    async def only_owner(msg: Message) -> bool:
-        ok = (str(msg.chat.id) == str(TELEGRAM_CHAT_ID))
-        if not ok: log.warning(f"[TG][DENY] chat={msg.chat.id}")
-        return ok
+    def __init__(self, token: str, chat_id: Optional[int] = None, trader=None):
+        self.bot = Bot(token=token, parse_mode=ParseMode.HTML)
+        self.dp = Dispatcher()
+        self.router = Router()
+        self.dp.include_router(self.router)
 
-    @dp.message(Command("start"))
-    async def cmd_start(msg: Message):
-        if not await only_owner(msg): return
-        await bus.put({"cmd":"start"})
-        await msg.answer("Запускаю")
+        self.trader = trader
+        self.chat_id = chat_id
+        self._running_flag = False  # визуальный статус для кнопок
 
-    @dp.message(Command("stop"))
-    async def cmd_stop(msg: Message):
-        if not await only_owner(msg): return
-        await bus.put({"cmd":"stop"})
-        await msg.answer("Останавливаю")
+        self._register_handlers()
 
-    @dp.message(Command("status"))
-    async def cmd_status(msg: Message):
-        if not await only_owner(msg): return
-        await msg.answer(f"status={bus.status} mode={bus.mode} risk={bus.risk_pct}%")
+    # ---------------- Handlers ----------------
 
-    @dp.message(Command("close_all"))
-    async def cmd_close(msg: Message):
-        if not await only_owner(msg): return
-        await bus.put({"cmd":"close_all"})
-        await msg.answer("Закрываю все позиции")
+    def _register_handlers(self):
+        @self.router.message(Command("start"))
+        async def on_start(message: Message):
+            # если chat_id не задан — кэшируем
+            if not self.chat_id:
+                self.chat_id = message.chat.id
+                log.info(f"[BOT] bind chat_id={self.chat_id}")
 
-    @dp.message(Command("mode"))
-    async def cmd_mode(msg: Message):
-        if not await only_owner(msg): return
-        parts = msg.text.split()
-        if len(parts) >= 2 and parts[1] in ("auto","trend","range"):
-            await bus.put({"cmd":"mode","value":parts[1]})
-            await msg.answer(f"mode -> {parts[1]}")
-        else:
-            await msg.answer("Используй: /mode auto|trend|range")
+            await message.answer(
+                "Бот запущен.\nВыбирай действие ниже:",
+                reply_markup=kb_main(),
+            )
 
-    @dp.message(Command("risk"))
-    async def cmd_risk(msg: Message):
-        if not await only_owner(msg): return
-        parts = msg.text.split()
-        if len(parts) >= 2:
+        @self.router.callback_query(F.data == "balance")
+        async def on_balance(cb: CallbackQuery):
+            if not self.trader:
+                await cb.message.answer("Трейдер недоступен")
+                await cb.answer()
+                return
+            eq = self.trader.refresh_equity()
+            await cb.message.answer(f"💰 Баланс: <b>{eq:.2f} USDT</b>")
+            await cb.answer()
+
+        @self.router.callback_query(F.data == "start")
+        async def on_start_trade(cb: CallbackQuery):
+            self._running_flag = True
+            await cb.message.answer("🟢 Торговля: <b>ON</b>")
+            await cb.answer()
+
+        @self.router.callback_query(F.data == "stop")
+        async def on_stop_trade(cb: CallbackQuery):
+            self._running_flag = False
+            await cb.message.answer("🔴 Торговля: <b>OFF</b>")
+            await cb.answer()
+
+        # /help (по желанию)
+        @self.router.message(Command("help"))
+        async def on_help(message: Message):
+            await message.answer(
+                "Доступно:\n"
+                "• /start — меню\n"
+                "• Кнопки: Баланс / Старт / Стоп\n"
+                "• Уведомления: сигналы, ответы ИИ, ордера"
+            )
+
+    # ---------------- Public API ----------------
+
+    async def start_background(self):
+        """
+        Запускает поллинг в фоне (не блокирует).
+        В main.py можно просто:  asyncio.create_task(bot.start_background())
+        """
+        async def _poll():
             try:
-                v = float(parts[1]); v = max(0.2, min(1.0, v))
-                await bus.put({"cmd":"risk","value":v})
-                await msg.answer(f"risk -> {v}%")
-            except Exception:
-                await msg.answer("Пример: /risk 0.8")
-        else:
-            await msg.answer("Пример: /risk 0.8")
+                log.info("[BOT] polling start")
+                await self.dp.start_polling(self.bot)
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                log.error(f"[BOT] polling error: {e}")
 
-    return bot, dp
+        asyncio.create_task(_poll(), name="tg-polling")
+
+    async def notify(self, text: str):
+        """
+        Короткие апдейты (сигналы, LLM-ответ, вход/выход, TP/SL).
+        Тихо игнорим, если chat_id ещё не известен (появится после /start).
+        """
+        if not self.chat_id:
+            log.debug("[BOT] notify skipped (no chat_id yet)")
+            return
+        try:
+            await self.bot.send_message(self.chat_id, text)
+        except Exception as e:
+            log.error(f"[BOT][ERR] {e}")
+
+    # Опционально — остановка
+    async def shutdown(self):
+        try:
+            await self.bot.session.close()
+        except Exception:
+            pass
+        log.info("[BOT] shutdown")
