@@ -247,22 +247,9 @@ class Trader:
         tp_r = self._round_step(tp, tick) if side == "Buy" else self._ceil_step(tp, tick)
         sl_r, tp_r = self._fix_tpsl(side, price, sl_r, tp_r, tick)
 
-        # Маркет-вход: сначала пробуем прикрепить TP/SL прямо в order/create (tpslMode=Full)
+        # Маркет-вход: сначала ордер БЕЗ TP/SL, затем TP/SL через trading-stop (устраняем 30208)
         log.info(f"[ENTER] {side} qty={self._fmt(qty)}")
-        try:
-            r = self.client.place_order(
-                self.symbol,
-                side,
-                qty,
-                takeProfit=self._fmt(tp_r),
-                stopLoss=self._fmt(sl_r),
-                tpslMode="Full",
-                positionIdx=0,
-            )
-        except TypeError:
-            # Старый клиент без параметров TP/SL — создаём без них
-            r = self.client.place_order(self.symbol, side, qty)
-
+        r = self.client.place_order(self.symbol, side, qty)
         rc = r.get("retCode")
         if rc == 0:
             order_id = r.get("result", {}).get("orderId", "")
@@ -272,26 +259,14 @@ class Trader:
                     await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(qty)} (id {order_id})")
                 except Exception:
                     pass
-        elif rc == 110007:  # ab not enough for new order
-            # попробуем уменьшить qty и повторить один раз
+        elif rc == 110007:  # ab not enough for new order — уменьшим объём и повторим один раз
             f = self.ensure_filters()
             qty2 = max(f["minQty"], self._round_step(qty * 0.9, f["qtyStep"]))
             if qty2 < f["minQty"]:
                 log.error(f"[ORDER][FAIL] rc=110007 (no balance), qty too small after retry")
                 return
             log.info(f"[ENTER][RETRY] reduce qty -> {self._fmt(qty2)}")
-            try:
-                r = self.client.place_order(
-                    self.symbol,
-                    side,
-                    qty2,
-                    takeProfit=self._fmt(tp_r),
-                    stopLoss=self._fmt(sl_r),
-                    tpslMode="Full",
-                    positionIdx=0,
-                )
-            except TypeError:
-                r = self.client.place_order(self.symbol, side, qty2)
+            r = self.client.place_order(self.symbol, side, qty2)
             if r.get("retCode") == 0:
                 order_id = r.get("result", {}).get("orderId", "")
                 log.info(f"[ORDER←] OK id={order_id}")
@@ -304,27 +279,11 @@ class Trader:
             else:
                 log.error(f"[ORDER][FAIL] {r}")
                 return
-        elif rc == 30208:
-            # Failed: price restriction due to attached TP/SL; retry without TP/SL and set via trading-stop
-            log.warning("[ORDER][RETRY] 30208: retrying without TP/SL")
-            r = self.client.place_order(self.symbol, side, qty)
-            if r.get("retCode") == 0:
-                order_id = r.get("result", {}).get("orderId", "")
-                log.info(f"[ORDER←] OK id={order_id} (no TP/SL)")
-                if self.notifier:
-                    try:
-                        await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(qty)} (id {order_id}, no TP/SL)")
-                    except Exception:
-                        pass
-            else:
-                log.error(f"[ORDER][FAIL] {r}")
-                return
         else:
             log.error(f"[ORDER][FAIL] {r}")
             return
 
-        # Fallback: если клиент не умел TP/SL в order.create (TypeError) — поставим через trading-stop.
-        # Небольшое ожидание открытия позиции, чтобы не поймать rc=10001 (zero position)
+        # После успешного входа — подождём открытия позиции и поставим TP/SL отдельным вызовом
         ok = await self._wait_position_open()
         if not ok:
             log.warning("[TPSL][SKIP] position not opened")
