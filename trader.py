@@ -339,6 +339,53 @@ class Trader:
             await asyncio.sleep(interval)
         return False
 
+    async def _watchdog_close_on_lastprice(self, side: str, sl_price: float, tp_price: float, check_interval: float = 0.3, max_wait: float = 3600.0) -> bool:
+        """
+        Сторож: если LastPrice пересекает TP/SL, закрываем позицию маркетом (fallback на случай,
+        когда биржевой TP/SL с MarkPrice не срабатывает). Возвращает True, если позиция стала flat.
+        """
+        deadline = time.monotonic() + max_wait
+        side = "Buy" if side == "Buy" else "Sell"
+        opp = self._opposite(side)
+
+        while time.monotonic() < deadline:
+            try:
+                # если уже flat — всё, выходим
+                ps, sz = self._position_side_and_size()
+                if not ps or sz <= 0:
+                    return True
+
+                last = self._last_price()
+                if last <= 0:
+                    await asyncio.sleep(check_interval)
+                    continue
+
+                trigger = False
+                if side == "Buy":
+                    # SL: last <= sl ; TP: last >= tp
+                    if (sl_price and last <= sl_price) or (tp_price and last >= tp_price):
+                        trigger = True
+                else:
+                    # Sell: SL: last >= sl ; TP: last <= tp
+                    if (sl_price and last >= sl_price) or (tp_price and last <= tp_price):
+                        trigger = True
+
+                if trigger:
+                    log.info(f"[WATCH][CROSS] Last={self._fmt(last)} vs SL={self._fmt(sl_price)} / TP={self._fmt(tp_price)} -> force close")
+                    try:
+                        await self.close_market(opp, sz)
+                    except Exception as e:
+                        log.warning(f"[WATCH][CLOSE][EXC] {e}")
+                    # ждём подтверждения flat и выходим
+                    ok_flat = await self._wait_position_flat(timeout=30.0, interval=0.25)
+                    return ok_flat
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning(f"[WATCH][EXC] {e}")
+            await asyncio.sleep(check_interval)
+        return False
+
     async def _await_fill_or_retry(self, order_id: str, side: str, qty: float) -> bool:
         """
         Ждём исполнения текущего ордера. Если он отменён без фила — делаем до двух ретраев
@@ -602,10 +649,10 @@ class Trader:
                 log.warning(f"[EXT][LIM][TPSL][FAIL] {tr}")
 
             # --- Ждём закрытия позиции TP/SL и перезапускаем цикл с новым лимитником ---
-            log.info("[EXT][LIM][WAIT_FLAT] waiting position to be flat after TP/SL")
-            ok_flat = await self._wait_position_flat(timeout=3600.0, interval=0.5)
+            log.info("[EXT][LIM][WATCH] arming TP/SL watchdog (LastPrice cross)")
+            ok_flat = await self._watchdog_close_on_lastprice(actual_side, sl_final, tp_final, check_interval=0.25, max_wait=3600.0)
             if not ok_flat:
-                log.warning("[EXT][LIM][WAIT_FLAT][TIMEOUT] position still open; abort loop")
+                log.warning("[EXT][LIM][WATCH][TIMEOUT] position still open; abort loop")
                 return
 
             # На всякий случай снимем все оставшиеся ордера по символу
