@@ -399,7 +399,7 @@ class Trader:
             # Нормализация TP/SL относительно возможной базовой цены: пока используем цену входа
             sl_adj, tp_adj = self._fix_tpsl("Buy", entry_price, sl_ref, tp_ref, tick)
             log.info(f"[EXT][LIM][PLACE] Buy limit entry={self._fmt(entry_price)} tp={self._fmt(tp_adj)} sl={self._fmt(sl_adj)} qty={self._fmt(qty)}")
-            r = self.client.place_order(self.symbol, "Buy", qty, order_type="Limit", price=entry_price, timeInForce="GTC", positionIdx=0)
+            r = self.client.place_order(self.symbol, "Buy", qty, order_type="Limit", price=entry_price, timeInForce="GTC", position_idx=0)
         else:
             entry_price = prev_high - eps
             entry_price = self._round_step(entry_price, tick)  # для продажи вниз по тику
@@ -407,7 +407,7 @@ class Trader:
             sl_ref = sl if sl and sl > 0 else (entry_price + 2 * tick)
             sl_adj, tp_adj = self._fix_tpsl("Sell", entry_price, sl_ref, tp_ref, tick)
             log.info(f"[EXT][LIM][PLACE] Sell limit entry={self._fmt(entry_price)} tp={self._fmt(tp_adj)} sl={self._fmt(sl_adj)} qty={self._fmt(qty)}")
-            r = self.client.place_order(self.symbol, "Sell", qty, order_type="Limit", price=entry_price, timeInForce="GTC", positionIdx=0)
+            r = self.client.place_order(self.symbol, "Sell", qty, order_type="Limit", price=entry_price, timeInForce="GTC", position_idx=0)
 
         if r.get("retCode") != 0:
             log.error(f"[EXT][LIM][FAIL] place_order {r}")
