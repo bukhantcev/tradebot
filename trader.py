@@ -800,20 +800,23 @@ class Trader:
             log.exception(f"[EXT][LOGGER][EXC] {e}")
 
         # (3) Всегда форсируем flat перед новым входом
-        try:
-            ps, sz = self._position_side_and_size()
-            if ps and sz > 0:
-                log.info(f"[ENTER][FLAT] close existing {ps} size={self._fmt(sz)} before new entry")
-                await self.close_market(self._opposite(ps), sz)
-                for _ in range(20):
-                    p2, s2 = self._position_side_and_size()
-                    if not p2 or s2 <= 0:
-                        break
-                    await asyncio.sleep(0.25)
-            log.info("[EXT][CHECKPOINT] after flat enforcement")
-        except Exception as e:
-            log.exception(f"[EXT][FLAT][EXC] {e}")
-            log.info("[EXT][CHECKPOINT] after flat enforcement (with exception)")
+        if not use_ext:
+            try:
+                ps, sz = self._position_side_and_size()
+                if ps and sz > 0:
+                    log.info(f"[ENTER][FLAT] close existing {ps} size={self._fmt(sz)} before new entry")
+                    await self.close_market(self._opposite(ps), sz)
+                    for _ in range(20):
+                        p2, s2 = self._position_side_and_size()
+                        if not p2 or s2 <= 0:
+                            break
+                        await asyncio.sleep(0.25)
+                log.info("[EXT][CHECKPOINT] after flat enforcement")
+            except Exception as e:
+                log.exception(f"[EXT][FLAT][EXC] {e}")
+                log.info("[EXT][CHECKPOINT] after flat enforcement (with exception)")
+        else:
+            log.info("[ENTER][FLAT] skip in ext mode (only pending limits will be replaced)")
 
         try:
             log.info(f"[EXT][CHECKPOINT] before branch use_ext={use_ext}")
