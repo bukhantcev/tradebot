@@ -533,12 +533,12 @@ class Trader:
             if side == "Buy":
                 entry_price = self._ceil_step(cur_prev_low + eps, tick)
                 tp_ref = float(tp) if (tp and tp > 0) else (max(cur_prev_high - eps, entry_price + tick))
-                sl_ref = float(sl) if (sl and sl > 0) else (entry_price - 2 * tick)
+                sl_ref = float(sl) if (sl and sl > 0) else (entry_price - 1.5 * tick)
                 sl_adj, tp_adj = self._fix_tpsl("Buy", entry_price, sl_ref, tp_ref, tick)
             else:
                 entry_price = self._round_step(cur_prev_high - eps, tick)
                 tp_ref = float(tp) if (tp and tp > 0) else (min(cur_prev_low + eps, entry_price - tick))
-                sl_ref = float(sl) if (sl and sl > 0) else (entry_price + 2 * tick)
+                sl_ref = float(sl) if (sl and sl > 0) else (entry_price + 1.5 * tick)
                 sl_adj, tp_adj = self._fix_tpsl("Sell", entry_price, sl_ref, tp_ref, tick)
 
             log.info(f"[EXT][LIM][PLACE] {side} limit entry={self._fmt(entry_price)} tp={self._fmt(tp_adj)} sl={self._fmt(sl_adj)} qty={self._fmt(qty)}")
@@ -553,10 +553,16 @@ class Trader:
             f_loc = self.ensure_filters()
             min_qty = float(f_loc.get("minQty", 0.001))
             if attempt_qty < min_qty:
-                log.error(f"[EXT][LIM][SKIP] qty not affordable at entry={self._fmt(entry_price)} -> {self._fmt(attempt_qty)} < min {self._fmt(min_qty)}")
-                await asyncio.sleep(60)
-                cur_prev_high = cur_prev_low = 0.0
-                continue
+                # try to use min_qty if affordable
+                affordable = (self.available / (entry_price / max(self.leverage, 1.0))) >= min_qty
+                if affordable:
+                    attempt_qty = min_qty
+                    log.info(f"[EXT][LIM][FORCE] adjusted qty up to min {self._fmt(min_qty)}")
+                else:
+                    log.error(f"[EXT][LIM][SKIP] qty not affordable at entry={self._fmt(entry_price)} -> {self._fmt(attempt_qty)} < min {self._fmt(min_qty)}")
+                    await asyncio.sleep(60)
+                    cur_prev_high = cur_prev_low = 0.0
+                    continue
 
             # 4) Постановка лимитника с ретраями 110007
             active_oid = None
@@ -639,8 +645,9 @@ class Trader:
                 stop_loss=sl_final,
                 take_profit=tp_final,
                 tpslMode="Full",
-                tpTriggerBy="MarkPrice",
+                tpTriggerBy="LastPrice",
                 slTriggerBy="MarkPrice",
+                tpOrderType="Market",
                 positionIdx=0,
             )
             if tr.get("retCode") in (0, None):
@@ -1043,8 +1050,9 @@ class Trader:
             stop_loss=sl_adj,
             take_profit=tp_adj,
             tpslMode="Full",
-            tpTriggerBy="MarkPrice",
+            tpTriggerBy="LastPrice",
             slTriggerBy="MarkPrice",
+            tpOrderType="Market",
             positionIdx=0,
         )
         if r2.get("retCode") in (0, None):
