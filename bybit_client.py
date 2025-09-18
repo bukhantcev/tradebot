@@ -252,22 +252,52 @@ class BybitClient:
     def position_list(self, symbol: str):
         return self._request("GET", "/v5/position/list", params={"category": "linear", "symbol": symbol})
 
-    def trading_stop(self, symbol: str, side: str, stop_loss: Optional[float] = None, take_profit: Optional[float] = None, trailing_stop: Optional[float] = None):
+    def trading_stop(
+        self,
+        symbol: str,
+        side: Optional[str] = None,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        trailing_stop: Optional[float] = None,
+        tpslMode: Optional[str] = None,          # "Full" or "Partial"
+        positionIdx: Optional[int] = 0,          # 0 one-way, 1 long, 2 short (hedge)
+        slOrderType: Optional[str] = None,       # "Market" or "Limit" (Partial)
+        tpOrderType: Optional[str] = None,       # "Market" or "Limit" (Partial)
+        slTriggerBy: Optional[str] = None,       # "LastPrice" (default), "MarkPrice", "IndexPrice"
+        tpTriggerBy: Optional[str] = None,       # same as above
+    ):
         body = {
             "category": "linear",
             "symbol": symbol,
-            "positionIdx": 0,
-            "tpslMode": "Full",
+            "positionIdx": positionIdx if positionIdx is not None else 0,
         }
+        # Mode
+        if tpslMode is not None:
+            body["tpslMode"] = tpslMode
+        # Core TP/SL values
         if stop_loss is not None:
             body["stopLoss"] = str(stop_loss)
         if take_profit is not None:
             body["takeProfit"] = str(take_profit)
         if trailing_stop is not None:
             body["trailingStop"] = str(trailing_stop)
+        # Optional order/trigger types
+        if slOrderType is not None:
+            body["slOrderType"] = slOrderType
+        if tpOrderType is not None:
+            body["tpOrderType"] = tpOrderType
+        if slTriggerBy is not None:
+            body["slTriggerBy"] = slTriggerBy
+        if tpTriggerBy is not None:
+            body["tpTriggerBy"] = tpTriggerBy
+
         log.debug(f"[TPSL→] {body}")
         r = self._request("POST", "/v5/position/trading-stop", body=body)
-        log.debug(f"[TPSL←] retCode={r.get('retCode')} {str(r)[:400]}")
+        rc = r.get("retCode")
+        if rc and rc != 0:
+            log.warning(f"[TPSL←][ERR] rc={rc} msg={r.get('retMsg')} body={body}")
+        else:
+            log.debug(f"[TPSL←] retCode={rc} {str(r)[:400]}")
         return r
 
     # --- WS connections ---
