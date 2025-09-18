@@ -286,6 +286,21 @@ class BybitClient:
         if price is not None and (order_type or "").lower() != "market":
             price_str = self._fmt_price(symbol, float(price))
 
+        # >>> NEW: форматируем TP/SL по тик-­сайзу
+        tp_str = None
+        sl_str = None
+        if takeProfit is not None:
+            try:
+                tp_str = self._fmt_price(symbol, float(takeProfit))
+            except Exception:
+                tp_str = str(takeProfit)
+        if stopLoss is not None:
+            try:
+                sl_str = self._fmt_price(symbol, float(stopLoss))
+            except Exception:
+                sl_str = str(stopLoss)
+        # <<< NEW
+
         body = {
             "category": "linear",
             "symbol": symbol,
@@ -308,16 +323,16 @@ class BybitClient:
             body["timeInForce"] = timeInForce
 
         # TP/SL attach on order.create (v5 supports this)
-        if takeProfit is not None:
-            body["takeProfit"] = str(takeProfit)
+        if tp_str is not None:
+            body["takeProfit"] = tp_str
             if tpOrderType is not None:
                 body["tpOrderType"] = tpOrderType  # e.g., "Market"
             # дефолтный триггер — LastPrice (если не задан извне)
             if "tpTriggerBy" not in body:
                 body["tpTriggerBy"] = "LastPrice"
 
-        if stopLoss is not None:
-            body["stopLoss"] = str(stopLoss)
+        if sl_str is not None:
+            body["stopLoss"] = sl_str
             if slOrderType is not None:
                 body["slOrderType"] = slOrderType  # e.g., "Market"
             # дефолтный триггер — LastPrice (если не задан извне)
@@ -372,7 +387,7 @@ class BybitClient:
 
     def get_order_status(self, symbol: str, order_id: str) -> Dict[str, Any]:
         """
-        Возвращает {"status": str|None, "cumExecQty": float, "qty": float}
+        Возвращает {\"status\": str|None, \"cumExecQty\": float, \"qty\": float}
         Сначала смотрит realtime (открытые), затем history (закрытые/отменённые).
         """
         try:
@@ -416,6 +431,21 @@ class BybitClient:
         slTriggerBy: Optional[str] = None, # "LastPrice" (default), "MarkPrice", "IndexPrice"
         tpTriggerBy: Optional[str] = None, # same
     ):
+        # >>> NEW: форматируем цены по тик-сайзу
+        sl_str = None
+        tp_str = None
+        if stop_loss is not None:
+            try:
+                sl_str = self._fmt_price(symbol, float(stop_loss))
+            except Exception:
+                sl_str = str(stop_loss)
+        if take_profit is not None:
+            try:
+                tp_str = self._fmt_price(symbol, float(take_profit))
+            except Exception:
+                tp_str = str(take_profit)
+        # <<< NEW
+
         body = {
             "category": "linear",
             "symbol": symbol,
@@ -423,10 +453,10 @@ class BybitClient:
         }
         if tpslMode is not None:
             body["tpslMode"] = tpslMode
-        if stop_loss is not None:
-            body["stopLoss"] = str(stop_loss)
-        if take_profit is not None:
-            body["takeProfit"] = str(take_profit)
+        if sl_str is not None:
+            body["stopLoss"] = sl_str
+        if tp_str is not None:
+            body["takeProfit"] = tp_str
         if trailing_stop is not None:
             body["trailingStop"] = str(trailing_stop)
         if slOrderType is not None:

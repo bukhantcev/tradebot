@@ -7,6 +7,7 @@ import asyncio
 from config import SYMBOL, RISK_PCT
 from features import load_recent_1m, compute_features, last_feature_row
 from llm import ask_model
+import math
 
 log = logging.getLogger("STRATEGY")
 
@@ -53,6 +54,14 @@ class StrategyEngine:
         self._last_trade_time = 0.0
         self._notifier = notifier
 
+    def _to_tick_down(self, price: float) -> float:
+        t = self.tick_size or 0.1
+        return math.floor(price / t) * t
+
+    def _to_tick_up(self, price: float) -> float:
+        t = self.tick_size or 0.1
+        return math.ceil(price / t) * t
+
     def set_notifier(self, notifier: Any):
         self._notifier = notifier
 
@@ -92,24 +101,56 @@ class StrategyEngine:
             except Exception:
                 pass
 
-        # 4) Вызов LLM (запрос/ответ логируются в llm.py как [LLM→]/[LLM←])
+        # 4) Вызов LLM (добавлены подробные DEBUG-логи на каждом этапе)
         ctx = {
             "symbol": self.symbol,
             "risk_pct": self.risk_pct,
         }
-        decision = await ask_model(
-            features={
-                "ts_ms": f0["ts_ms"],
-                "close": f0["close"],
-                "ema_fast": f0["ema_fast"],
-                "ema_slow": f0["ema_slow"],
-                "atr14": f0["atr14"],
-                "roc1": f0["roc1"],
-                "spread_proxy": f0["spread_proxy"],
-                "vol_roll": f0["vol_roll"],
-            },
-            ctx=ctx,
+
+        # Подготовим компактные строки для логов
+        feats_dbg = (
+            f"ts={int(f0.get('ts_ms', 0))} "
+            f"c={float(f0.get('close', 0)):.2f} "
+            f"emaF={float(f0.get('ema_fast', 0)):.2f} "
+            f"emaS={float(f0.get('ema_slow', 0)):.2f} "
+            f"atr14={float(f0.get('atr14', 0)):.2f} "
+            f"roc1={float(f0.get('roc1', 0)):.4f} "
+            f"spr={float(f0.get('spread_proxy', 0)):.4f} "
+            f"vol={float(f0.get('vol_roll', 0)):.5f}"
         )
+        log.debug(f"[LLM][PREP] ctx={ctx} | feats=({feats_dbg})")
+
+        t0 = time.time()
+        try:
+            decision = await ask_model(
+                features={
+                    "ts_ms": f0["ts_ms"],
+                    "close": f0["close"],
+                    "ema_fast": f0["ema_fast"],
+                    "ema_slow": f0["ema_slow"],
+                    "atr14": f0["atr14"],
+                    "roc1": f0["roc1"],
+                    "spread_proxy": f0["spread_proxy"],
+                    "vol_roll": f0["vol_roll"],
+                },
+                ctx=ctx,
+            )
+            dt_ms = (time.time() - t0) * 1000.0
+            # компактный ответ в лог (не более ~300 символов)
+            resp_str = str(decision)
+            if len(resp_str) > 300:
+                resp_str = resp_str[:300] + "…"
+            log.debug(f"[LLM][OK] {dt_ms:.1f} ms | resp={resp_str}")
+        except Exception as e:
+            dt_ms = (time.time() - t0) * 1000.0
+            log.exception(f"[LLM][ERR] {dt_ms:.1f} ms | {e}")
+            # Фоллбек: удерживаем позицию, но сигнал формируем как hold с причиной
+            if self._notifier:
+                try:
+                    await self._notifier.notify(f"⚠️ ИИ ошибка: {e}")
+                except Exception:
+                    pass
+            return Signal(None, f"llm_error: {e}", None, None, float(f0["atr14"]), int(f0["ts_ms"]), prev_high, prev_low, prev_open, prev_close)
 
         action_raw = str(decision.get("decision", "Hold"))
         reason = str(decision.get("reason", "") or "").strip()
@@ -124,11 +165,11 @@ class StrategyEngine:
             log.debug(f"[SIGNAL][HL] prevH={prev_high} prevL={prev_low}")
             return Signal(None, "hold", None, None, float(f0["atr14"]), int(f0["ts_ms"]), prev_high, prev_low, prev_open, prev_close)
 
-        # 5) Построение SL/TP из ATR
+        # 5) Построение SL/TP относительно тела предыдущей свечи,
+        #    + защита, чтобы TP гарантированно был по правильную сторону от LastPrice.
         close = float(f0["close"])
         atr = max(float(f0["atr14"]), 1e-8)
         sl_mult = float(self.sl_mult)
-        tp_vs_sl = float(self.tp_vs_sl)
 
         body_high = max(prev_open, prev_close)
         body_low = min(prev_open, prev_close)
@@ -137,18 +178,18 @@ class StrategyEngine:
 
         if action == "Buy":
             sl = close - sl_mult * atr
-            tp = body_high - tp_nudges
-            # Ensure TP is strictly higher than LastPrice (close)
+            desired_tp = max(body_high - tp_nudges, close + tick)
+            tp = self._to_tick_up(desired_tp)
             if tp <= close:
-                tp = close + tick
-            log.info(f"[LLM][TPSL][MARK] Buy TP adjusted for LastPrice trigger: sl={sl:.2f} tp={tp:.2f}")
+                tp = self._to_tick_up(close + tick)
+            log.info(f"[LLM][TPSL][MARK] Buy TP adjusted for LastPrice: sl={sl:.2f} tp={tp:.2f}")
         else:  # Sell
             sl = close + sl_mult * atr
-            tp = body_low + tp_nudges
-            # Ensure TP is strictly lower than LastPrice (close)
+            desired_tp = min(body_low + tp_nudges, close - tick)
+            tp = self._to_tick_down(desired_tp)
             if tp >= close:
-                tp = close - tick
-            log.info(f"[LLM][TPSL][MARK] Sell TP adjusted for LastPrice trigger: sl={sl:.2f} tp={tp:.2f}")
+                tp = self._to_tick_down(close - tick)
+            log.info(f"[LLM][TPSL][MARK] Sell TP adjusted for LastPrice: sl={sl:.2f} tp={tp:.2f}")
 
         log.info(f"[DECIDE] {action} | sl={sl:.2f} tp={tp:.2f} • {reason}")
         if self._notifier:
