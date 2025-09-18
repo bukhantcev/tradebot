@@ -28,6 +28,7 @@ log = logging.getLogger("MAIN")
 
 
 async def strategy_loop(strat: StrategyEngine, trader: Trader, poll_sec: float = 1.0):
+    log.debug("[STRAT_LOOP][START] polling=%.2fs", poll_sec)
     last_ts: Optional[int] = None
     while True:
         try:
@@ -56,18 +57,22 @@ async def strategy_loop(strat: StrategyEngine, trader: Trader, poll_sec: float =
                             "prev_high": sig.prev_high,
                             "prev_low": sig.prev_low,
                         }
-                        await trader.open_market(sig.side, payload)
+                        # Запускаем вход как фоновую задачу, чтобы не блокировать обработку следующих свечей
+                        asyncio.create_task(
+                            trader.open_market(sig.side, payload),
+                            name=f"trade_enter_{ts_closed}"
+                        )
                 else:
                     log.debug(f"[CANDLE][WAIT] no new closed bar (closed_ts={ts_closed})")
             else:
-                log.debug("[CANDLE][WAIT] insufficient bars (<2)")
+                log.info("[CANDLE][WAIT] need >=2 bars; got %s", 0 if df is None else len(df))
 
             await asyncio.sleep(poll_sec)
         except asyncio.CancelledError:
             break
         except Exception as e:
-            log.error(f"[STRAT_LOOP] {e}", exc_info=True)
-            await asyncio.sleep(1.0)
+            log.error("[STRAT_LOOP][ERR] %s", e, exc_info=True)
+            await asyncio.sleep(0.5)
 
 
 async def main():
