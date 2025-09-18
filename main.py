@@ -72,9 +72,10 @@ async def main():
     POLL_SEC = float(os.getenv("STRAT_POLL_SEC", "1.0"))
 
     client = BybitClient()
-    bot = TgBot(TG_TOKEN, int(TG_CHAT) if TG_CHAT else None)
-    trader = Trader(client=client, notifier=bot)
+    trader = Trader(client=client, notifier=None)
+    bot = TgBot(TG_TOKEN, int(TG_CHAT) if TG_CHAT else None, trader=trader)
     strat = StrategyEngine(notifier=bot)
+    trader.notifier = bot
     data = DataManager()
 
     await bot.start_background()

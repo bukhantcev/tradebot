@@ -3,6 +3,8 @@ import math
 import logging
 from typing import Optional, Dict, Any
 import asyncio
+import os
+import time
 from config import SYMBOL, RISK_PCT, LEVERAGE
 from bybit_client import BybitClient
 
@@ -39,6 +41,8 @@ class Trader:
         # последняя известная equity (USDT)
         self.equity: float = 0.0
         self.available: float = 0.0  # доступный баланс для маржи (USDT)
+        # режим входа по экстремам предыдущей закрытой свечи (выкл. по умолчанию)
+        self.entry_extremes: bool = os.getenv("ENTRY_EXTREMES", "0") == "1"
 
     # ---------- УТИЛЫ ----------
 
@@ -210,7 +214,109 @@ class Trader:
             await asyncio.sleep(interval)
         return False
 
+    # ---------- УСЛОВНЫЕ ОРДЕРА ПО ЭКСТРЕМАМ ----------
+
+    def _place_conditional(self, side: str, trigger_price: float, qty: float, trigger_direction: int) -> Dict[str, Any]:
+        """
+        Ставит условный маркет-ордер (IOC) по достижению trigger_price.
+        trigger_direction: 1 = триггер при росте до цены, 2 = при падении до цены.
+        Возвращает ответ API.
+        """
+        body = {
+            "category": "linear",
+            "symbol": self.symbol,
+            "side": side,
+            "orderType": "Market",
+            "qty": self._fmt(qty),
+            "timeInForce": "IOC",
+            "positionIdx": 0,
+            "triggerPrice": self._fmt(trigger_price),
+            "triggerDirection": trigger_direction,
+        }
+        # Уникальный orderLinkId для удобной отмены/отслеживания
+        body["orderLinkId"] = f"ext-{int(time.time()*1000)}-{side[0].lower()}"
+        return self.client._request("POST", "/v5/order/create", body=body)
+
+    def _cancel_order(self, order_id: Optional[str] = None, order_link_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Отмена одного активного/условного ордера.
+        """
+        body = {
+            "category": "linear",
+            "symbol": self.symbol,
+        }
+        if order_id:
+            body["orderId"] = order_id
+        if order_link_id:
+            body["orderLinkId"] = order_link_id
+        return self.client._request("POST", "/v5/order/cancel", body=body)
+
     # ---------- ОРДЕРА ----------
+
+    async def _enter_by_extremes(self, side: str, prev_high: float, prev_low: float, qty: float, sl_r: float, tp_r: float):
+        """
+        Ставит две условные заявки:
+          • Sell при достижении prev_high (triggerDirection=1),
+          • Buy при достижении prev_low (triggerDirection=2).
+        Как только одна исполняется — вторая отменяется. Затем ставим TP/SL через trading-stop.
+        """
+        # sanity
+        if qty <= 0 or prev_high <= 0 or prev_low <= 0:
+            log.info("[COND][SKIP] bad params")
+            return
+
+        # 1) Ставим оба условных
+        r_sell = self._place_conditional("Sell", prev_high, qty, trigger_direction=1)
+        r_buy  = self._place_conditional("Buy",  prev_low,  qty, trigger_direction=2)
+
+        oid_sell = r_sell.get("result", {}).get("orderId") if r_sell.get("retCode") == 0 else None
+        oid_buy  = r_buy.get("result", {}).get("orderId")  if r_buy.get("retCode") == 0 else None
+
+        if r_sell.get("retCode") != 0:
+            log.warning(f"[COND][ERR] sell {r_sell}")
+        if r_buy.get("retCode") != 0:
+            log.warning(f"[COND][ERR] buy {r_buy}")
+
+        if self.notifier:
+            try:
+                await self.notifier.notify(f"⏳ Cond placed: Sell@{self._fmt(prev_high)} / Buy@{self._fmt(prev_low)} qty={self._fmt(qty)}")
+            except Exception:
+                pass
+
+        # 2) Ждём, пока появится позиция (значит одна из заявок сработала)
+        ok = await self._wait_position_open(timeout=300.0, interval=0.5)
+        if not ok:
+            log.warning("[COND][TIMEOUT] no fill within 5m — cancel both")
+            if oid_sell:
+                self._cancel_order(order_id=oid_sell)
+            if oid_buy:
+                self._cancel_order(order_id=oid_buy)
+            return
+
+        # 3) Позиция появилась — снимаем вторую заявку (если ещё активна)
+        if oid_sell:
+            self._cancel_order(order_id=oid_sell)
+        if oid_buy:
+            self._cancel_order(order_id=oid_buy)
+
+        # 4) Ставим TP/SL для открытой позиции
+        r2 = self.client.trading_stop(
+            self.symbol,
+            side=side,
+            stop_loss=sl_r,
+            take_profit=tp_r,
+            tpslMode="Full",
+            positionIdx=0,
+        )
+        if r2.get("retCode") in (0, None):
+            log.info(f"[TPSL] sl={self._fmt(sl_r)} tp={self._fmt(tp_r)} OK")
+            if self.notifier:
+                try:
+                    await self.notifier.notify(f"🎯 TP/SL set: SL {self._fmt(sl_r)} / TP {self._fmt(tp_r)}")
+                except Exception:
+                    pass
+        else:
+            log.warning(f"[TPSL][FAIL] {r2}")
 
     async def open_market(self, side: str, signal: Dict[str, Any]):
         """
@@ -246,6 +352,14 @@ class Trader:
         sl_r = self._ceil_step(sl, tick) if side == "Buy" else self._round_step(sl, tick)
         tp_r = self._round_step(tp, tick) if side == "Buy" else self._ceil_step(tp, tick)
         sl_r, tp_r = self._fix_tpsl(side, price, sl_r, tp_r, tick)
+
+        # Режим входа по экстремам предыдущей закрытой свечи (включается флагом ENTRY_EXTREMES=1)
+        prev_high = signal.get("prev_high")
+        prev_low = signal.get("prev_low")
+        if self.entry_extremes and prev_high and prev_low:
+            log.info(f"[COND][ENTER] use extremes: prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} qty={self._fmt(qty)}")
+            await self._enter_by_extremes(side, float(prev_high), float(prev_low), qty, sl_r, tp_r)
+            return
 
         # Маркет-вход: сначала ордер БЕЗ TP/SL, затем TP/SL через trading-stop (устраняем 30208)
         log.info(f"[ENTER] {side} qty={self._fmt(qty)}")

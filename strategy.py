@@ -19,6 +19,8 @@ class Signal:
     tp: Optional[float]
     atr: Optional[float]
     ts_ms: Optional[int]
+    prev_high: Optional[float] = None
+    prev_low: Optional[float] = None
 
 
 class StrategyEngine:
@@ -56,20 +58,24 @@ class StrategyEngine:
         if len(df) < 60:
             # короткий факт-лог — без шума
             log.info("[SKIP] warmup (<60 closed 1m bars)")
-            return Signal(None, "warmup", None, None, None, None)
+            return Signal(None, "warmup", None, None, None, None, None, None)
+
+        # Экстремы предыдущей ЗАКРЫТОЙ 1m свечи
+        prev_high = float(df.iloc[-1]["high"])
+        prev_low = float(df.iloc[-1]["low"])
 
         # 2) Признаки
         dff = compute_features(df)
         f0: Dict[str, Any] = last_feature_row(dff)
         if not f0:
-            return Signal(None, "no_features", None, None, None, None)
+            return Signal(None, "no_features", None, None, None, None, prev_high, prev_low)
 
         # Ключевой лог «сигнал/срез фич» — компактно
-        log.info(f"[SIGNAL] c={f0['close']:.2f} emaF={f0['ema_fast']:.2f} emaS={f0['ema_slow']:.2f} atr={f0['atr14']:.2f}")
+        log.info(f"[SIGNAL] c={f0['close']:.2f} emaF={f0['ema_fast']:.2f} emaS={f0['ema_slow']:.2f} atr={f0['atr14']:.2f} prevH={prev_high:.2f} prevL={prev_low:.2f}")
         if self._notifier:
             try:
                 await self._notifier.notify(
-                    f"📊 Signal\nc={f0['close']:.2f}  emaF={f0['ema_fast']:.2f}  emaS={f0['ema_slow']:.2f}  atr={f0['atr14']:.2f}"
+                    f"📊 Signal\nc={f0['close']:.2f}  emaF={f0['ema_fast']:.2f}  emaS={f0['ema_slow']:.2f}  atr={f0['atr14']:.2f}\nprevH {prev_high:.2f} / prevL {prev_low:.2f}"
                 )
             except Exception:
                 pass
@@ -77,7 +83,7 @@ class StrategyEngine:
         # 3) Анти-спам: общий кулдаун между входами
         now = time.time()
         if now - self._last_trade_time < self.cooldown_sec:
-            return Signal(None, "cooldown", None, None, float(f0["atr14"]), int(f0["ts_ms"]))
+            return Signal(None, "cooldown", None, None, float(f0["atr14"]), int(f0["ts_ms"]), prev_high, prev_low)
 
         # 4) Вызов LLM (запрос/ответ логируются в llm.py как [LLM→]/[LLM←])
         ctx = {
@@ -108,7 +114,7 @@ class StrategyEngine:
                     await self._notifier.notify(f"🤖 LLM: Hold • {reason or 'no reason'}")
                 except Exception:
                     pass
-            return Signal(None, "hold", None, None, float(f0["atr14"]), int(f0["ts_ms"]))
+            return Signal(None, "hold", None, None, float(f0["atr14"]), int(f0["ts_ms"]), prev_high, prev_low)
 
         # 5) Построение SL/TP из ATR
         close = float(f0["close"])
@@ -141,4 +147,6 @@ class StrategyEngine:
             tp=float(tp),
             atr=float(atr),
             ts_ms=int(f0["ts_ms"]),
+            prev_high=prev_high,
+            prev_low=prev_low,
         )
