@@ -45,6 +45,11 @@ class Trader:
         self.available: float = 0.0  # доступный баланс для маржи (USDT)
         # режим входа по экстремам предыдущей закрытой свечи (выкл. по умолчанию)
         self.entry_extremes: bool = os.getenv("ENTRY_EXTREMES", "0") == "1"
+        # сузить уровни на N тиков внутрь (экстрем-режим)
+        try:
+            self.ext_eps_ticks = int(os.getenv("EXT_EPS_TICKS", "2"))
+        except Exception:
+            self.ext_eps_ticks = 2
         # таск минутного логгера
         self._minute_task = None
     def _round_down_qty(self, qty: float) -> float:
@@ -351,132 +356,166 @@ class Trader:
     # ---------- ЖИВОЕ СОПРОВОЖДЕНИЕ ПО ЭКСТРЕМАМ (БЕЗ ОТЛОЖЕК) ----------
     async def _follow_extremes(self, side: str, prev_high: float, prev_low: float, qty: float):
         """
-        НЕ ставим отложки. Следим за ценой:
-          • side == "Sell": ждём достижения текущего high => Market Sell; далее ждём текущий low => Market Buy (фиксация)
-          • side == "Buy":  ждём достижения текущего low  => Market Buy;  далее ждём текущий high => Market Sell (фиксация)
-        Экстремы текущей незакрытой 1m-свечи обновляются на каждом тике.
+        НЕ ставим отложки. Следим за ценой в непрерывном цикле:
+          • side == "Sell": при достижении текущего high-ε ⇒ Market Sell; далее при достижении текущего low+ε ⇒ Market Buy (фиксация), и снова цикл.
+          • side == "Buy":  при достижении текущего low+ε  ⇒ Market Buy;  далее при достижении текущего high-ε ⇒ Market Sell (фиксация), и снова цикл.
+        Экстремы текущей незакрытой 1m-свечи обновляются на каждом тике. ε — смещение внутрь уровней на EXT_EPS_TICKS * tickSize.
+        Сигнал LLM задаёт только вектор (Buy/Sell). Цикл продолжается, пока включён экстрем-режим.
         """
         if qty <= 0 or prev_high <= 0 or prev_low <= 0:
             log.info("[EXT][SKIP] bad params")
             return
-        log.info(f"[EXT][START] side={side} init_prevH={self._fmt(prev_high)} init_prevL={self._fmt(prev_low)}")
 
-        # Инициализация динамических уровней экстремов текущей «живой» свечи
-        cur_high = float(prev_high)
-        cur_low = float(prev_low)
+        # базовые величины
+        f = self.ensure_filters()
+        tick = float(f.get("tickSize", 0.1) or 0.1)
+        eps = max(tick * max(1, int(self.ext_eps_ticks)), tick)  # минимум 1 тик внутрь
 
-        # От чего стартуем: точка входа и выхода
-        want_entry_on = "high" if side == "Sell" else "low"
-        want_exit_on = "low" if side == "Sell" else "high"
+        log.info(f"[EXT][START] vec={side} prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} qty={self._fmt(qty)} eps={self._fmt(eps)}")
 
-        # Отметим границу текущей минуты, чтобы при переключении минуты продолжить обновлять экстремы
-        cur_minute = int(time.time() // 60)
-        last_minute_logged = cur_minute
-
-        # 1) Ожидание входа
-        log.info(f"[EXT][WAIT_ENTER] side={side} qty={self._fmt(qty)} startH={self._fmt(cur_high)} startL={self._fmt(cur_low)}")
+        # Бесконечный цикл: вход -> выход -> вход ...
         while True:
-            px = self._last_price()
-            if px <= 0:
-                await asyncio.sleep(0.2)
-                continue
+            # если режим выключили снаружи — выходим
+            if not self.entry_extremes:
+                log.info("[EXT][STOP] flag off")
+                return
 
-            # Обновляем экстремы «живой» свечи (обновляются внутри минуты)
-            m = int(time.time() // 60)
-            if m != cur_minute:
-                cur_minute = m
-                cur_high = px
-                cur_low = px
-            else:
-                if px > cur_high:
+            # --- Ожидание входа ---
+            # Инициализация «живых» экстремов от переданных prev_high/low (сужаем внутрь на eps)
+            cur_high = float(prev_high)
+            cur_low = float(prev_low)
+            want_entry_on = "high" if side == "Sell" else "low"
+            want_exit_on = "low" if side == "Sell" else "high"
+
+            cur_minute = int(time.time() // 60)
+            last_minute_logged = cur_minute
+
+            log.info(f"[EXT][WAIT_ENTER] vec={side} qty={self._fmt(qty)} startH={self._fmt(cur_high)} startL={self._fmt(cur_low)} eps={self._fmt(eps)} want={want_entry_on}")
+
+            px = 0.0
+            while True:
+                px = self._last_price()
+                if px <= 0:
+                    await asyncio.sleep(0.2)
+                    continue
+
+                # обновляем «живые» экстремы в рамках минуты
+                m = int(time.time() // 60)
+                if m != cur_minute:
+                    cur_minute = m
                     cur_high = px
-                if px < cur_low:
                     cur_low = px
+                else:
+                    if px > cur_high:
+                        cur_high = px
+                    if px < cur_low:
+                        cur_low = px
 
-            # ЛОГ КАЖДУЮ МИНУТУ: экстремы прошедшей свечи и текущей «живой»
-            if m != last_minute_logged:
-                last_minute_logged = m
-                log.info(f"[EXT][MINUTE][ENTER] prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} curH={self._fmt(cur_high)} curL={self._fmt(cur_low)} px={self._fmt(px)} want_entry_on={want_entry_on}")
+                # минутный лог
+                if m != last_minute_logged:
+                    last_minute_logged = m
+                    log.info(f"[EXT][MINUTE][ENTER] curH={self._fmt(cur_high)} curL={self._fmt(cur_low)} px={self._fmt(px)} want={want_entry_on} eps={self._fmt(eps)}")
 
-            # Нужное условие на вход
-            if want_entry_on == "high" and px >= cur_high:
-                # вход Sell по рынку
-                log.info(f"[EXT][ENTER] Sell @ {self._fmt(px)} (cur_high={self._fmt(cur_high)})")
-                r = self.client.place_order(self.symbol, "Sell", qty, order_type="Market", preferSmart=True)
-                if r.get("retCode") != 0:
-                    log.error(f"[EXT][ENTER][FAIL] {r}")
-                    return
-                order_id = r.get("result", {}).get("orderId", "")
-                if not await self._await_fill_or_retry(order_id, "Sell", qty):
-                    log.warning("[EXT][ENTER][ABORT] no fill")
-                    return
-                break
+                # условия входа (сузим уровни внутрь)
+                if want_entry_on == "high" and px >= (cur_high - eps):
+                    log.info(f"[EXT][ENTER] Sell @ {self._fmt(px)} (trigger≥{self._fmt(cur_high - eps)})")
+                    r = self.client.place_order(self.symbol, "Sell", qty, order_type="Market", preferSmart=True)
+                    if r.get("retCode") != 0:
+                        log.error(f"[EXT][ENTER][FAIL] {r}")
+                        return
+                    oid = r.get("result", {}).get("orderId", "")
+                    if not await self._await_fill_or_retry(oid, "Sell", qty):
+                        log.warning("[EXT][ENTER][ABORT] no fill")
+                        return
+                    # страховой SL сразу после входа — за внешний уровень
+                    try:
+                        sl_price = cur_high + 2 * tick
+                        tr = self.client.trading_stop(self.symbol, side="Sell", stop_loss=float(sl_price), tpslMode="Full", positionIdx=0)
+                        if tr.get("retCode") in (0, None):
+                            log.info(f"[EXT][SL] set {self._fmt(sl_price)} OK")
+                        else:
+                            log.warning(f"[EXT][SL][FAIL] {tr}")
+                    except Exception as e:
+                        log.warning(f"[EXT][SL][EXC] {e}")
+                    break
 
-            if want_entry_on == "low" and px <= cur_low:
-                # вход Buy по рынку
-                log.info(f"[EXT][ENTER] Buy @ {self._fmt(px)} (cur_low={self._fmt(cur_low)})")
-                r = self.client.place_order(self.symbol, "Buy", qty, order_type="Market", preferSmart=True)
-                if r.get("retCode") != 0:
-                    log.error(f"[EXT][ENTER][FAIL] {r}")
-                    return
-                order_id = r.get("result", {}).get("orderId", "")
-                if not await self._await_fill_or_retry(order_id, "Buy", qty):
-                    log.warning("[EXT][ENTER][ABORT] no fill")
-                    return
-                break
+                if want_entry_on == "low" and px <= (cur_low + eps):
+                    log.info(f"[EXT][ENTER] Buy @ {self._fmt(px)} (trigger≤{self._fmt(cur_low + eps)})")
+                    r = self.client.place_order(self.symbol, "Buy", qty, order_type="Market", preferSmart=True)
+                    if r.get("retCode") != 0:
+                        log.error(f"[EXT][ENTER][FAIL] {r}")
+                        return
+                    oid = r.get("result", {}).get("orderId", "")
+                    if not await self._await_fill_or_retry(oid, "Buy", qty):
+                        log.warning("[EXT][ENTER][ABORT] no fill")
+                        return
+                    # страховой SL сразу после входа — за внешний уровень
+                    try:
+                        sl_price = cur_low - 2 * tick
+                        tr = self.client.trading_stop(self.symbol, side="Buy", stop_loss=float(sl_price), tpslMode="Full", positionIdx=0)
+                        if tr.get("retCode") in (0, None):
+                            log.info(f"[EXT][SL] set {self._fmt(sl_price)} OK")
+                        else:
+                            log.warning(f"[EXT][SL][FAIL] {tr}")
+                    except Exception as e:
+                        log.warning(f"[EXT][SL][EXC] {e}")
+                    break
 
-            await asyncio.sleep(0.15)
+                await asyncio.sleep(0.12)
 
-        # 2) Ожидание выхода (фиксации) по противоположному экстремуму в той же логике
-        # Обнулим экстремы от момента входа, чтобы ловить новые high/low после входа
-        cur_high = px
-        cur_low = px
-        cur_minute = int(time.time() // 60)
+            # --- Ожидание выхода (фиксации) ---
+            # После входа обнулим экстремы от текущей цены и начнём следить заново
+            cur_high = px
+            cur_low = px
+            cur_minute = int(time.time() // 60)
+            last_minute_logged = cur_minute
+            side_exit = self._opposite(side)
+            log.info(f"[EXT][WAIT_EXIT] want={want_exit_on} sideExit={side_exit} eps={self._fmt(eps)}")
 
-        side_exit = self._opposite(side)
-        log.info(f"[EXT][WAIT_EXIT] want={want_exit_on} sideExit={side_exit}")
-        last_minute_logged = cur_minute
-        while True:
-            # Если позиция закрыта внешне — выходим из лупа
-            ps, sz = self._position_side_and_size()
-            if not ps or sz <= 0:
-                log.info("[EXT][DONE] position closed externally")
-                return
+            while True:
+                # если позицию закрыли снаружи — начинаем новый оборот цикла без входа (ждать новый вход)
+                ps, sz = self._position_side_and_size()
+                if not ps or sz <= 0:
+                    log.info("[EXT][DONE] position closed externally — restart loop")
+                    break
 
-            px = self._last_price()
-            if px <= 0:
-                await asyncio.sleep(0.2)
-                continue
+                px = self._last_price()
+                if px <= 0:
+                    await asyncio.sleep(0.2)
+                    continue
 
-            m = int(time.time() // 60)
-            if m != cur_minute:
-                cur_minute = m
-                cur_high = px
-                cur_low = px
-            else:
-                if px > cur_high:
+                m = int(time.time() // 60)
+                if m != cur_minute:
+                    cur_minute = m
                     cur_high = px
-                if px < cur_low:
                     cur_low = px
+                else:
+                    if px > cur_high:
+                        cur_high = px
+                    if px < cur_low:
+                        cur_low = px
 
-            # ЛОГ КАЖДУЮ МИНУТУ: экстремы прошедшей свечи и текущей «живой»
-            if m != last_minute_logged:
-                last_minute_logged = m
-                log.info(f"[EXT][MINUTE][EXIT] prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} curH={self._fmt(cur_high)} curL={self._fmt(cur_low)} px={self._fmt(px)} want_exit_on={want_exit_on} sideExit={side_exit}")
+                # минутный лог
+                if m != last_minute_logged:
+                    last_minute_logged = m
+                    log.info(f"[EXT][MINUTE][EXIT] curH={self._fmt(cur_high)} curL={self._fmt(cur_low)} px={self._fmt(px)} want={want_exit_on} eps={self._fmt(eps)}")
 
-            if want_exit_on == "low" and px <= cur_low:
-                # фиксация по рынку (Buy закрывает Sell)
-                log.info(f"[EXT][EXIT] Buy @ {self._fmt(px)} (cur_low={self._fmt(cur_low)})")
-                await self.close_market("Buy", sz)
-                return
+                # условия выхода (сузим уровни внутрь)
+                if want_exit_on == "low" and px <= (cur_low + eps):
+                    log.info(f"[EXT][EXIT] Buy @ {self._fmt(px)} (trigger≤{self._fmt(cur_low + eps)})")
+                    await self.close_market("Buy", sz)
+                    break
 
-            if want_exit_on == "high" and px >= cur_high:
-                # фиксация по рынку (Sell закрывает Buy)
-                log.info(f"[EXT][EXIT] Sell @ {self._fmt(px)} (cur_high={self._fmt(cur_high)})")
-                await self.close_market("Sell", sz)
-                return
+                if want_exit_on == "high" and px >= (cur_high - eps):
+                    log.info(f"[EXT][EXIT] Sell @ {self._fmt(px)} (trigger≥{self._fmt(cur_high - eps)})")
+                    await self.close_market("Sell", sz)
+                    break
 
-            await asyncio.sleep(0.15)
+                await asyncio.sleep(0.12)
+
+            # подготовим уровни следующего оборота
+            prev_high = cur_high
+            prev_low = cur_low
 
     # NOTE: ниже — старая ветка с условными заявками; для live-follow она не используется.
     def _place_conditional(self, side: str, trigger_price: float, qty: float, trigger_direction: int) -> Dict[str, Any]:
