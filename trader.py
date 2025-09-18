@@ -147,6 +147,30 @@ class Trader:
             return 0.0
         return qty
 
+    async def _wait_position_open(self, timeout: float = 2.0, interval: float = 0.2) -> bool:
+        """
+        Короткое ожидание появления позиции (size&gt;0), чтобы fallback trading-stop не падал rc=10001.
+        Возвращает True, если позиция открылась в течение timeout.
+        """
+        import time
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                pl = self.client.position_list(self.symbol)
+                lst = pl.get("result", {}).get("list", [])
+                if lst:
+                    size_str = lst[0].get("size") or lst[0].get("positionValue") or ""
+                    try:
+                        size = float(size_str) if size_str != "" else 0.0
+                    except Exception:
+                        size = 0.0
+                    if size > 0:
+                        return True
+            except Exception:
+                pass
+            await asyncio.sleep(interval)
+        return False
+
     # ---------- ОРДЕРА ----------
 
     async def open_market(self, side: str, signal: Dict[str, Any]):
@@ -177,9 +201,28 @@ class Trader:
             log.info("[ENTER][SKIP] qty=0")
             return
 
-        # Маркет-вход
+        # Подготовим округлённые SL/TP заранее (для передачи в order/create)
+        f = self.ensure_filters()
+        tick = f["tickSize"]
+        sl_r = self._ceil_step(sl, tick) if side == "Buy" else self._round_step(sl, tick)
+        tp_r = self._round_step(tp, tick) if side == "Buy" else self._ceil_step(tp, tick)
+
+        # Маркет-вход: сначала пробуем прикрепить TP/SL прямо в order/create (tpslMode=Full)
         log.info(f"[ENTER] {side} qty={self._fmt(qty)}")
-        r = self.client.place_order(self.symbol, side, qty)
+        try:
+            r = self.client.place_order(
+                self.symbol,
+                side,
+                qty,
+                takeProfit=self._fmt(tp_r),
+                stopLoss=self._fmt(sl_r),
+                tpslMode="Full",
+                positionIdx=0,
+            )
+        except TypeError:
+            # Старый клиент без параметров TP/SL — создаём без них
+            r = self.client.place_order(self.symbol, side, qty)
+
         rc = r.get("retCode")
         if rc == 0:
             order_id = r.get("result", {}).get("orderId", "")
@@ -197,7 +240,18 @@ class Trader:
                 log.error(f"[ORDER][FAIL] rc=110007 (no balance), qty too small after retry")
                 return
             log.info(f"[ENTER][RETRY] reduce qty -> {self._fmt(qty2)}")
-            r = self.client.place_order(self.symbol, side, qty2)
+            try:
+                r = self.client.place_order(
+                    self.symbol,
+                    side,
+                    qty2,
+                    takeProfit=self._fmt(tp_r),
+                    stopLoss=self._fmt(sl_r),
+                    tpslMode="Full",
+                    positionIdx=0,
+                )
+            except TypeError:
+                r = self.client.place_order(self.symbol, side, qty2)
             if r.get("retCode") == 0:
                 order_id = r.get("result", {}).get("orderId", "")
                 log.info(f"[ORDER←] OK id={order_id}")
@@ -206,7 +260,7 @@ class Trader:
                         await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(qty2)} (id {order_id})")
                     except Exception:
                         pass
-                qty = qty2  # использовать фактическое qty далее
+                qty = qty2  # используем фактическое qty далее
             else:
                 log.error(f"[ORDER][FAIL] {r}")
                 return
@@ -214,13 +268,21 @@ class Trader:
             log.error(f"[ORDER][FAIL] {r}")
             return
 
-        # Установка TP/SL
-        f = self.ensure_filters()
-        tick = f["tickSize"]
-        sl_r = self._ceil_step(sl, tick) if side == "Buy" else self._round_step(sl, tick)
-        tp_r = self._round_step(tp, tick) if side == "Buy" else self._ceil_step(tp, tick)
+        # Fallback: если клиент не умел TP/SL в order.create (TypeError) — поставим через trading-stop.
+        # Небольшое ожидание открытия позиции, чтобы не поймать rc=10001 (zero position)
+        ok = await self._wait_position_open()
+        if not ok:
+            log.warning("[TPSL][SKIP] position not opened")
+            return
 
-        r2 = self.client.trading_stop(self.symbol, side=side, stop_loss=sl_r, take_profit=tp_r)
+        r2 = self.client.trading_stop(
+            self.symbol,
+            side=side,
+            stop_loss=sl_r,
+            take_profit=tp_r,
+            tpslMode="Full",
+            positionIdx=0,
+        )
         if r2.get("retCode") in (0, None):
             log.info(f"[TPSL] sl={self._fmt(sl_r)} tp={self._fmt(tp_r)} OK")
             if self.notifier:

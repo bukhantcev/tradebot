@@ -105,18 +105,42 @@ class BybitClient:
             "sellLeverage": str(sell_leverage),
         })
 
-    def place_order(self, symbol: str, side: str, qty: float, order_type="Market", position_idx=0, price: Optional[float] = None):
+    def place_order(
+        self,
+        symbol: str,
+        side: str,
+        qty: float,
+        order_type: str = "Market",
+        position_idx: int = 0,
+        price: Optional[float] = None,
+        takeProfit: Optional[str] = None,
+        stopLoss: Optional[str] = None,
+        tpslMode: Optional[str] = None,
+        reduceOnly: Optional[bool] = None,
+        timeInForce: str = "GoodTillCancel",
+    ):
         body = {
             "category": "linear",
             "symbol": symbol,
             "side": side,
             "orderType": order_type,
             "qty": str(qty),
-            "timeInForce": "GoodTillCancel",
+            "timeInForce": timeInForce,
             "positionIdx": position_idx,
         }
         if price is not None:
             body["price"] = str(price)
+        # TP/SL attach on order.create (v5 supports this)
+        if takeProfit is not None:
+            body["takeProfit"] = str(takeProfit)
+        if stopLoss is not None:
+            body["stopLoss"] = str(stopLoss)
+        if tpslMode is not None:
+            body["tpslMode"] = tpslMode  # e.g., "Full"
+        if reduceOnly is not None:
+            # Bybit accepts boolean or "true"/"false" strings; we stringify to be safe
+            body["reduceOnly"] = bool(reduceOnly)
+
         log.debug(f"[ORDER→] {body}")
         r = self._request("POST", "/v5/order/create", body=body)
         log.debug(f"[ORDER←] retCode={r.get('retCode')} {str(r)[:400]}")
