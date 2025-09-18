@@ -254,8 +254,7 @@ class Trader:
             side,
             qty,
             order_type="Market",
-            slippageToleranceType="Percent",
-            slippageTolerance="0.5",
+            preferSmart=True,
         )
         rc = r.get("retCode")
         if rc == 0:
@@ -278,8 +277,7 @@ class Trader:
                 side,
                 qty2,
                 order_type="Market",
-                slippageToleranceType="Percent",
-                slippageTolerance="0.5",
+                preferSmart=True,
             )
             if r.get("retCode") == 0:
                 order_id = r.get("result", {}).get("orderId", "")
@@ -290,6 +288,51 @@ class Trader:
                     except Exception:
                         pass
                 qty = qty2  # используем фактическое qty далее
+            else:
+                log.error(f"[ORDER][FAIL] {r}")
+                return
+        elif rc == 30208:
+            # 1-й ретрай: мягкая толерантность по % (0.05%)
+            log.warning("[ORDER][RETRY] 30208: add slippage Percent=0.05")
+            r = self.client.place_order(
+                self.symbol,
+                side,
+                qty,
+                order_type="Market",
+                slippageToleranceType="Percent",
+                slippageTolerance="0.05",
+            )
+            rc2 = r.get("retCode")
+            if rc2 == 0:
+                order_id = r.get("result", {}).get("orderId", "")
+                log.info(f"[ORDER←] OK id={order_id} (slip 0.05%)")
+                if self.notifier:
+                    try:
+                        await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(qty)} (id {order_id}, slip 0.05%)")
+                    except Exception:
+                        pass
+            elif rc2 == 30208:
+                # 2-й ретрай: толерантность в тиках (5 тиков)
+                log.warning("[ORDER][RETRY] 30208: add slippage TickSize=5")
+                r = self.client.place_order(
+                    self.symbol,
+                    side,
+                    qty,
+                    order_type="Market",
+                    slippageToleranceType="TickSize",
+                    slippageTolerance="5",
+                )
+                if r.get("retCode") == 0:
+                    order_id = r.get("result", {}).get("orderId", "")
+                    log.info(f"[ORDER←] OK id={order_id} (slip 5 ticks)")
+                    if self.notifier:
+                        try:
+                            await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(qty)} (id {order_id}, slip 5 ticks)")
+                        except Exception:
+                            pass
+                else:
+                    log.error(f"[ORDER][FAIL] {r}")
+                    return
             else:
                 log.error(f"[ORDER][FAIL] {r}")
                 return
@@ -334,8 +377,7 @@ class Trader:
             side,
             qty,
             order_type="Market",
-            slippageToleranceType="Percent",
-            slippageTolerance="0.5",
+            preferSmart=True,
         )
         if r.get("retCode") == 0:
             oid = r.get("result", {}).get("orderId", "")
@@ -345,5 +387,25 @@ class Trader:
                     await self.notifier.notify(f"❌ Close {side} {self.symbol} qty={self._fmt(qty)} (id {oid})")
                 except Exception:
                     pass
+        elif r.get("retCode") == 30208:
+            log.warning("[ORDER][RETRY] 30208: close with slippage Percent=0.05")
+            r = self.client.place_order(
+                self.symbol,
+                side,
+                qty,
+                order_type="Market",
+                slippageToleranceType="Percent",
+                slippageTolerance="0.05",
+            )
+            if r.get("retCode") == 0:
+                oid = r.get("result", {}).get("orderId", "")
+                log.info(f"[ORDER←] CLOSE OK id={oid} (slip 0.05%)")
+                if self.notifier:
+                    try:
+                        await self.notifier.notify(f"❌ Close {side} {self.symbol} qty={self._fmt(qty)} (id {oid}, slip 0.05%)")
+                    except Exception:
+                        pass
+            else:
+                log.error(f"[ORDER][FAIL] {r}")
         else:
             log.error(f"[ORDER][FAIL] {r}")

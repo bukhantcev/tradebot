@@ -74,6 +74,11 @@ class BybitClient:
     def instruments_info(self, category="linear", symbol="BTCUSDT"):
         return self._request("GET", "/v5/market/instruments-info", params={"category": category, "symbol": symbol})
 
+    def orderbook_top(self, symbol: str, category: str = "linear"):
+        # depth=1 returns best bid/ask
+        params = {"category": category, "symbol": symbol, "limit": 1}
+        return self._request("GET", "/v5/market/orderbook", params=params)
+
     def server_time(self):
         return self._request("GET", "/v5/market/time")
 
@@ -105,6 +110,76 @@ class BybitClient:
             "sellLeverage": str(sell_leverage),
         })
 
+    def place_market_safe(
+        self,
+        symbol: str,
+        side: str,
+        qty: float,
+        position_idx: int = 0,
+        slip_percent: float = 0.05,  # 0.05%
+    ):
+        """
+        Отправляет рыночный ордер как Limit+IOC по цене, рассчитанной от best bid/ask с небольшим допуском,
+        чтобы не ловить 30208 (прайс-лимит) на деривативах.
+        """
+        # 1) Получаем тик и топ стакана
+        ins = self.instruments_info("linear", symbol)
+        tick = 0.1
+        try:
+            lst = ins.get("result", {}).get("list", [])
+            if lst:
+                tick = float(lst[0]["priceFilter"]["tickSize"])
+        except Exception:
+            pass
+
+        ob = self.orderbook_top(symbol, "linear")
+        ask1 = bid1 = None
+        try:
+            a = ob.get("result", {}).get("a", [])
+            b = ob.get("result", {}).get("b", [])
+            # формат [[price, size], ...]
+            ask1 = float(a[0][0]) if a and a[0] else None
+            bid1 = float(b[0][0]) if b and b[0] else None
+        except Exception:
+            pass
+
+        if ask1 is None or bid1 is None:
+            # Если стакан не получили — отправляем чистый Market IOC
+            body = {
+                "category": "linear",
+                "symbol": symbol,
+                "side": side,
+                "orderType": "Market",
+                "qty": str(qty),
+                "positionIdx": position_idx,
+                "timeInForce": "IOC",
+            }
+            return self._request("POST", "/v5/order/create", body=body)
+
+        # 2) Считаем лимит-цену с допуском slip_percent
+        k = 1.0 + (slip_percent * 0.01)
+        if side == "Buy":
+            price = ask1 * k
+            # округление вверх к тику
+            price = (int(price / tick + 0.9999999)) * tick
+        else:
+            price = bid1 / k
+            # округление вниз к тику
+            price = (int(price / tick)) * tick
+
+        # 3) Отправляем как Limit + IOC
+        body = {
+            "category": "linear",
+            "symbol": symbol,
+            "side": side,
+            "orderType": "Limit",
+            "qty": str(qty),
+            "price": f"{price:.8f}".rstrip("0").rstrip("."),
+            "positionIdx": position_idx,
+            "timeInForce": "IOC",
+        }
+        return self._request("POST", "/v5/order/create", body=body)
+
     def place_order(
         self,
         symbol: str,
@@ -120,9 +195,14 @@ class BybitClient:
         timeInForce: str = "GoodTillCancel",
         tpOrderType: Optional[str] = "Market",
         slOrderType: Optional[str] = "Market",
-        slippageToleranceType: Optional[str] = None,  # "Percent" or "TickSize"
+        slippageToleranceType: Optional[str] = None,      # e.g., "0.5" for 0.50%
         slippageTolerance: Optional[str] = None,      # e.g., "0.5" for 0.50%
+        preferSmart: bool = False,                         # route Market via Limit+IOC with computed price
     ):
+        # Smart routing for Market: use Limit+IOC near top-of-book to avoid 30208
+        if (order_type or "").lower() == "market" and preferSmart:
+            return self.place_market_safe(symbol, side, qty, position_idx=position_idx)
+
         body = {
             "category": "linear",
             "symbol": symbol,
