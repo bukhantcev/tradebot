@@ -1,27 +1,17 @@
-"""
-Простой Telegram-бот (aiogram 3.x) для управления:
-/start, /stop, /status, /equity, /pnl, /close_all, /mode, /risk
-"""
 import asyncio
 import logging
-from typing import Callable, Awaitable
-
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher
 from aiogram.types import Message
 from aiogram.filters import Command
 
 from config import HOST_ROLE, TELEGRAM_TOKEN_LOCAL, TELEGRAM_TOKEN_SERVER, TELEGRAM_CHAT_ID
 
-logger = logging.getLogger("TGBOT")
+log = logging.getLogger("TGBOT")
 
 def get_token() -> str:
     return TELEGRAM_TOKEN_SERVER if HOST_ROLE == "server" else TELEGRAM_TOKEN_LOCAL
 
 class ControlBus:
-    """
-    Простой «шина» для сигналов между ботом и main:
-    значения обновляет main, bot только читает/пишет команды.
-    """
     def __init__(self):
         self.started = False
         self.status = "idle"
@@ -30,17 +20,22 @@ class ControlBus:
         self.commands = asyncio.Queue()
 
     async def put(self, cmd: dict):
+        log.debug(f"[BUS→] {cmd}")
         await self.commands.put(cmd)
 
     async def get(self):
-        return await self.commands.get()
+        cmd = await self.commands.get()
+        log.debug(f"[BUS←] {cmd}")
+        return cmd
 
 def build_app(bus: ControlBus):
     bot = Bot(get_token(), parse_mode=None)
     dp = Dispatcher()
 
     async def only_owner(msg: Message) -> bool:
-        return (str(msg.chat.id) == str(TELEGRAM_CHAT_ID))
+        ok = (str(msg.chat.id) == str(TELEGRAM_CHAT_ID))
+        if not ok: log.warning(f"[TG][DENY] chat={msg.chat.id}")
+        return ok
 
     @dp.message(Command("start"))
     async def cmd_start(msg: Message):
@@ -81,8 +76,7 @@ def build_app(bus: ControlBus):
         parts = msg.text.split()
         if len(parts) >= 2:
             try:
-                v = float(parts[1])
-                v = max(0.2, min(1.0, v))
+                v = float(parts[1]); v = max(0.2, min(1.0, v))
                 await bus.put({"cmd":"risk","value":v})
                 await msg.answer(f"risk -> {v}%")
             except Exception:

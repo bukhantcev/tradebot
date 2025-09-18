@@ -1,31 +1,42 @@
 import logging
 import sys
-from config import LOG_LEVEL, FILE_LOG_LEVEL
+import asyncio
+
+# Вытаскиваем имя текущей asyncio-задачи в логах
+class TaskNameFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            task = asyncio.current_task()
+            record.task = task.get_name() if task else "-"
+        except Exception:
+            record.task = "-"
+        return True
+
+FORMAT = "%(asctime)s | %(levelname)s | %(task)s | %(name)s:%(lineno)d | %(message)s"
 
 def setup_logging():
-    logger = logging.getLogger()
-    logger.setLevel(logging.DEBUG)  # корневой уровень = DEBUG
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)  # корневой DEBUG
 
-    # Console handler (INFO+)
+    # Console DEBUG (всё в консоль)
     ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
-    ch.setFormatter(logging.Formatter(
-        "%(asctime)s | %(levelname)s | %(name)s:%(lineno)d | %(message)s"
-    ))
-    logger.addHandler(ch)
+    ch.setLevel(logging.DEBUG)
+    ch.setFormatter(logging.Formatter(FORMAT))
+    ch.addFilter(TaskNameFilter())
+    root.addHandler(ch)
 
-    # File handler (DEBUG)
+    # Файл DEBUG (дублируем)
     fh = logging.FileHandler("bot_debug.log", encoding="utf-8")
-    fh.setLevel(getattr(logging, FILE_LOG_LEVEL.upper(), logging.DEBUG))
-    fh.setFormatter(logging.Formatter(
-        "%(asctime)s | %(levelname)s | %(name)s:%(lineno)d | %(message)s"
-    ))
-    logger.addHandler(fh)
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(FORMAT))
+    fh.addFilter(TaskNameFilter())
+    root.addHandler(fh)
 
-    # Silence overly noisy loggers
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("websockets").setLevel(logging.WARNING)
+    # ВКЛЮЧАЕМ подробности внешних либ
+    logging.getLogger("httpx").setLevel(logging.DEBUG)
+    logging.getLogger("websockets").setLevel(logging.DEBUG)
+    logging.getLogger("aiogram").setLevel(logging.DEBUG)
 
-    return logger
+    return root
 
 logger = setup_logging()

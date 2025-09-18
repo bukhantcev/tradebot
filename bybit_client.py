@@ -11,7 +11,7 @@ import asyncio
 
 from config import get_bybit_keys, BYBIT_ENV
 
-logger = logging.getLogger("BYBIT")
+log = logging.getLogger("BYBIT")
 
 class BybitClient:
     def __init__(self, recv_window: int = 5000, verify_ssl: bool = True):
@@ -29,6 +29,7 @@ class BybitClient:
             self.ws_private_url = "wss://stream-testnet.bybit.com/v5/private"
 
         self.session = httpx.Client(verify=self.verify_ssl, timeout=15.0)
+        log.debug(f"[INIT] recv_window={recv_window} verify_ssl={verify_ssl} env={BYBIT_ENV}")
 
     # --- Sign helper ---
     def _sign(self, payload: str) -> str:
@@ -57,12 +58,18 @@ class BybitClient:
             "Content-Type": "application/json",
         }
 
-        logger.debug(f"[HTTP] {method} {url} params={params} body={body_str}")
-
+        log.debug(f"[HTTP→] {method} {url} params={params} body={body}")
         resp = self.session.request(method, url, params=params, content=body_str, headers=headers)
-        data = resp.json()
-        if data.get("retCode") != 0:
-            logger.error(f"[HTTP][ERROR] {data}")
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"status_code": resp.status_code, "text": resp.text[:500]}
+
+        rc = data.get("retCode")
+        log.debug(f"[HTTP←] {method} {path} retCode={rc} status={resp.status_code} resp={str(data)[:500]}")
+        if rc not in (0, None):
+            log.error(f"[HTTP][ERROR] path={path} rc={rc} msg={data.get('retMsg')}")
+
         return data
 
     # --- Public REST endpoints ---
@@ -77,6 +84,7 @@ class BybitClient:
         return self._request("GET", "/v5/account/wallet-balance", params={"accountType": account_type})
 
     def set_leverage(self, symbol: str, buy_leverage: int, sell_leverage: int):
+        log.debug(f"[LEVERAGE] set {symbol} -> {buy_leverage}/{sell_leverage}")
         return self._request("POST", "/v5/position/set-leverage", body={
             "category": "linear",
             "symbol": symbol,
@@ -96,7 +104,10 @@ class BybitClient:
         }
         if price is not None:
             body["price"] = str(price)
-        return self._request("POST", "/v5/order/create", body=body)
+        log.debug(f"[ORDER→] {body}")
+        r = self._request("POST", "/v5/order/create", body=body)
+        log.debug(f"[ORDER←] retCode={r.get('retCode')} {str(r)[:400]}")
+        return r
 
     def position_list(self, symbol: str):
         return self._request("GET", "/v5/position/list", params={"category": "linear", "symbol": symbol})
@@ -108,31 +119,34 @@ class BybitClient:
             "positionIdx": 0,
             "tpslMode": "Full",
         }
-        if stop_loss:
+        if stop_loss is not None:
             body["stopLoss"] = str(stop_loss)
-        if take_profit:
+        if take_profit is not None:
             body["takeProfit"] = str(take_profit)
-        if trailing_stop:
+        if trailing_stop is not None:
             body["trailingStop"] = str(trailing_stop)
-        return self._request("POST", "/v5/position/trading-stop", body=body)
+        log.debug(f"[TPSL→] {body}")
+        r = self._request("POST", "/v5/position/trading-stop", body=body)
+        log.debug(f"[TPSL←] retCode={r.get('retCode')} {str(r)[:400]}")
+        return r
 
     # --- WS connections ---
     async def ws_subscribe(self, url: str, topics: list[str], auth: bool = False):
+        log.debug(f"[WS][CONNECT] {url} topics={topics} auth={auth}")
         async with websockets.connect(url, ping_interval=20) as ws:
             if auth:
                 ts = str(int(time.time() * 1000))
                 param_str = ts + self.api_key + str(self.recv_window)
                 sign = self._sign(param_str)
-                await ws.send(json.dumps({
-                    "op": "auth",
-                    "args": [self.api_key, ts, self.recv_window, sign],
-                }))
-                resp = await ws.recv()
-                logger.info(f"[WS][AUTH] {resp}")
+                auth_msg = {"op": "auth", "args": [self.api_key, ts, self.recv_window, sign]}
+                await ws.send(json.dumps(auth_msg))
+                auth_resp = await ws.recv()
+                log.debug(f"[WS][AUTH] {auth_resp}")
 
             sub_msg = {"op": "subscribe", "args": topics}
             await ws.send(json.dumps(sub_msg))
-            logger.info(f"[WS] Subscribed: {topics}")
+            log.debug(f"[WS][SUB] {sub_msg}")
 
             async for message in ws:
+                log.debug(f"[WS][MSG] {str(message)[:400]}")
                 yield json.loads(message)

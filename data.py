@@ -1,6 +1,4 @@
 import os
-import json
-import math
 import time
 import asyncio
 import logging
@@ -13,30 +11,26 @@ import pandas as pd
 from config import DB_PATH, PARQUET_DIR, SYMBOL
 from bybit_client import BybitClient
 
-logger = logging.getLogger("DATA")
+log = logging.getLogger("DATA")
 
-# --------- Data containers ---------
 @dataclass
 class Bar:
-    ts: int          # start timestamp (ms)
+    ts: int
     open: float
     high: float
     low: float
     close: float
-    volume: float    # base volume
-    turnover: float  # quote volume
-    confirm: bool    # closed bar?
-
+    volume: float
+    turnover: float
+    confirm: bool
     @property
     def dt_minute(self) -> int:
-        # normalize to minute epoch (ms)
         return (self.ts // 60000) * 60000
 
-# --------- SQLite schema / IO ---------
-DDL_BARS_1M = """
+DDL_1M = """
 CREATE TABLE IF NOT EXISTS bars_1m(
     symbol TEXT NOT NULL,
-    ts_ms INTEGER NOT NULL,      -- start of bar (ms)
+    ts_ms INTEGER NOT NULL,
     open REAL NOT NULL,
     high REAL NOT NULL,
     low REAL NOT NULL,
@@ -47,11 +41,10 @@ CREATE TABLE IF NOT EXISTS bars_1m(
     PRIMARY KEY(symbol, ts_ms)
 );
 """
-
-DDL_BARS_5M = """
+DDL_5M = """
 CREATE TABLE IF NOT EXISTS bars_5m(
     symbol TEXT NOT NULL,
-    ts_ms INTEGER NOT NULL,      -- start of 5m window (ms)
+    ts_ms INTEGER NOT NULL,
     open REAL NOT NULL,
     high REAL NOT NULL,
     low REAL NOT NULL,
@@ -72,16 +65,16 @@ class DataStore:
         self._db = await aiosqlite.connect(self.db_path)
         await self._db.execute("PRAGMA journal_mode=WAL;")
         await self._db.execute("PRAGMA synchronous=NORMAL;")
-        await self._db.execute(DDL_BARS_1M)
-        await self._db.execute(DDL_BARS_5M)
+        await self._db.execute(DDL_1M)
+        await self._db.execute(DDL_5M)
         await self._db.commit()
-        logger.info("[DB] opened and initialized")
+        log.debug("[DB] open OK")
 
     async def close(self):
         if self._db:
             await self._db.close()
             self._db = None
-            logger.info("[DB] closed")
+            log.debug("[DB] close OK")
 
     async def upsert_bar_1m(self, symbol: str, bar: Bar):
         assert self._db
@@ -97,9 +90,8 @@ class DataStore:
             turnover=excluded.turnover,
             confirm=excluded.confirm;
         """
-        await self._db.execute(q, (
-            symbol, bar.dt_minute, bar.open, bar.high, bar.low, bar.close, bar.volume, bar.turnover, int(bar.confirm)
-        ))
+        await self._db.execute(q, (symbol, bar.dt_minute, bar.open, bar.high, bar.low, bar.close, bar.volume, bar.turnover, int(bar.confirm)))
+        log.debug(f"[DB][1m] upsert ts={bar.dt_minute} c={bar.close} conf={bar.confirm}")
 
     async def upsert_bar_5m(self, symbol: str, ts_ms_5m: int, ohlcv: Tuple[float, float, float, float, float, float]):
         assert self._db
@@ -116,76 +108,40 @@ class DataStore:
             turnover=excluded.turnover;
         """
         await self._db.execute(q, (symbol, ts_ms_5m, o, h, l, c, v, t))
+        log.debug(f"[DB][5m] upsert ts5={ts_ms_5m} c={c}")
 
     async def commit(self):
         assert self._db
         await self._db.commit()
+        log.debug("[DB] commit")
 
-    async def load_1m_for_day(self, symbol: str, day_utc: str) -> pd.DataFrame:
-        """
-        day_utc: 'YYYY-MM-DD'
-        """
-        assert self._db
-        start = int(pd.Timestamp(day_utc + " 00:00:00+00:00").timestamp() * 1000)
-        end   = int(pd.Timestamp(day_utc + " 23:59:59.999+00:00").timestamp() * 1000)
-        q = """
-        SELECT ts_ms, open, high, low, close, volume, turnover, confirm
-        FROM bars_1m WHERE symbol=? AND ts_ms BETWEEN ? AND ?
-        ORDER BY ts_ms ASC;
-        """
-        async with self._db.execute(q, (symbol, start, end)) as cur:
-            rows = await cur.fetchall()
-        df = pd.DataFrame(rows, columns=["ts_ms","open","high","low","close","volume","turnover","confirm"])
-        return df
-
-# --------- Aggregation 1m -> 5m ---------
 def aggregate_5m(rows: List[Tuple[int, float, float, float, float, float, float]]) -> Dict[int, Tuple[float, float, float, float, float, float]]:
-    """
-    rows: list of (ts_ms, open, high, low, close, volume, turnover) minute bars (confirmed)
-    returns: {ts5m_start: (open, high, low, close, volume, turnover)}
-    """
     buckets: Dict[int, List[Tuple[int, float, float, float, float, float, float]]] = {}
     for ts_ms, o, h, l, c, v, t in rows:
         ts5 = (ts_ms // (5*60*1000)) * (5*60*1000)
         buckets.setdefault(ts5, []).append((ts_ms, o, h, l, c, v, t))
-
     out: Dict[int, Tuple[float, float, float, float, float, float]] = {}
     for ts5, arr in buckets.items():
         arr.sort(key=lambda x: x[0])
-        o = arr[0][1]
-        h = max(x[2] for x in arr)
-        l = min(x[3] for x in arr)
-        c = arr[-1][4]
-        v = sum(x[5] for x in arr)
-        t = sum(x[6] for x in arr)
+        o = arr[0][1]; h = max(x[2] for x in arr); l = min(x[3] for x in arr)
+        c = arr[-1][4]; v = sum(x[5] for x in arr); t = sum(x[6] for x in arr)
         out[ts5] = (o, h, l, c, v, t)
+    log.debug(f"[AGG] 5m buckets={len(out)} from_rows={len(rows)}")
     return out
 
-# --------- Parquet snapshot ---------
 def write_parquet_daily(df: pd.DataFrame, day_utc: str, symbol: str, timeframe: str):
     if df.empty:
+        log.debug("[PARQUET] skip empty")
         return
     os.makedirs(PARQUET_DIR, exist_ok=True)
     fn = os.path.join(PARQUET_DIR, f"{symbol}_{timeframe}_{day_utc}.parquet")
-    # make index nice
     dff = df.copy()
     dff["ts"] = pd.to_datetime(dff["ts_ms"], unit="ms", utc=True)
     dff.set_index("ts", inplace=True)
     dff.to_parquet(fn, engine="pyarrow")
-    logger.info(f"[PARQUET] written {fn} rows={len(dff)}")
+    log.debug(f"[PARQUET] written {fn} rows={len(dff)}")
 
-# --------- WS parsing helpers ---------
 def parse_kline_payload(msg: Dict[str, Any]) -> List[Bar]:
-    """
-    Bybit v5 kline payload example:
-      {
-        "topic": "kline.1.BTCUSDT",
-        "data": [{
-            "start": 1716286500000, "end": 1716286559999, "interval": "1",
-            "open": "67123.5", "close": "67130.1", "high": "67150.0", "low": "67110.0",
-            "volume": "12.345", "turnover": "828123.12", "confirm": True, ...}]
-      }
-    """
     bars: List[Bar] = []
     if "data" not in msg:
         return bars
@@ -204,17 +160,11 @@ def parse_kline_payload(msg: Dict[str, Any]) -> List[Bar]:
             if b.ts > 0:
                 bars.append(b)
         except Exception as e:
-            logger.warning(f"[WS][PARSE] skip item: {e} item={it}")
+            log.warning(f"[WS][PARSE] skip item: {e} item={it}")
+    log.debug(f"[WS][PARSE] bars={len(bars)}")
     return bars
 
-# --------- DataManager ---------
 class DataManager:
-    """
-    - Подписывается на kline.1.{SYMBOL}
-    - Пишет bars_1m (с обновлением текущей незакрытой свечи)
-    - На закрытии баров агрегирует в 5m
-    - Раз в сутки — parquet снапшот 1m
-    """
     def __init__(self, symbol: str = SYMBOL):
         self.symbol = symbol
         self.client = BybitClient()
@@ -224,17 +174,14 @@ class DataManager:
         self._last_snapshot_day: Optional[str] = None
 
     async def start(self):
+        asyncio.current_task().set_name("data")
         await self.store.open()
-        consumer_task = asyncio.create_task(self._consumer_loop(), name="bars-consumer")
-        agg_task = asyncio.create_task(self._aggregator_loop(), name="bars-aggregator")
-        ws_task = asyncio.create_task(self._ws_loop(), name="ws-kline")
-
-        logger.info("[DATA] started")
+        consumer_task = asyncio.create_task(self._consumer_loop(), name="data-consumer")
+        agg_task = asyncio.create_task(self._aggregator_loop(), name="data-aggregator")
+        ws_task = asyncio.create_task(self._ws_loop(), name="data-ws")
+        log.debug("[DATA] start")
         try:
-            await asyncio.wait(
-                {consumer_task, agg_task, ws_task},
-                return_when=asyncio.FIRST_EXCEPTION
-            )
+            await asyncio.wait({consumer_task, agg_task, ws_task}, return_when=asyncio.FIRST_EXCEPTION)
         finally:
             self._stop.set()
             for t in (consumer_task, agg_task, ws_task):
@@ -242,7 +189,7 @@ class DataManager:
                     t.cancel()
             await self.store.commit()
             await self.store.close()
-            logger.info("[DATA] stopped")
+            log.debug("[DATA] stop")
 
     async def stop(self):
         self._stop.set()
@@ -257,23 +204,18 @@ class DataManager:
                     if isinstance(msg, dict) and msg.get("topic", "").startswith("kline."):
                         bars = parse_kline_payload(msg)
                         for b in bars:
-                            # очередь не должна блокировать WS надолго
                             try:
                                 self._queue.put_nowait(b)
                             except asyncio.QueueFull:
                                 _ = self._queue.get_nowait()
                                 await self._queue.put(b)
                     elif isinstance(msg, dict) and msg.get("op") == "subscribe":
-                        logger.info(f"[WS] {msg}")
+                        log.debug(f"[WS] {msg}")
             except Exception as e:
-                logger.error(f"[WS] reconnect due to: {e}")
+                log.error(f"[WS] reconnect: {e}")
                 await asyncio.sleep(2.0)
 
     async def _consumer_loop(self):
-        """
-        Принимает Bar и upsert в bars_1m (незакрытые свечи тоже обновляем).
-        Коммитим пакетно раз в N записей или раз в секунду.
-        """
         batch = 0
         last_commit = time.time()
         while not self._stop.is_set():
@@ -286,17 +228,13 @@ class DataManager:
                 batch += 1
             if batch >= 50 or (time.time() - last_commit) >= 1.0:
                 await self.store.commit()
+                log.debug(f"[DB] batch_commit n={batch}")
                 batch = 0
                 last_commit = time.time()
 
     async def _aggregator_loop(self):
-        """
-        Каждые 10 секунд подтягивает последние подтверждённые бары за ~2 часа,
-        агрегирует в 5m и обновляет bars_5m. Раз в день — parquet снапшот 1m.
-        """
         while not self._stop.is_set():
             try:
-                # возьмём с запасом 2 часа (120 баров)
                 now_ms = int(time.time() * 1000)
                 start_ms = now_ms - 120 * 60 * 1000
                 q = """
@@ -309,29 +247,20 @@ class DataManager:
                     rows = await cur.fetchall()
                 agg = aggregate_5m(rows)
                 if agg:
-                    # запишем все собранные 5m окна
                     for ts5, ohlcv in agg.items():
                         await self.store.upsert_bar_5m(self.symbol, ts5, ohlcv)
                     await self.store.commit()
-
-                # parquet снапшот раз в день
+                # parquet snapshot once per day
                 utc_day = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
                 if self._last_snapshot_day != utc_day:
-                    df = await self.store.load_1m_for_day(self.symbol, utc_day)
+                    async with self.store._db.execute(
+                        "SELECT ts_ms, open, high, low, close, volume, turnover FROM bars_1m WHERE symbol=? AND DATE(ts_ms/1000,'unixepoch')=DATE('now') ORDER BY ts_ms"
+                        , (self.symbol,)
+                    ) as cur:
+                        day_rows = await cur.fetchall()
+                    df = pd.DataFrame(day_rows, columns=["ts_ms","open","high","low","close","volume","turnover"])
                     write_parquet_daily(df, utc_day, self.symbol, "1m")
                     self._last_snapshot_day = utc_day
             except Exception as e:
-                logger.error(f"[AGG] {e}")
+                log.error(f"[AGG] {e}")
             await asyncio.sleep(10.0)
-
-# --------- manual run ---------
-if __name__ == "__main__":
-    # Пример самостоятельного запуска сборщика:
-    # python data.py
-    async def _run():
-        dm = DataManager(symbol=SYMBOL)
-        try:
-            await dm.start()
-        except KeyboardInterrupt:
-            await dm.stop()
-    asyncio.run(_run())

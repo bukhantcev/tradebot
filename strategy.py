@@ -1,27 +1,17 @@
-"""
-Базовая стратегия + интеграция с OnlineModel.
-Сигналы по закрытию 1m свечи. Фильтры:
-- тренд (ema_fast vs ema_slow)
-- импульс/ROC, спред-прокси
-- ML prob в качестве веса (не жёсткий фильтр)
-SL/TP: SL=1.5*ATR, TP=2*SL, трейл включается при +1*SL
-"""
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
-
-import pandas as pd
+from typing import Optional
 
 from config import RISK_PCT, SYMBOL
 from features import load_recent_1m, compute_features, last_feature_row
 from ml import OnlineModel
 
-logger = logging.getLogger("STRATEGY")
+log = logging.getLogger("STRATEGY")
 
 @dataclass
 class Signal:
-    side: Optional[str]  # "Buy" | "Sell" | None
+    side: Optional[str]   # "Buy" | "Sell" | None
     reason: str
     sl: Optional[float]
     tp: Optional[float]
@@ -35,22 +25,24 @@ class StrategyEngine:
         self.model = OnlineModel()
         self.cooldown_sec = 180
         self._last_trade_time = 0.0
-        self._mode = "auto"  # "auto" | "trend" | "range"
+        self._mode = "auto"
 
     def set_mode(self, mode: str):
         if mode in ("auto","trend","range"):
+            log.debug(f"[MODE] {self._mode} -> {mode}")
             self._mode = mode
 
     async def on_kline_closed(self) -> Signal:
         df = await load_recent_1m(200, symbol=self.symbol)
+        log.debug(f"[BAR] loaded rows={len(df)}")
         if len(df) < 60:
             return Signal(None, "warmup", None, None, None, None)
+
         dff = compute_features(df)
         f0 = last_feature_row(dff)
-        if not f0:
-            return Signal(None, "no_features", None, None, None, None)
+        log.debug(f"[FEAT] last={f0}")
 
-        # update ML with previous step info (if possible)
+        # онлайн-апдейт модели на предыдущем шаге
         if len(dff) >= 2:
             prev = dff.iloc[-2]
             curr = dff.iloc[-1]
@@ -63,42 +55,38 @@ class StrategyEngine:
                     float(curr["close"])
                 )
             except Exception as e:
-                logger.debug(f"[ML] update skip: {e}")
+                log.debug(f"[ML] update skip: {e}")
 
-        prob_up = self.model.predict(f0)  # 0..1
+        prob_up = self.model.predict(f0)
         atr = max(f0["atr14"], 1e-8)
         close = f0["close"]
         ema_fast, ema_slow = f0["ema_fast"], f0["ema_slow"]
         trend_up = ema_fast > ema_slow
         roc = f0["roc1"]
+        log.debug(f"[ML] p_up={prob_up:.3f} trend_up={trend_up} roc={roc:.4f}")
 
-        # cooldown
         now = time.time()
         if now - self._last_trade_time < self.cooldown_sec:
             return Signal(None, "cooldown", None, None, atr, f0["ts_ms"])
 
-        # Decide side
         side = None
-        reason = []
-        if self._mode in ("auto", "trend"):
+        reasons = []
+        if self._mode in ("auto","trend"):
             if trend_up and prob_up > 0.52 and roc >= -0.001:
-                side = "Buy"
-                reason.append("trend_up+ml")
+                side = "Buy"; reasons.append("trend_up+ml")
             elif (not trend_up) and prob_up < 0.48 and roc <= 0.001:
-                side = "Sell"
-                reason.append("trend_dn+ml")
-        if side is None and self._mode in ("auto", "range"):
-            # контртренд: возврат к EMA_slow при переотклонении
+                side = "Sell"; reasons.append("trend_dn+ml")
+        if side is None and self._mode in ("auto","range"):
             dev = (close - ema_slow) / max(close, 1e-8)
             if dev > 0.004 and prob_up < 0.5:
-                side = "Sell"; reason.append("revert_down")
+                side = "Sell"; reasons.append("revert_down")
             elif dev < -0.004 and prob_up > 0.5:
-                side = "Buy"; reason.append("revert_up")
+                side = "Buy"; reasons.append("revert_up")
 
         if side is None:
+            log.debug("[DECIDE] no_entry")
             return Signal(None, "no_entry", None, None, atr, f0["ts_ms"])
 
-        # SL/TP
         sl_mult = 1.5
         tp_mult_vs_sl = 2.0
         if side == "Buy":
@@ -109,4 +97,6 @@ class StrategyEngine:
             tp = close - tp_mult_vs_sl * (sl - close)
 
         self._last_trade_time = now
-        return Signal(side, "+".join(reason), sl, tp, atr, f0["ts_ms"])
+        reason = "+".join(reasons)
+        log.info(f"[SIGNAL] side={side} reason={reason} close={close:.2f} atr={atr:.2f} sl={sl:.2f} tp={tp:.2f}")
+        return Signal(side, reason, sl, tp, atr, f0["ts_ms"])
