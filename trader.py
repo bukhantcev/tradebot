@@ -650,10 +650,16 @@ class Trader:
 
             # --- Ждём закрытия позиции TP/SL и перезапускаем цикл с новым лимитником ---
             log.info("[EXT][LIM][WATCH] arming TP/SL watchdog (LastPrice cross)")
-            ok_flat = await self._watchdog_close_on_lastprice(actual_side, sl_final, tp_final, check_interval=0.25, max_wait=3600.0)
-            if not ok_flat:
-                log.warning("[EXT][LIM][WATCH][TIMEOUT] position still open; abort loop")
-                return
+            # Не останавливаем рабочий цикл из‑за таймаута.
+            # Следим за TP/SL батчами по 5 минут; если таймаут — просто продолжаем мониторить,
+            # пока позиция не станет flat.
+            while True:
+                ok_flat = await self._watchdog_close_on_lastprice(
+                    actual_side, sl_final, tp_final, check_interval=0.25, max_wait=300.0
+                )
+                if ok_flat:
+                    break
+                log.warning("[EXT][LIM][WATCH][TIMEOUT] position still open; keep monitoring…")
 
             # На всякий случай снимем все оставшиеся ордера по символу
             try:
