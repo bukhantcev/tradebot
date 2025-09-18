@@ -66,8 +66,26 @@ class StrategyEngine:
         self._notifier = notifier
 
     async def on_kline_closed(self) -> Signal:
+        log.debug("[ON_CLOSE][ENTER]")
+        try:
+            _bars_dbg_len = "n/a"
+            _bars_dbg_ts = "n/a"
+            df_peek = await load_recent_1m(1, symbol=self.symbol)
+            if df_peek is not None and len(df_peek) > 0:
+                _bars_dbg_len = "≥1"
+                _bars_dbg_ts = str(int(df_peek.iloc[-1].get("ts_ms", 0)))
+            log.debug(f"[ON_CLOSE][BARS] peek ts={_bars_dbg_ts}")
+        except Exception as _e:
+            log.debug(f"[ON_CLOSE][BARS][ERR] {type(_e).__name__}: {_e}")
+
         # 1) История только из закрытых минут
         df = await load_recent_1m(200, symbol=self.symbol)
+        try:
+            last_ts = int(df.iloc[-1]["ts_ms"]) if len(df) else -1
+            log.debug(f"[ON_CLOSE][LOADED] closed_1m_bars={len(df)} last_ts={last_ts}")
+        except Exception as _e:
+            log.debug(f"[ON_CLOSE][LOADED][ERR] {type(_e).__name__}: {_e}")
+
         prev_high = None
         prev_low = None
         prev_open = None
@@ -76,6 +94,7 @@ class StrategyEngine:
             # короткий факт-лог — без шума
             log.info("[SKIP] warmup (<60 closed 1m bars)")
             log.debug(f"[SIGNAL][HL] prevH={prev_high} prevL={prev_low}")
+            log.debug("[ON_CLOSE][EXIT] reason=warmup")
             return Signal(None, "warmup", None, None, None, None, prev_high, prev_low, None, None)
 
         # Экстремы предыдущей ЗАКРЫТОЙ 1m свечи
@@ -87,8 +106,14 @@ class StrategyEngine:
         # 2) Признаки
         dff = compute_features(df)
         f0: Dict[str, Any] = last_feature_row(dff)
+        if f0:
+            log.debug(f"[FEAT][ROW] ts={int(f0.get('ts_ms',0))} c={float(f0.get('close',0)):.2f} emaF={float(f0.get('ema_fast',0)):.2f} emaS={float(f0.get('ema_slow',0)):.2f} atr={float(f0.get('atr14',0)):.2f}")
+        else:
+            log.debug("[FEAT][ROW] none")
+
         if not f0:
             log.debug(f"[SIGNAL][HL] prevH={prev_high} prevL={prev_low}")
+            log.debug("[ON_CLOSE][EXIT] reason=no_features")
             return Signal(None, "no_features", None, None, None, None, prev_high, prev_low, prev_open, prev_close)
 
         # Ключевой лог «сигнал/срез фич» — компактно
@@ -120,6 +145,7 @@ class StrategyEngine:
         )
         log.debug(f"[LLM][PREP] ctx={ctx} | feats=({feats_dbg})")
 
+        log.info("[LLM][CALL] start")
         t0 = time.time()
         try:
             decision = await ask_model(
@@ -141,15 +167,18 @@ class StrategyEngine:
             if len(resp_str) > 300:
                 resp_str = resp_str[:300] + "…"
             log.debug(f"[LLM][OK] {dt_ms:.1f} ms | resp={resp_str}")
+            log.info(f"[LLM][CALL][OK] { (time.time() - t0) * 1000.0:.1f} ms decision={str(decision.get('decision','')).strip() or 'n/a'}")
         except Exception as e:
             dt_ms = (time.time() - t0) * 1000.0
             log.exception(f"[LLM][ERR] {dt_ms:.1f} ms | {e}")
+            log.warning(f"[LLM][CALL][FAIL] {type(e).__name__}: {e}")
             # Фоллбек: удерживаем позицию, но сигнал формируем как hold с причиной
             if self._notifier:
                 try:
                     await self._notifier.notify(f"⚠️ ИИ ошибка: {e}")
                 except Exception:
                     pass
+            log.debug("[ON_CLOSE][EXIT] reason=llm_error")
             return Signal(None, f"llm_error: {e}", None, None, float(f0["atr14"]), int(f0["ts_ms"]), prev_high, prev_low, prev_open, prev_close)
 
         action_raw = str(decision.get("decision", "Hold"))
@@ -163,6 +192,7 @@ class StrategyEngine:
                 except Exception:
                     pass
             log.debug(f"[SIGNAL][HL] prevH={prev_high} prevL={prev_low}")
+            log.debug("[ON_CLOSE][EXIT] reason=hold")
             return Signal(None, "hold", None, None, float(f0["atr14"]), int(f0["ts_ms"]), prev_high, prev_low, prev_open, prev_close)
 
         # 5) Построение SL/TP относительно тела предыдущей свечи,
@@ -203,6 +233,7 @@ class StrategyEngine:
         self._last_trade_time = time.time()
 
         log.debug(f"[SIGNAL][HL] prevH={prev_high} prevL={prev_low}")
+        log.debug(f"[ON_CLOSE][EXIT] action={action} sl={sl:.2f} tp={tp:.2f} ts={int(f0.get('ts_ms',0))}")
         return Signal(
             side=action,
             reason=reason or "llm",
