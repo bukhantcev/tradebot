@@ -23,7 +23,7 @@ def kb_main() -> InlineKeyboardMarkup:
 
 class TgBot:
     def __init__(self, token: str, chat_id: Optional[int] = None, trader=None):
-        self.bot = Bot(token=token, parse_mode=ParseMode.HTML)
+        self.bot = Bot(token=token)
         self.dp = Dispatcher()
         self.router = Router()
         self.dp.include_router(self.router)

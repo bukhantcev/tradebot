@@ -11,7 +11,7 @@ from trader import Trader
 from strategy import StrategyEngine
 from bot import TgBot
 from features import load_recent_1m
-
+from config import TELEGRAM_TOKEN_LOCAL, TELEGRAM_TOKEN_SERVER, TELEGRAM_CHAT_ID
 
 def setup_logging():
     level = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -59,21 +59,22 @@ async def strategy_loop(strat: StrategyEngine, trader: Trader, poll_sec: float =
 
 async def main():
     host_role = os.getenv("HOST_ROLE", "local").strip().lower()
+    log.info(f"[MAIN] host_role={host_role} token={'SERVER' if host_role=='server' else 'LOCAL'} chat_id={'set' if TELEGRAM_CHAT_ID else 'not set'}")
     if host_role == "server":
-        TG_TOKEN = os.getenv("TELEGRAM_TOKEN_SERVER", "").strip()
+        TG_TOKEN = TELEGRAM_TOKEN_SERVER.strip()
     else:
-        TG_TOKEN = os.getenv("TELEGRAM_TOKEN_LOCAL", "").strip()
+        TG_TOKEN = TELEGRAM_TOKEN_LOCAL.strip()
 
     if not TG_TOKEN or ":" not in TG_TOKEN:
         raise RuntimeError("[MAIN][ERR] Telegram token not set or invalid")
 
-    TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    TG_CHAT = TELEGRAM_CHAT_ID.strip()
     POLL_SEC = float(os.getenv("STRAT_POLL_SEC", "1.0"))
 
     client = BybitClient()
     bot = TgBot(TG_TOKEN, int(TG_CHAT) if TG_CHAT else None)
     trader = Trader(client=client, notifier=bot)
-    strat = StrategyEngine(trader=trader, notifier=bot)
+    strat = StrategyEngine(notifier=bot)
     data = DataManager()
 
     await bot.start_background()
