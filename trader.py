@@ -55,6 +55,45 @@ class Trader:
     def _fmt(self, x: float) -> str:
         return f"{x:.6f}".rstrip("0").rstrip(".")
 
+    def _fix_tpsl(self, side: str, price: float, sl: float, tp: float, tick: float) -> (float, float):
+        """
+        Нормализует SL/TP относительно рыночной цены и тика, чтобы не ловить 30208 на order.create.
+          • Buy:  SL < price, TP > price  (минимум на 1 тик от цены)
+          • Sell: SL > price, TP < price
+        Возвращает кортеж (sl_fixed, tp_fixed) с корректировкой на 1–2 тика при необходимости.
+        """
+        p = float(price)
+        sl_f, tp_f = float(sl), float(tp)
+        t = max(float(tick), 0.0) or 0.1
+
+        if side == "Buy":
+            # SL должен быть строго ниже цены, TP — строго выше
+            if sl_f >= p:
+                sl_f = p - t
+            if tp_f <= p:
+                tp_f = p + t
+            # округление в сторону, совместимую с правилами биржи
+            sl_f = self._round_step(sl_f, t)  # вниз по тику
+            tp_f = self._ceil_step(tp_f, t)   # вверх по тику
+            # дополнительная страховка: разнести хотя бы на 1 тик
+            if sl_f >= p:
+                sl_f = p - 2 * t
+            if tp_f <= p:
+                tp_f = p + 2 * t
+        else:  # Sell
+            if sl_f <= p:
+                sl_f = p + t
+            if tp_f >= p:
+                tp_f = p - t
+            sl_f = self._ceil_step(sl_f, t)   # вверх по тику
+            tp_f = self._round_step(tp_f, t)  # вниз по тику
+            if sl_f <= p:
+                sl_f = p + 2 * t
+            if tp_f >= p:
+                tp_f = p - 2 * t
+
+        return sl_f, tp_f
+
     # ---------- ПУБЛИЧНЫЕ МЕТОДЫ ----------
 
     def refresh_equity(self) -> float:
@@ -206,6 +245,7 @@ class Trader:
         tick = f["tickSize"]
         sl_r = self._ceil_step(sl, tick) if side == "Buy" else self._round_step(sl, tick)
         tp_r = self._round_step(tp, tick) if side == "Buy" else self._ceil_step(tp, tick)
+        sl_r, tp_r = self._fix_tpsl(side, price, sl_r, tp_r, tick)
 
         # Маркет-вход: сначала пробуем прикрепить TP/SL прямо в order/create (tpslMode=Full)
         log.info(f"[ENTER] {side} qty={self._fmt(qty)}")
@@ -261,6 +301,21 @@ class Trader:
                     except Exception:
                         pass
                 qty = qty2  # используем фактическое qty далее
+            else:
+                log.error(f"[ORDER][FAIL] {r}")
+                return
+        elif rc == 30208:
+            # Failed: price restriction due to attached TP/SL; retry without TP/SL and set via trading-stop
+            log.warning("[ORDER][RETRY] 30208: retrying without TP/SL")
+            r = self.client.place_order(self.symbol, side, qty)
+            if r.get("retCode") == 0:
+                order_id = r.get("result", {}).get("orderId", "")
+                log.info(f"[ORDER←] OK id={order_id} (no TP/SL)")
+                if self.notifier:
+                    try:
+                        await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(qty)} (id {order_id}, no TP/SL)")
+                    except Exception:
+                        pass
             else:
                 log.error(f"[ORDER][FAIL] {r}")
                 return

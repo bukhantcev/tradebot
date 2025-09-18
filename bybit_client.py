@@ -118,6 +118,8 @@ class BybitClient:
         tpslMode: Optional[str] = None,
         reduceOnly: Optional[bool] = None,
         timeInForce: str = "GoodTillCancel",
+        tpOrderType: Optional[str] = "Market",
+        slOrderType: Optional[str] = "Market",
     ):
         body = {
             "category": "linear",
@@ -133,8 +135,12 @@ class BybitClient:
         # TP/SL attach on order.create (v5 supports this)
         if takeProfit is not None:
             body["takeProfit"] = str(takeProfit)
+            if tpOrderType is not None:
+                body["tpOrderType"] = tpOrderType  # e.g., "Market"
         if stopLoss is not None:
             body["stopLoss"] = str(stopLoss)
+            if slOrderType is not None:
+                body["slOrderType"] = slOrderType  # e.g., "Market"
         if tpslMode is not None:
             body["tpslMode"] = tpslMode  # e.g., "Full"
         if reduceOnly is not None:
