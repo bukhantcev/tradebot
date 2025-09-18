@@ -75,20 +75,30 @@ class Trader:
             last_min = int(time.time() // 60)
             while True:
                 try:
+                    # sleep first to avoid hot loop on immediate reschedules
+                    await asyncio.sleep(1.0)
                     m = int(time.time() // 60)
                     if m != last_min:
                         last_min = m
-                        px = self._last_price()
-                        side, sz = self._position_side_and_size()
+                        try:
+                            px = self._last_price()
+                        except Exception:
+                            px = 0.0
+                        try:
+                            side, sz = self._position_side_and_size()
+                        except Exception:
+                            side, sz = (None, 0.0)
                         sl_price = self._minute_sl
                         mode = self._minute_mode
-                        log.info(f"[STAT][MIN] mode={mode} px={self._fmt(px)} pos={side or 'Flat'} size={self._fmt(sz)} SL={(self._fmt(sl_price) if sl_price else 'None')}")
-                    await asyncio.sleep(0.25)
+                        log.info(
+                            f"[STAT][MIN] mode={mode} px={self._fmt(px)} pos={side or 'Flat'} size={self._fmt(sz)} SL={(self._fmt(sl_price) if sl_price else 'None')}"
+                        )
                 except asyncio.CancelledError:
                     log.info("[MIN][LOOP] cancelled")
                     break
                 except Exception:
-                    await asyncio.sleep(0.5)
+                    # backoff on any unexpected exception to avoid tight spinning
+                    await asyncio.sleep(2.0)
         self._minute_task = asyncio.create_task(_loop(), name="minute_stat")
         log.info("[MIN][START] minute logger started")
 
@@ -376,82 +386,178 @@ class Trader:
     # ---------- ЛИМИТНЫЕ ОРДЕРА ПО ЭКСТРЕМАМ ----------
     async def _enter_extremes_with_limits(self, side: str, prev_high: float, prev_low: float, qty: float, sl: float, tp: float):
         """
-        Экстрем-режим через ЛИМИТНЫЕ ордера:
-          • Buy:  ставим LimitBuy ≈ (prev_low + ε); после фила ставим TP ≈ (prev_high − ε) и SL чуть ниже входа
-          • Sell: ставим LimitSell ≈ (prev_high − ε); после фила ставим TP ≈ (prev_low  + ε) и SL чуть выше входа
-        ε = EXT_EPS_TICKS * tickSize. Лимит — GTC. Отдельных отложек на обратную сторону не ставим.
+        Экстрем-режим через ЛИМИТНЫЕ ордера с динамической перестановкой:
+          • Каждую минуту получаем экстремумы предыдущей ЗАКРЫТОЙ 1m-свечи через REST /v5/market/kline.
+          • Ставим лимит на вход чуть внутри уровня (ε = EXT_EPS_TICKS * tickSize).
+          • Ждём до 60с. Если не исполнился — отменяем, переставляем по новым экстремам и повторяем.
+          • После фила — ставим TP/SL через trading-stop (Full) и выходим.
         """
-        if qty <= 0 or prev_high <= 0 or prev_low <= 0:
-            log.info("[EXT][LIM][SKIP] bad params")
+        # sanity
+        if qty <= 0:
+            log.info("[EXT][LIM][SKIP] qty<=0")
             return
 
         f = self.ensure_filters()
         tick = float(f.get("tickSize", 0.1) or 0.1)
-        eps = max(tick * max(1, int(self.ext_eps_ticks)), tick)
+        eps_ticks = max(1, int(self.ext_eps_ticks))
+        eps = max(tick * eps_ticks, tick)
 
-        # Рассчитаем цену входа и целевые TP/SL, затем отнормируем к тику
-        if side == "Buy":
-            entry_price = prev_low + eps
-            entry_price = self._ceil_step(entry_price, tick)  # для покупки вверх по тику
-            # Если в сигнале SL/TP отсутствуют, используем экстремы
-            tp_ref = tp if tp and tp > 0 else (prev_high - eps)
-            sl_ref = sl if sl and sl > 0 else (entry_price - 2 * tick)
-            # Нормализация TP/SL относительно возможной базовой цены: пока используем цену входа
-            sl_adj, tp_adj = self._fix_tpsl("Buy", entry_price, sl_ref, tp_ref, tick)
-            log.info(f"[EXT][LIM][PLACE] Buy limit entry={self._fmt(entry_price)} tp={self._fmt(tp_adj)} sl={self._fmt(sl_adj)} qty={self._fmt(qty)}")
-            r = self.client.place_order(self.symbol, "Buy", qty, order_type="Limit", price=entry_price, timeInForce="GTC", position_idx=0)
-        else:
-            entry_price = prev_high - eps
-            entry_price = self._round_step(entry_price, tick)  # для продажи вниз по тику
-            tp_ref = tp if tp and tp > 0 else (prev_low + eps)
-            sl_ref = sl if sl and sl > 0 else (entry_price + 2 * tick)
-            sl_adj, tp_adj = self._fix_tpsl("Sell", entry_price, sl_ref, tp_ref, tick)
-            log.info(f"[EXT][LIM][PLACE] Sell limit entry={self._fmt(entry_price)} tp={self._fmt(tp_adj)} sl={self._fmt(sl_adj)} qty={self._fmt(qty)}")
-            r = self.client.place_order(self.symbol, "Sell", qty, order_type="Limit", price=entry_price, timeInForce="GTC", position_idx=0)
-
-        if r.get("retCode") != 0:
-            log.error(f"[EXT][LIM][FAIL] place_order {r}")
-            return
-
-        oid = r.get("result", {}).get("orderId", "")
-        log.info(f"[EXT][LIM][ORDER] id={oid} price={self._fmt(entry_price)}")
-
-        # Ждём фила (позиция должна появиться)
-        filled = await self._await_fill_or_retry(oid, side, qty)
-        if not filled:
-            log.warning("[EXT][LIM][ABORT] no fill")
-            # На всякий случай попробуем отменить невыполненный лимитник
+        async def _prev_hl_rest() -> tuple[float|None, float|None]:
+            """Быстро получаем экстремумы предыдущей ЗАКРЫТОЙ 1m-свечи через /v5/market/kline."""
             try:
-                self._cancel_order(order_id=oid)
+                r = self.client._request(
+                    "GET",
+                    "/v5/market/kline",
+                    params={"category": "linear", "symbol": self.symbol, "interval": "1", "limit": 3},
+                )
+                kl = (r.get("result", {}) or {}).get("list", [])
+                # Ответ Bybit для kline — список от старой к новой или наоборот; нормализуем
+                # Возьмём последнюю подтверждённую свечу (confirm=true); если нет — предпоследнюю
+                # Элементы могут быть массивами строк: [start,open,high,low,close,volume,turnover]
+                # В V5 REST confirm может отсутствовать — считаем предпоследнюю как закрытую.
+                if not kl:
+                    return (None, None)
+                if len(kl) >= 2:
+                    last = kl[-2]
+                else:
+                    last = kl[-1]
+                # Форматы бывают dict или list
+                def _get(v, idx):
+                    try:
+                        if isinstance(v, dict):
+                            return float(v.get(idx) or v.get(idx.lower()) or 0.0)
+                        return float(v[idx])
+                    except Exception:
+                        return 0.0
+                # В REST v5 list формат: [start,open,high,low,close,volume,turnover]
+                ph = _get(last, 2)
+                pl = _get(last, 3)
+                return (ph if ph > 0 else None, pl if pl > 0 else None)
+            except Exception:
+                return (None, None)
+
+        # если вызвали с начальными prev_high/prev_low — используем как первый шаг
+        cur_prev_high = float(prev_high or 0.0)
+        cur_prev_low  = float(prev_low or 0.0)
+
+        # активный id текущего лимитника (если стоит)
+        active_oid: str | None = None
+        # охранный счётчик, чтобы не зациклиться бесконечно при проблемах кансела
+        max_cycles = 120  # максимум 2 часа перестановок по 1 минуте
+
+        for cycle in range(max_cycles):
+            # 1) если нет актуальных экстремумов — подтянем по REST
+            if cur_prev_high <= 0 or cur_prev_low <= 0:
+                ph, pl = await _prev_hl_rest()
+                if ph and pl:
+                    cur_prev_high, cur_prev_low = ph, pl
+                else:
+                    log.info("[EXT][LIM][SKIP] no prev HL from REST; retry in 5s")
+                    await asyncio.sleep(5)
+                    continue
+
+            # 2) Рассчитать цену входа и целевые SL/TP от текущих экстремумов
+            if side == "Buy":
+                entry_price = self._ceil_step(cur_prev_low + eps, tick)
+                tp_ref = float(tp) if (tp and tp > 0) else (cur_prev_high - eps)
+                sl_ref = float(sl) if (sl and sl > 0) else (entry_price - 2 * tick)
+                sl_adj, tp_adj = self._fix_tpsl("Buy", entry_price, sl_ref, tp_ref, tick)
+            else:
+                entry_price = self._round_step(cur_prev_high - eps, tick)
+                tp_ref = float(tp) if (tp and tp > 0) else (cur_prev_low + eps)
+                sl_ref = float(sl) if (sl and sl > 0) else (entry_price + 2 * tick)
+                sl_adj, tp_adj = self._fix_tpsl("Sell", entry_price, sl_ref, tp_ref, tick)
+
+            log.info(f"[EXT][LIM][PLACE] {side} limit entry={self._fmt(entry_price)} tp={self._fmt(tp_adj)} sl={self._fmt(sl_adj)} qty={self._fmt(qty)}")
+
+            # 3) Поставить лимитник GTC
+            r = self.client.place_order(
+                self.symbol,
+                side,
+                qty,
+                order_type="Limit",
+                price=entry_price,
+                timeInForce="GTC",
+                position_idx=0,
+            )
+            if r.get("retCode") != 0:
+                log.error(f"[EXT][LIM][FAIL] place_order {r}")
+                # подождём минуту и попробуем снова со свежими HL
+                await asyncio.sleep(60)
+                cur_prev_high = cur_prev_low = 0.0
+                continue
+
+            active_oid = r.get("result", {}).get("orderId", "")
+            log.info(f"[EXT][LIM][ORDER] id={active_oid} price={self._fmt(entry_price)}")
+
+            # 4) Ждать до 60с исполнения; если не исполнилось — отменить и переставить на новые HL
+            end_ts = time.time() + 60
+            filled = False
+            while time.time() < end_ts:
+                # быстрое появление позиции
+                if await self._wait_position_open(timeout=1.0, interval=0.25):
+                    filled = True
+                    break
+                await asyncio.sleep(0.5)
+
+            if not filled:
+                # отменяем текущий лимитник
+                try:
+                    self._cancel_order(order_id=active_oid)
+                except Exception:
+                    pass
+                log.warning("[EXT][LIM][REPLACE] no fill in 60s — re-evaluate last closed HL")
+                # обновим экстремумы
+                ph, pl = await _prev_hl_rest()
+                cur_prev_high = float(ph or 0.0)
+                cur_prev_low = float(pl or 0.0)
+                continue  # следующий цикл
+
+            # 5) Исполнилось — узнаем факт. базовую цену и ставим TP/SL
+            actual_side = side
+            base_price = entry_price
+            try:
+                pos = self.client.position_list(self.symbol)
+                items = pos.get("result", {}).get("list", [])
+                if items:
+                    it = items[0]
+                    actual_side = it.get("side") or side
+                    b = float(it.get("avgPrice") or it.get("entryPrice") or 0.0)
+                    if b > 0:
+                        base_price = b
             except Exception:
                 pass
-            return
 
-        # Узнаем базовую цену и сторону фактической позиции
-        actual_side = side
-        base_price = entry_price
+            sl_final, tp_final = self._fix_tpsl(actual_side, base_price, sl_adj, tp_adj, tick)
+            log.info(f"[EXT][LIM][TPSL] side={actual_side} base={self._fmt(base_price)} sl={self._fmt(sl_final)} tp={self._fmt(tp_final)}")
+
+            tr = self.client.trading_stop(
+                self.symbol,
+                side=actual_side,
+                stop_loss=sl_final,
+                take_profit=tp_final,
+                tpslMode="Full",
+                positionIdx=0,
+            )
+            if tr.get("retCode") in (0, None):
+                log.info(f"[EXT][LIM][TPSL][OK] sl={self._fmt(sl_final)} tp={self._fmt(tp_final)}")
+            else:
+                log.warning(f"[EXT][LIM][TPSL][FAIL] {tr}")
+
+            return  # выходим после успешного входа
+
+        log.warning("[EXT][LIM][ABORT] max cycles reached; stop")
+
+    # вспомогательная проверка статуса лимитника по orderId (если потребуется где-то ещё)
+    def _order_status_brief(self, order_id: str) -> str:
         try:
-            pos = self.client.position_list(self.symbol)
-            items = pos.get("result", {}).get("list", [])
-            if items:
-                it = items[0]
-                actual_side = it.get("side") or side
-                b = float(it.get("avgPrice") or it.get("entryPrice") or 0.0)
-                if b > 0:
-                    base_price = b
+            st = self.client.get_order_status(self.symbol, order_id)
+            s = (st.get("status") or "").lower()
+            ce = float(st.get("cumExecQty") or 0.0)
+            q = float(st.get("qty") or 0.0)
+            return f"{s or 'n/a'} {ce}/{q}"
         except Exception:
-            pass
-
-        # Итоговые TP/SL с учётом фактической базы
-        sl_final, tp_final = self._fix_tpsl(actual_side, base_price, sl_adj, tp_adj, tick)
-        log.info(f"[EXT][LIM][TPSL] side={actual_side} base={self._fmt(base_price)} sl={self._fmt(sl_final)} tp={self._fmt(tp_final)}")
-
-        # Ставим TP/SL через trading-stop (Full)
-        tr = self.client.trading_stop(self.symbol, side=actual_side, stop_loss=sl_final, take_profit=tp_final, tpslMode="Full", positionIdx=0)
-        if tr.get("retCode") in (0, None):
-            log.info(f"[EXT][LIM][TPSL][OK] sl={self._fmt(sl_final)} tp={self._fmt(tp_final)}")
-        else:
-            log.warning(f"[EXT][LIM][TPSL][FAIL] {tr}")
+            return "n/a"
 
     # NOTE: ниже — старая ветка с условными заявками; для live-follow она не используется.
     def _place_conditional(self, side: str, trigger_price: float, qty: float, trigger_direction: int) -> Dict[str, Any]:
