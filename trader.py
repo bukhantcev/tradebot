@@ -299,20 +299,42 @@ class Trader:
         if oid_buy:
             self._cancel_order(order_id=oid_buy)
 
-        # 4) Ставим TP/SL для открытой позиции
+        # 4) Определяем фактическую сторону/цену позиции и нормализуем TP/SL
+        actual_side = side
+        base_price = None
+        try:
+            pos = self.client.position_list(self.symbol)
+            items = pos.get("result", {}).get("list", [])
+            if items:
+                it = items[0]
+                actual_side = it.get("side") or actual_side
+                base_price = float(it.get("avgPrice") or it.get("entryPrice") or 0.0)
+        except Exception:
+            pass
+
+        f = self.ensure_filters()
+        tick = f["tickSize"]
+        if base_price and base_price > 0:
+            sl_adj, tp_adj = self._fix_tpsl(actual_side, base_price, sl_r, tp_r, tick)
+        else:
+            sl_adj, tp_adj = sl_r, tp_r
+
+        log.info(f"[TPSL][NORM] side={actual_side} base={self._fmt(base_price) if base_price else 'n/a'} sl={self._fmt(sl_adj)} tp={self._fmt(tp_adj)}")
+
+        # 5) Ставим TP/SL для открытой позиции
         r2 = self.client.trading_stop(
             self.symbol,
-            side=side,
-            stop_loss=sl_r,
-            take_profit=tp_r,
+            side=actual_side,
+            stop_loss=sl_adj,
+            take_profit=tp_adj,
             tpslMode="Full",
             positionIdx=0,
         )
         if r2.get("retCode") in (0, None):
-            log.info(f"[TPSL] sl={self._fmt(sl_r)} tp={self._fmt(tp_r)} OK")
+            log.info(f"[TPSL] sl={self._fmt(sl_adj)} tp={self._fmt(tp_adj)} OK")
             if self.notifier:
                 try:
-                    await self.notifier.notify(f"🎯 TP/SL set: SL {self._fmt(sl_r)} / TP {self._fmt(tp_r)}")
+                    await self.notifier.notify(f"🎯 TP/SL set: SL {self._fmt(sl_adj)} / TP {self._fmt(tp_adj)}")
                 except Exception:
                     pass
         else:
@@ -460,19 +482,41 @@ class Trader:
             log.warning("[TPSL][SKIP] position not opened")
             return
 
+        # Нормализуем TP/SL относительно ФАКТИЧЕСКОЙ стороны и базовой цены позиции
+        actual_side = side
+        base_price = None
+        try:
+            pos = self.client.position_list(self.symbol)
+            items = pos.get("result", {}).get("list", [])
+            if items:
+                it = items[0]
+                actual_side = it.get("side") or actual_side
+                base_price = float(it.get("avgPrice") or it.get("entryPrice") or 0.0)
+        except Exception:
+            pass
+
+        f = self.ensure_filters()
+        tick = f["tickSize"]
+        if base_price and base_price > 0:
+            sl_adj, tp_adj = self._fix_tpsl(actual_side, base_price, sl_r, tp_r, tick)
+        else:
+            sl_adj, tp_adj = sl_r, tp_r
+
+        log.info(f"[TPSL][NORM] side={actual_side} base={self._fmt(base_price) if base_price else 'n/a'} sl={self._fmt(sl_adj)} tp={self._fmt(tp_adj)}")
+
         r2 = self.client.trading_stop(
             self.symbol,
-            side=side,
-            stop_loss=sl_r,
-            take_profit=tp_r,
+            side=actual_side,
+            stop_loss=sl_adj,
+            take_profit=tp_adj,
             tpslMode="Full",
             positionIdx=0,
         )
         if r2.get("retCode") in (0, None):
-            log.info(f"[TPSL] sl={self._fmt(sl_r)} tp={self._fmt(tp_r)} OK")
+            log.info(f"[TPSL] sl={self._fmt(sl_adj)} tp={self._fmt(tp_adj)} OK")
             if self.notifier:
                 try:
-                    await self.notifier.notify(f"🎯 TP/SL set: SL {self._fmt(sl_r)} / TP {self._fmt(tp_r)}")
+                    await self.notifier.notify(f"🎯 TP/SL set: SL {self._fmt(sl_adj)} / TP {self._fmt(tp_adj)}")
                 except Exception:
                     pass
         else:
