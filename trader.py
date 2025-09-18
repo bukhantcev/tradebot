@@ -249,7 +249,14 @@ class Trader:
 
         # Маркет-вход: сначала ордер БЕЗ TP/SL, затем TP/SL через trading-stop (устраняем 30208)
         log.info(f"[ENTER] {side} qty={self._fmt(qty)}")
-        r = self.client.place_order(self.symbol, side, qty)
+        r = self.client.place_order(
+            self.symbol,
+            side,
+            qty,
+            order_type="Market",
+            slippageToleranceType="Percent",
+            slippageTolerance="0.5",
+        )
         rc = r.get("retCode")
         if rc == 0:
             order_id = r.get("result", {}).get("orderId", "")
@@ -266,7 +273,14 @@ class Trader:
                 log.error(f"[ORDER][FAIL] rc=110007 (no balance), qty too small after retry")
                 return
             log.info(f"[ENTER][RETRY] reduce qty -> {self._fmt(qty2)}")
-            r = self.client.place_order(self.symbol, side, qty2)
+            r = self.client.place_order(
+                self.symbol,
+                side,
+                qty2,
+                order_type="Market",
+                slippageToleranceType="Percent",
+                slippageTolerance="0.5",
+            )
             if r.get("retCode") == 0:
                 order_id = r.get("result", {}).get("orderId", "")
                 log.info(f"[ORDER←] OK id={order_id}")
@@ -315,7 +329,14 @@ class Trader:
             log.info("[EXIT][SKIP] qty=0")
             return
         log.info(f"[EXIT] {side} qty={self._fmt(qty)}")
-        r = self.client.place_order(self.symbol, side, qty)
+        r = self.client.place_order(
+            self.symbol,
+            side,
+            qty,
+            order_type="Market",
+            slippageToleranceType="Percent",
+            slippageTolerance="0.5",
+        )
         if r.get("retCode") == 0:
             oid = r.get("result", {}).get("orderId", "")
             log.info(f"[ORDER←] CLOSE OK id={oid}")

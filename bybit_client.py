@@ -120,6 +120,8 @@ class BybitClient:
         timeInForce: str = "GoodTillCancel",
         tpOrderType: Optional[str] = "Market",
         slOrderType: Optional[str] = "Market",
+        slippageToleranceType: Optional[str] = None,  # "Percent" or "TickSize"
+        slippageTolerance: Optional[str] = None,      # e.g., "0.5" for 0.50%
     ):
         body = {
             "category": "linear",
@@ -135,6 +137,11 @@ class BybitClient:
         if order_type.lower() == "market":
             body.pop("price", None)
             body["timeInForce"] = "IOC"
+            # Optional explicit slippage tolerance for market orders
+            if slippageToleranceType:
+                body["slippageToleranceType"] = slippageToleranceType  # "Percent" or "TickSize"
+            if slippageTolerance:
+                body["slippageTolerance"] = str(slippageTolerance)
         else:
             body["timeInForce"] = timeInForce
 
