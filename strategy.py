@@ -38,6 +38,7 @@ class StrategyEngine:
         self,
         risk_pct: float = RISK_PCT,
         symbol: str = SYMBOL,
+        tick_size: float = 0.1,
         sl_mult: float = 1.5,
         tp_vs_sl: float = 2.0,
         cooldown_sec: int = 180,
@@ -45,6 +46,7 @@ class StrategyEngine:
     ):
         self.risk_pct = risk_pct
         self.symbol = symbol
+        self.tick_size = float(tick_size)
         self.sl_mult = sl_mult
         self.tp_vs_sl = tp_vs_sl
         self.cooldown_sec = cooldown_sec
@@ -136,13 +138,15 @@ class StrategyEngine:
 
         body_high = max(prev_open, prev_close)
         body_low = min(prev_open, prev_close)
+        tick = max(self.tick_size, 1e-9)
+        tp_nudges = 4 * tick  # смещаем TP на 4 тика внутрь тела
 
         if action == "Buy":
             sl = close - sl_mult * atr
-            tp = body_high
+            tp = body_high - tp_nudges
         else:  # Sell
             sl = close + sl_mult * atr
-            tp = body_low
+            tp = body_low + tp_nudges
 
         log.info(f"[DECIDE] {action} | sl={sl:.2f} tp={tp:.2f} • {reason}")
         if self._notifier:
