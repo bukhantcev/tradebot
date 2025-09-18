@@ -45,51 +45,6 @@ class Trader:
         self.available: float = 0.0  # доступный баланс для маржи (USDT)
         # режим входа по экстремам предыдущей закрытой свечи (выкл. по умолчанию)
         self.entry_extremes: bool = os.getenv("ENTRY_EXTREMES", "0") == "1"
-        # таск минутного логгера
-        self._minute_task = None
-    def _round_down_qty(self, qty: float) -> float:
-        """Округляет вниз с учётом шага количества; запасной шаг 0.001."""
-        try:
-            f = self.ensure_filters()
-            step = float(f.get("qtyStep", 0.001))
-        except Exception:
-            step = 0.001
-        if step <= 0:
-            step = 0.001
-        n = int(qty / step)
-        return max(step, n * step)
-
-    def _start_minute_logger(self, mode: str, sl_price: float | None):
-        """Запускает компактный логгер раз в минуту: px, позиция, режим, SL."""
-        if self._minute_task and not self._minute_task.done():
-            return
-        import asyncio, time
-        async def _loop():
-            last_min = int(time.time() // 60)
-            while True:
-                try:
-                    m = int(time.time() // 60)
-                    if m != last_min:
-                        last_min = m
-                        px = self._last_price()
-                        side, sz = self._position_side_and_size()
-                        log.info(f"[STAT][MIN] mode={mode} px={self._fmt(px)} pos={side or 'Flat'} size={self._fmt(sz)} SL={(self._fmt(sl_price) if sl_price else 'None')}")
-                    await asyncio.sleep(0.25)
-                except asyncio.CancelledError:
-                    break
-                except Exception:
-                    await asyncio.sleep(0.5)
-        self._minute_task = asyncio.create_task(_loop(), name="minute_stat")
-
-    async def _stop_minute_logger(self):
-        t = self._minute_task
-        if t and not t.done():
-            t.cancel()
-            try:
-                await t
-            except Exception:
-                pass
-        self._minute_task = None
 
     # ---------- УТИЛЫ ----------
 
@@ -636,17 +591,12 @@ class Trader:
         tp = float(_sg_multi(["tp", "take_profit", "takeProfit"]) or 0.0)
         if sl <= 0 or tp <= 0:
             log.info("[ENTER][SKIP] bad SL/TP")
-            await self._stop_minute_logger()
             return
-
-        # старт минутного логгера (режим уточним ниже)
-        self._start_minute_logger("normal", float(sl) if sl else None)
 
         qty = self._calc_qty(side, price, sl)
         log.info(f"[QTY] risk%={self.risk_pct*100:.2f} stop={abs(price-sl):.2f} equity={self.equity:.2f} avail={self.available:.2f} -> qty={self._fmt(qty)}")
         if qty <= 0:
             log.info("[ENTER][SKIP] qty=0")
-            await self._stop_minute_logger()
             return
 
         # Подготовим округлённые SL/TP заранее (для передачи в order/create)
@@ -675,132 +625,121 @@ class Trader:
                 fields = ["?"]
             log.info(f"[EXT][MODE] OFF ({','.join(reason) if reason else 'n/a'}) fields={fields}")
 
-        # обновим режим минутного логгера
-        await self._stop_minute_logger()
-        self._start_minute_logger("ext" if use_ext else "normal", float(sl) if sl else None)
-
-        # (3) Всегда форсируем flat перед новым входом
-        ps, sz = self._position_side_and_size()
-        if ps and sz > 0:
-            log.info(f"[ENTER][FLAT] close existing {ps} size={self._fmt(sz)} before new entry")
-            await self.close_market(self._opposite(ps), sz)
-            for _ in range(20):
-                p2, s2 = self._position_side_and_size()
-                if not p2 or s2 <= 0:
-                    break
-                await asyncio.sleep(0.25)
-
         if use_ext:
             log.info(f"[EXT][FOLLOW] side={side} prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} qty={self._fmt(qty)}")
             await self._follow_extremes(side, float(prev_high), float(prev_low), qty)
-            await self._stop_minute_logger()
             return
 
-        # Маркет-вход: БЕЗ TP/SL, с жёстким ретраем 110007 (уменьшаем qty до минимума)
+        # Маркет-вход: сначала ордер БЕЗ TP/SL, затем TP/SL через trading-stop (устраняем 30208)
         log.info(f"[ENTER] {side} qty={self._fmt(qty)}")
-        attempt_qty = qty
-        order_id = None
-        # максимум 6 попыток, уменьшая до минимального шага
-        for attempt in range(6):
+        r = self.client.place_order(
+            self.symbol,
+            side,
+            qty,
+            order_type="Market",
+            preferSmart=True,
+        )
+        rc = r.get("retCode")
+        if rc == 0:
+            order_id = r.get("result", {}).get("orderId", "")
+            log.info(f"[ORDER←] OK id={order_id}")
+            if self.notifier:
+                try:
+                    await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(qty)} (id {order_id})")
+                except Exception:
+                    pass
+            # Дождаться фактического фила или ретраиться
+            if not await self._await_fill_or_retry(order_id, side, qty):
+                log.warning("[ENTER][ABORT] no fill")
+                return
+        elif rc == 110007:  # ab not enough for new order — уменьшим объём и повторим один раз
+            f = self.ensure_filters()
+            qty2 = max(f["minQty"], self._round_step(qty * 0.9, f["qtyStep"]))
+            if qty2 < f["minQty"]:
+                log.error(f"[ORDER][FAIL] rc=110007 (no balance), qty too small after retry")
+                return
+            log.info(f"[ENTER][RETRY] reduce qty -> {self._fmt(qty2)}")
             r = self.client.place_order(
                 self.symbol,
                 side,
-                attempt_qty,
+                qty2,
                 order_type="Market",
                 preferSmart=True,
             )
-            rc = r.get("retCode")
-            if rc == 0:
+            if r.get("retCode") == 0:
                 order_id = r.get("result", {}).get("orderId", "")
                 log.info(f"[ORDER←] OK id={order_id}")
                 if self.notifier:
                     try:
-                        await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(attempt_qty)} (id {order_id})")
+                        await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(qty2)} (id {order_id})")
                     except Exception:
                         pass
-                break
-            if rc == 110007:
-                f = self.ensure_filters()
-                step = f.get("qtyStep", 0.001)
-                min_qty = f.get("minQty", 0.001)
-                new_qty = self._round_down_qty(attempt_qty * 0.75)
-                if new_qty >= attempt_qty:
-                    new_qty = self._round_down_qty(attempt_qty - step)
-                if new_qty < min_qty:
-                    log.error(f"[ENTER][FAIL] insufficient balance for minimal qty; last={self._fmt(attempt_qty)}")
-                    await self._stop_minute_logger()
+                # Дождаться фактического фила или ретраиться
+                if not await self._await_fill_or_retry(order_id, side, qty2):
+                    log.warning("[ENTER][ABORT] no fill")
                     return
-                log.info(f"[ENTER][RETRY_QTY] 110007 -> {self._fmt(attempt_qty)} -> {self._fmt(new_qty)}")
-                attempt_qty = new_qty
-                continue
-            if rc == 30208:
-                # прайс-защита: используем мягкую толерантность
-                log.warning("[ENTER][RETRY] 30208: add slippage Percent=0.05")
-                r2 = self.client.place_order(
-                    self.symbol, side, attempt_qty, order_type="Market",
-                    slippageToleranceType="Percent", slippageTolerance="0.05"
+                qty = qty2  # используем фактическое qty далее
+            else:
+                log.error(f"[ORDER][FAIL] {r}")
+                return
+        elif rc == 30208:
+            # 1-й ретрай: мягкая толерантность по % (0.05%)
+            log.warning("[ORDER][RETRY] 30208: add slippage Percent=0.05")
+            r = self.client.place_order(
+                self.symbol,
+                side,
+                qty,
+                order_type="Market",
+                slippageToleranceType="Percent",
+                slippageTolerance="0.05",
+            )
+            rc2 = r.get("retCode")
+            if rc2 == 0:
+                order_id = r.get("result", {}).get("orderId", "")
+                log.info(f"[ORDER←] OK id={order_id} (slip 0.05%)")
+                if self.notifier:
+                    try:
+                        await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(qty)} (id {order_id}, slip 0.05%)")
+                    except Exception:
+                        pass
+                # Дождаться фактического фила или ретраиться
+                if not await self._await_fill_or_retry(order_id, side, qty):
+                    log.warning("[ENTER][ABORT] no fill")
+                    return
+            elif rc2 == 30208:
+                # 2-й ретрай: толерантность в тиках (5 тиков)
+                log.warning("[ORDER][RETRY] 30208: add slippage TickSize=5")
+                r = self.client.place_order(
+                    self.symbol,
+                    side,
+                    qty,
+                    order_type="Market",
+                    slippageToleranceType="TickSize",
+                    slippageTolerance="5",
                 )
-                if r2.get("retCode") == 0:
-                    order_id = r2.get("result", {}).get("orderId", "")
-                    log.info(f"[ORDER←] OK id={order_id} (slip 0.05%)")
-                    if self.notifier:
-                        try:
-                            await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(attempt_qty)} (id {order_id}, slip 0.05%)")
-                        except Exception:
-                            pass
-                    break
-                # ещё попытка с TickSize=5
-                log.warning("[ENTER][RETRY] 30208: add slippage TickSize=5")
-                r3 = self.client.place_order(
-                    self.symbol, side, attempt_qty, order_type="Market",
-                    slippageToleranceType="TickSize", slippageTolerance="5"
-                )
-                if r3.get("retCode") == 0:
-                    order_id = r3.get("result", {}).get("orderId", "")
+                if r.get("retCode") == 0:
+                    order_id = r.get("result", {}).get("orderId", "")
                     log.info(f"[ORDER←] OK id={order_id} (slip 5 ticks)")
                     if self.notifier:
                         try:
-                            await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(attempt_qty)} (id {order_id}, slip 5 ticks)")
+                            await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(qty)} (id {order_id}, slip 5 ticks)")
                         except Exception:
                             pass
-                    break
-                log.error(f"[ENTER][FAIL] {r3}")
-                await self._stop_minute_logger()
-                return
-            log.error(f"[ENTER][FAIL] {r}")
-            await self._stop_minute_logger()
-            return
-
-        if not order_id:
-            log.error("[ENTER][FAIL] no orderId")
-            await self._stop_minute_logger()
-            return
-
-        # Дождаться фактического фила или ретраиться
-        if not await self._await_fill_or_retry(order_id, side, attempt_qty):
-            log.warning("[ENTER][ABORT] no fill")
-            await self._stop_minute_logger()
-            return
-
-        # ← NEW: сразу ставим SL после обычного входа по рынку
-        if sl:
-            try:
-                tr = self.client.trading_stop(
-                    self.symbol,
-                    side=side,
-                    stop_loss=float(sl),
-                    tpslMode="Full",
-                    positionIdx=0,
-                )
-                if tr.get("retCode") in (0, None):
-                    log.info(f"[SL][NORM] set SL={self._fmt(sl)} OK")
+                    # Дождаться фактического фила или ретраиться
+                    if not await self._await_fill_or_retry(order_id, side, qty):
+                        log.warning("[ENTER][ABORT] no fill")
+                        return
                 else:
-                    log.warning(f"[SL][NORM][FAIL] {tr}")
-            except Exception as e:
-                log.warning(f"[SL][NORM][EXC] {e}")
+                    log.error(f"[ORDER][FAIL] {r}")
+                    return
+            else:
+                log.error(f"[ORDER][FAIL] {r}")
+                return
+        else:
+            log.error(f"[ORDER][FAIL] {r}")
+            return
 
-        # Обновим qty на фактический
-        qty = attempt_qty
+        # Позиция открыта (либо после ретраев) — ставим TP/SL
 
         # Нормализуем TP/SL относительно ФАКТИЧЕСКОЙ стороны и базовой цены позиции
         actual_side = side
@@ -841,8 +780,6 @@ class Trader:
                     pass
         else:
             log.warning(f"[TPSL][FAIL] {r2}")
-
-        await self._stop_minute_logger()
 
     async def close_market(self, side: str, qty: float):
         """
