@@ -52,6 +52,8 @@ class Trader:
             self.ext_eps_ticks = 2
         # таск минутного логгера
         self._minute_task = None
+        self._minute_mode: str = "normal"
+        self._minute_sl: float | None = None
     def _round_down_qty(self, qty: float) -> float:
         """Округляет вниз с учётом шага количества; запасной шаг 0.001."""
         try:
@@ -64,8 +66,8 @@ class Trader:
         n = int(qty / step)
         return max(step, n * step)
 
-    def _start_minute_logger(self, mode: str, sl_price: float | None):
-        """Запускает компактный логгер раз в минуту: px, позиция, режим, SL."""
+    def _start_minute_logger(self):
+        """Запускает один общий минутный логгер; режим/SL берутся из self._minute_mode/_minute_sl."""
         if self._minute_task and not self._minute_task.done():
             return
         import asyncio, time
@@ -78,6 +80,8 @@ class Trader:
                         last_min = m
                         px = self._last_price()
                         side, sz = self._position_side_and_size()
+                        sl_price = self._minute_sl
+                        mode = self._minute_mode
                         log.info(f"[STAT][MIN] mode={mode} px={self._fmt(px)} pos={side or 'Flat'} size={self._fmt(sz)} SL={(self._fmt(sl_price) if sl_price else 'None')}")
                     await asyncio.sleep(0.25)
                 except asyncio.CancelledError:
@@ -87,6 +91,12 @@ class Trader:
                     await asyncio.sleep(0.5)
         self._minute_task = asyncio.create_task(_loop(), name="minute_stat")
         log.info("[MIN][START] minute logger started")
+
+    def set_minute_status(self, mode: str, sl_price: float | None):
+        self._minute_mode = mode
+        self._minute_sl = sl_price
+        log.info(f"[MIN][MODE] set mode={mode} SL={(self._fmt(sl_price) if sl_price else 'None')}")
+        self._start_minute_logger()
 
     async def _stop_minute_logger(self):
         t = self._minute_task
@@ -690,8 +700,8 @@ class Trader:
             await self._stop_minute_logger()
             return
 
-        # старт минутного логгера (режим уточним ниже)
-        self._start_minute_logger("normal", float(sl) if sl else None)
+        # старт/обновление минутного логгера (без перезапуска задачи)
+        self.set_minute_status("normal", float(sl) if sl else None)
 
         qty = self._calc_qty(side, price, sl)
         log.info(f"[QTY] risk%={self.risk_pct*100:.2f} stop={abs(price-sl):.2f} equity={self.equity:.2f} avail={self.available:.2f} -> qty={self._fmt(qty)}")
@@ -727,12 +737,9 @@ class Trader:
             log.info(f"[EXT][MODE] OFF ({','.join(reason) if reason else 'n/a'}) fields={fields}")
 
         # обновим режим минутного логгера
-        log.info("[EXT][CHECKPOINT] before minute logger stop/start")
+        log.info("[EXT][CHECKPOINT] minute logger set status")
         try:
-            await self._stop_minute_logger()
-            log.info("[EXT][CHECKPOINT] minute logger stopped")
-            self._start_minute_logger("ext" if use_ext else "normal", float(sl) if sl else None)
-            log.info("[EXT][CHECKPOINT] after minute logger start")
+            self.set_minute_status("ext" if use_ext else "normal", float(sl) if sl else None)
         except Exception as e:
             log.exception(f"[EXT][LOGGER][EXC] {e}")
 
@@ -914,7 +921,7 @@ class Trader:
         else:
             log.warning(f"[TPSL][FAIL] {r2}")
 
-        await self._stop_minute_logger()
+        # (удалено по инструкции)
 
     async def close_market(self, side: str, qty: float):
         """
