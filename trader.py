@@ -366,6 +366,8 @@ class Trader:
             log.info("[EXT][SKIP] bad params")
             return
 
+        log.info("[EXT][ENTER_FN] _follow_extremes started")
+
         # базовые величины
         f = self.ensure_filters()
         tick = float(f.get("tickSize", 0.1) or 0.1)
@@ -731,8 +733,13 @@ class Trader:
 
         if use_ext:
             log.info(f"[EXT][FOLLOW] side={side} prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} qty={self._fmt(qty)}")
-            await self._follow_extremes(side, float(prev_high), float(prev_low), qty)
-            await self._stop_minute_logger()
+            try:
+                await self._follow_extremes(side, float(prev_high), float(prev_low), qty)
+                log.info("[EXT][RETURN] _follow_extremes finished normally")
+            except Exception as e:
+                log.exception(f"[EXT][CRASH] _follow_extremes exception: {e}")
+            finally:
+                await self._stop_minute_logger()
             return
 
         # Маркет-вход: БЕЗ TP/SL, с жёстким ретраем 110007 (уменьшаем qty до минимума)
