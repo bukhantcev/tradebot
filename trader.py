@@ -190,7 +190,7 @@ class Trader:
             return 0.0
         return qty
 
-    async def _wait_position_open(self, timeout: float = 2.0, interval: float = 0.2) -> bool:
+    async def _wait_position_open(self, timeout: float = 10.0, interval: float = 0.3) -> bool:
         """
         Короткое ожидание появления позиции (size&gt;0), чтобы fallback trading-stop не падал rc=10001.
         Возвращает True, если позиция открылась в течение timeout.
@@ -201,8 +201,9 @@ class Trader:
             try:
                 pl = self.client.position_list(self.symbol)
                 lst = pl.get("result", {}).get("list", [])
-                if lst:
-                    size_str = lst[0].get("size") or lst[0].get("positionValue") or ""
+                # Пройдём по всем позициям (на случай hedge-mode/двух сторон)
+                for it in lst:
+                    size_str = it.get("size") or it.get("positionValue") or ""
                     try:
                         size = float(size_str) if size_str != "" else 0.0
                     except Exception:
@@ -477,7 +478,7 @@ class Trader:
             return
 
         # После успешного входа — подождём открытия позиции и поставим TP/SL отдельным вызовом
-        ok = await self._wait_position_open()
+        ok = await self._wait_position_open(timeout=10.0, interval=0.3)
         if not ok:
             log.warning("[TPSL][SKIP] position not opened")
             return
