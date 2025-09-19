@@ -201,6 +201,21 @@ class Trader:
             log.error("[QTY][PARSE][ERR] cannot parse qty from %r", q)
             return None
 
+    def _extract_qty_from_ctx(self, ctx: dict) -> Optional[float]:
+        """
+        Если в словаре есть явное количество — вернуть его без логов.
+        Поддерживаем варианты ключей.
+        """
+        for k in ("qty", "quantity", "value", "amount", "size"):
+            v = ctx.get(k)
+            if v is None:
+                continue
+            try:
+                return float(v)
+            except Exception:
+                continue
+        return None
+
     # -----------------------------
     # Вход
     # -----------------------------
@@ -246,21 +261,22 @@ class Trader:
         # явное значение, а при отсутствии — посчитаем от риска.
         if isinstance(qty, dict):
             ctx = qty
-            # сначала попытка вытащить явное поле количества
-            parsed = self._to_float_qty(ctx)
-            if parsed is not None:
-                qty = parsed
+            # 1) Пытаемся взять явное количество, если оно есть
+            explicit = self._extract_qty_from_ctx(ctx)
+            if explicit is not None:
+                qty = explicit
             else:
+                # 2) Нет явного qty — считаем от риска, используя price/sl из контекста
                 eff_sl = ctx.get("sl", sl)
-                eff_price = ctx.get("price", last)
+                eff_price = ctx.get("price") or ctx.get("close") or last
                 if eff_sl is None:
-                    log.error("[QTY][PARSE][ERR] dict has no 'sl' to compute qty: %r", ctx)
+                    log.warning("[QTY][CTX] no SL in ctx to compute qty; skip. ctx=%r", ctx)
                     qty = None
                 else:
                     try:
                         qty = self.risk.calc_qty(side=side, price=float(eff_price), sl=float(eff_sl))
                     except Exception as e:
-                        log.error("[QTY][PARSE][ERR] risk.calc_qty failed: %s | ctx=%r", str(e), ctx)
+                        log.error("[QTY][CTX][ERR] risk.calc_qty failed: %s | ctx=%r", str(e), ctx)
                         qty = None
         elif qty is None:
             # Количество не задано — считаем от риска, нужен SL
@@ -274,6 +290,9 @@ class Trader:
         if qty is None:
             log.info("[ENTER][SKIP] qty is None after normalization")
             return
+        # Небольшая защита от микроскопических значений после округления
+        if 0 < qty < self.qty_step:
+            qty = 0.0
         if qty < self.qty_step:
             log.info("[ENTER][SKIP] qty=%s < min step=%s", qty, self.qty_step)
             return
