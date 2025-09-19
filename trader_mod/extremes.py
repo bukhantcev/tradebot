@@ -283,7 +283,7 @@ async def enter_extremes_with_limits(self, side: str, prev_high: float, prev_low
                 self.symbol, side=actual_side,
                 stop_loss=sl_final, take_profit=tp_final,
                 tpslMode="Full", tpTriggerBy="LastPrice",
-                slTriggerBy="MarkPrice", tpOrderType="Market",
+                slTriggerBy="LastPrice", tpOrderType="Market",
                 positionIdx=0,
             )
             rc = tr.get("retCode")

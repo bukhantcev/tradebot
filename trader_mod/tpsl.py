@@ -80,7 +80,7 @@ async def _realign_tpsl(self, side: str, desired_sl: float, desired_tp: float, t
                     take_profit=tp_norm,
                     tpslMode="Full",
                     tpTriggerBy="LastPrice",
-                    slTriggerBy="MarkPrice",
+                    slTriggerBy="LastPrice",
                     tpOrderType="Market",
                     positionIdx=0,
                 )
@@ -238,7 +238,7 @@ async def _apply_sl_failsafe(self, side: str, sl: float) -> bool:
                     side=side,
                     stop_loss=sl_f,
                     tpslMode="Full",
-                    slTriggerBy="MarkPrice",
+                    slTriggerBy="LastPrice",
                     positionIdx=0,
                 )
                 rc = r.get("retCode")
@@ -281,7 +281,7 @@ async def _apply_tpsl_failsafe(self, side: str, base_price: float, sl: float, tp
                     take_profit=tp_n,
                     tpslMode="Full",
                     tpTriggerBy="LastPrice",
-                    slTriggerBy="MarkPrice",
+                    slTriggerBy="LastPrice",
                     tpOrderType="Market",
                     positionIdx=0,
                 )

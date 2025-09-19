@@ -276,7 +276,7 @@ async def open_market(self, side: str, signal: Dict[str, Any]):
             else:
                 tr = self.client.trading_stop(
                     self.symbol, side=side, stop_loss=float(sl),
-                    tpslMode="Full", slTriggerBy="MarkPrice", positionIdx=0,
+                    tpslMode="Full", slTriggerBy="LastPrice", positionIdx=0,
                 )
                 rc = tr.get("retCode")
                 if rc in (0, None, 34040):
@@ -318,7 +318,7 @@ async def open_market(self, side: str, signal: Dict[str, Any]):
             self.symbol, side=actual_side,
             stop_loss=sl_adj, take_profit=tp_adj,
             tpslMode="Full", tpTriggerBy="LastPrice",
-            slTriggerBy="MarkPrice", tpOrderType="Market",
+            slTriggerBy="LastPrice", tpOrderType="Market",
             positionIdx=0,
         )
         rc2 = r2.get("retCode")
