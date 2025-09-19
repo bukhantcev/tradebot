@@ -118,6 +118,64 @@ class Trader:
     def ensure_filters(self) -> Dict[str, float]: return acc.ensure_filters(self)
     def ensure_leverage(self): return acc.ensure_leverage(self)
 
+    async def _switch_regime(self, regime: str):
+        """
+        Switch trading regime between 'flat' and 'trend'.
+        - 'flat': close all positions, cancel all orders.
+        - 'trend': cancel all orders, keep positions.
+        """
+        if hasattr(self, "_regime") and self._regime == regime:
+            return
+        # Always stop trailing and cancel realigner
+        try:
+            await self._stop_trailing()
+        except Exception as e:
+            log.warning(f"[REGIME][SWITCH] Exception while stopping trailing: {e}")
+        try:
+            self._cancel_realigner()
+        except Exception as e:
+            log.warning(f"[REGIME][SWITCH] Exception while cancelling realigner: {e}")
+
+        if regime == "flat":
+            # Close all positions
+            try:
+                side, qty = self._position_side_and_size()
+                while side and qty > 0:
+                    try:
+                        await self.close_market(side, qty)
+                    except Exception as e:
+                        log.warning(f"[REGIME][SWITCH] Exception while closing position ({side}, {qty}): {e}")
+                        break
+                    side, qty = self._position_side_and_size()
+            except Exception as e:
+                log.warning(f"[REGIME][SWITCH] Exception during position side/size check: {e}")
+            # Cancel all orders
+            try:
+                self._cancel_all_orders()
+            except Exception as e:
+                log.warning(f"[REGIME][SWITCH] Exception while cancelling all orders: {e}")
+            log.info("[REGIME][SWITCH] Switched to FLAT: all positions closed, all orders cancelled.")
+            if self.notifier:
+                try:
+                    await self.notifier.notify("[REGIME][SWITCH] Switched to FLAT: all positions closed, all orders cancelled.")
+                except Exception as e:
+                    log.warning(f"[REGIME][SWITCH] Exception while notifying: {e}")
+        elif regime == "trend":
+            # Cancel all orders, leave positions open
+            try:
+                self._cancel_all_orders()
+            except Exception as e:
+                log.warning(f"[REGIME][SWITCH] Exception while cancelling all orders: {e}")
+            log.info("[REGIME][SWITCH] Switched to TREND: all orders cancelled, positions left open.")
+            if self.notifier:
+                try:
+                    await self.notifier.notify("[REGIME][SWITCH] Switched to TREND: all orders cancelled, positions left open.")
+                except Exception as e:
+                    log.warning(f"[REGIME][SWITCH] Exception while notifying: {e}")
+        else:
+            log.warning(f"[REGIME][SWITCH] Unknown regime: {regime}")
+        self._regime = regime
+
     async def _enter_extremes_with_limits(self, side: str, prev_high: float, prev_low: float, qty: float, sl: float, tp: float):
         await ex.enter_extremes_with_limits(self, side, prev_high, prev_low, qty, sl, tp)
 

@@ -25,6 +25,8 @@ class Signal:
     prev_low: Optional[float] = None
     prev_open: Optional[float] = None
     prev_close: Optional[float] = None
+    regime: Optional[str] = None
+    trend_side: Optional[str] = None
 
 
 class StrategyEngine:
@@ -164,6 +166,12 @@ class StrategyEngine:
             return Signal(None, f"llm_error:{e}", None, None, float(f0.get("atr14", 0.0)), int(f0.get("ts_ms", 0)), prev_high, prev_low, prev_open, prev_close)
 
         action_raw = str(decision.get("decision", "Hold"))
+        # Normalize regime/trend_side from LLM response
+        regime_raw = (decision.get("regime") or decision.get("mode") or "").strip().lower()
+        regime = regime_raw if regime_raw in ("trend", "flat") else None
+        trend_side_raw = (decision.get("trend_side") or decision.get("side") or "").strip().capitalize()
+        trend_side = trend_side_raw if trend_side_raw in ("Buy", "Sell") else None
+
         reason = str(decision.get("reason", "") or "").strip()
         action = action_raw.capitalize()
         if action not in ("Buy", "Sell"):
@@ -223,4 +231,6 @@ class StrategyEngine:
             prev_low=prev_low,
             prev_open=prev_open,
             prev_close=prev_close,
+            regime=regime,
+            trend_side=trend_side,
         )

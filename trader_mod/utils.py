@@ -97,6 +97,23 @@ async def open_market(self, side: str, signal: Dict[str, Any]):
 
     set_minute_status(self, "normal", float(sl) if sl else None)
 
+    # --- Regime switch (trend/flat) if provided by signal ---
+    try:
+        regime = None
+        # accept multiple spellings from AI
+        if isinstance(signal, dict):
+            regime = signal.get("regime") or signal.get("mode")
+        else:
+            regime = getattr(signal, "regime", None) or getattr(signal, "mode", None)
+        if regime and regime != getattr(self, "_regime", None):
+            log.info(f"[REGIME][SWITCH] {getattr(self, '_regime', None)} -> {regime}")
+            try:
+                await self._switch_regime(regime)
+            except Exception as e:
+                log.warning(f"[REGIME][SWITCH][EXC] {e}")
+    except Exception as e:
+        log.warning(f"[REGIME][PARSE][EXC] {e}")
+
     qty = self._calc_qty(side, price, sl)
     log.info(f"[QTY] risk%={self.risk_pct*100:.2f} stop={abs(price-sl):.2f} equity={self.equity:.2f} avail={self.available:.2f} -> qty={self._fmt(qty)}")
     if qty <= 0:
