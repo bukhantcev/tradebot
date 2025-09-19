@@ -938,6 +938,47 @@ class Trader:
             self._cancel_realigner()
             await self._stop_minute_logger()
             return
+        # --- ЕДИНСТВЕННЫЙ ОРДЕР/ПОЗИЦИЯ В СТОРОНУ ИИ ---
+        can_enter = await self._enforce_single_exposure(side)
+        if not can_enter:
+            # Уже есть позиция в сторону ИИ — только realign TP/SL и выходим.
+            try:
+                f = self.ensure_filters()
+                tick = f["tickSize"]
+                # Если есть текущая позиция — подтянуть TP/SL к желаемым
+                ps, sz = self._position_side_and_size()
+                if ps and sz > 0:
+                    base_price = float(self._last_price()) or float(price)
+                    sl_r = self._ceil_step(sl, tick) if side == "Buy" else self._round_step(sl, tick)
+                    tp_r = self._round_step(tp, tick) if side == "Buy" else self._ceil_step(tp, tick)
+                    sl_adj, tp_adj = self._normalize_tpsl_with_anchor(ps, base_price, sl_r, tp_r, tick)
+                    # попытка применить
+                    r2 = self.client.trading_stop(
+                        self.symbol,
+                        side=ps,
+                        stop_loss=sl_adj,
+                        take_profit=tp_adj,
+                        tpslMode="Full",
+                        tpTriggerBy="LastPrice",
+                        slTriggerBy="MarkPrice",
+                        tpOrderType="Market",
+                        positionIdx=0,
+                    )
+                    rc2 = r2.get("retCode")
+                    tag = "OK" if rc2 in (0, None) else ("UNCHANGED" if rc2 == 34040 else f"RC={rc2}")
+                    log.info(f"[TPSL][REALIGN] sl={self._fmt(sl_adj)} tp={self._fmt(tp_adj)} {tag}")
+                    # запустить мягкий реалайнер
+                    self._cancel_realigner()
+                    try:
+                        self._realign_task = asyncio.create_task(
+                            self._realign_tpsl(ps, sl_r, tp_r, tick),
+                            name="tpsl_realign"
+                        )
+                    except Exception:
+                        self._realign_task = None
+            except Exception as e:
+                log.warning(f"[ONE][REALIGN][EXC] {e}")
+            return
 
         self.set_minute_status("normal", float(sl) if sl else None)
 
@@ -1003,7 +1044,15 @@ class Trader:
 
         if use_ext:
             log.info("[EXT][CHECKPOINT] entering use_ext branch")
-            log.info(f"[EXT][LIM][FLOW] side={side} prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} qty={self._fmt(qty)}")
+            # жёстко соблюдаем «один ордер» и «в сторону ИИ»
+            can_enter_ext = await self._enforce_single_exposure(side)
+            if not can_enter_ext:
+                log.info("[EXT][SKIP] already in AI side; no new limit order")
+                await self._stop_minute_logger()
+                return
+
+            log.info(
+                f"[EXT][LIM][FLOW] side={side} prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} qty={self._fmt(qty)}")
             try:
                 await self._enter_extremes_with_limits(side, float(prev_high), float(prev_low), qty, sl=float(sl), tp=float(tp))
                 log.info("[EXT][RETURN] _enter_extremes_with_limits finished")
@@ -1228,3 +1277,53 @@ class Trader:
                 log.error(f"[ORDER][FAIL] {r}")
         else:
             log.error(f"[ORDER][FAIL] {r}")
+
+    # ---- SINGLE-EXPOSURE HELPERS ----
+    def _active_orders_count(self) -> int:
+        """Сколько активных (и conditional) ордеров по символу."""
+        try:
+            r = self.client._request("GET", "/v5/order/realtime", params={"category": "linear", "symbol": self.symbol})
+            lst = (r.get("result", {}) or {}).get("list", []) or []
+            return len(lst)
+        except Exception:
+            return 0
+
+    async def _enforce_single_exposure(self, ai_side: str) -> bool:
+        """
+        Гарантирует: нет активных ордеров и позиция либо плоская, либо совпадает со стороной ИИ.
+        Возвращает True, если можно продолжать постановку нового входа (flat или совпадает).
+        Возвращает False, если уже открыта позиция В СТОРОНУ ИИ и вход НЕ НУЖЕН.
+        """
+        # 1) снять все отложенные ордера
+        try:
+            ca = self._cancel_all_orders()
+            rc = ca.get("retCode")
+            if rc not in (0, None):
+                log.warning(f"[ONE][CANCEL_ALL][WARN] rc={rc} msg={ca.get('retMsg')}")
+            else:
+                log.info("[ONE][CANCEL_ALL][OK]")
+        except Exception as e:
+            log.warning(f"[ONE][CANCEL_ALL][EXC] {e}")
+
+        # 2) проверить позицию
+        ps, sz = self._position_side_and_size()
+        if ps and sz > 0:
+            if ps == ai_side:
+                log.info(f"[ONE][KEEP] already in {ps} size={self._fmt(sz)} -> skip new entry; will realign TP/SL only")
+                return False  # ничего нового открывать не надо
+            else:
+                # противоположная — закрываем
+                log.info(f"[ONE][FLIP] have {ps} size={self._fmt(sz)} -> closing to follow AI={ai_side}")
+                await self.close_market(self._opposite(ps), sz)
+                ok = await self._wait_position_flat(timeout=30.0, interval=0.25)
+                if not ok:
+                    log.warning("[ONE][FLIP][WARN] position is not flat after close attempt")
+        else:
+            log.info("[ONE] flat — ok")
+
+        # 3) убедиться, что нет активных ордеров
+        for _ in range(10):
+            if self._active_orders_count() == 0:
+                break
+            await asyncio.sleep(0.2)
+        return True
