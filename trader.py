@@ -12,7 +12,6 @@ from trader_mod import risk as rk
 from trader_mod import tpsl as ts
 from trader_mod import extremes as ex
 from trader_mod import utils as ut
-from trader_mod import trailing as tr
 
 log = logging.getLogger("TRADER")
 
@@ -59,8 +58,6 @@ class Trader:
         self._minute_mode: str = "normal"
         self._minute_sl: float | None = None
         self._realign_task = None  # background TPSL realigner task
-        self._regime: str | None = None  # 'trend' | 'flat' | None
-        self._trail_task: asyncio.Task | None = None  # background trailing SL task
 
     # -------- УТИЛЫ (тонкие обёртки на функции из модулей) --------
     def _round_step(self, value: float, step: float) -> float: return rk._round_step(self, value, step)
@@ -101,14 +98,6 @@ class Trader:
     async def _apply_tpsl_failsafe(self, side: str, base_price: float, sl: float, tp: float) -> bool:
         return await ts._apply_tpsl_failsafe(self, side, base_price, sl, tp)
 
-    def _start_trailing(self, side: str, atr: float, entry: float, gap_mode: str = "atr", atr_mult: float = 1.5, check_sec: float = 1.0):
-        """Start background trailing task via trader_mod.trailing; stores task in self._trail_task."""
-        self._trail_task = tr.start_trailing(self, side, atr, entry, gap_mode=gap_mode, atr_mult=atr_mult, check_sec=check_sec)
-
-    def _stop_trailing(self):
-        """Stop trailing via trader_mod.trailing (if running)."""
-        tr.stop_trailing(self)
-
     def _order_status_brief(self, order_id: str) -> str: return ex._order_status_brief(self, order_id)
     def _place_conditional(self, side: str, trigger_price: float, qty: float, trigger_direction: int) -> Dict[str, Any]:
         return ex._place_conditional(self, side, trigger_price, qty, trigger_direction)
@@ -140,39 +129,3 @@ class Trader:
 
     async def close_market(self, side: str, qty: float):
         await ut.close_market(self, side, qty)
-
-    async def _switch_regime(self, new_regime: str):
-        if new_regime == self._regime:
-            return
-        log.info(f"[REGIME][SWITCH] {self._regime} -> {new_regime}")
-        try:
-            if self._trail_task and not self._trail_task.done():
-                self._trail_task.cancel()
-        except Exception:
-            pass
-        self._cancel_realigner()
-
-        if new_regime == "flat":
-            try:
-                ps, sz = self._position_side_and_size()
-                if ps and sz > 0:
-                    log.info(f"[REGIME][FLAT] closing {ps} {self._fmt(sz)} by market")
-                    await self.close_market(self._opposite(ps), sz)
-            except Exception as e:
-                log.warning(f"[REGIME][FLAT][EXC] {e}")
-            try:
-                self._cancel_all_orders()
-            except Exception:
-                pass
-        elif new_regime == "trend":
-            try:
-                self._cancel_all_orders()
-            except Exception:
-                pass
-
-        self._regime = new_regime
-        if self.notifier:
-            try:
-                await self.notifier.notify(f"⚙️ regime switched to {new_regime}")
-            except Exception:
-                pass

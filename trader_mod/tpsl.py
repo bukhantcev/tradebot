@@ -151,111 +151,43 @@ async def _wait_position_flat(self, timeout: float = 3600.0, interval: float = 0
 
 
 async def _await_fill_or_retry(self, order_id: str, side: str, qty: float) -> bool:
-    """
-    Расширенный ретрай исполнения входа.
-    Порядок:
-      1) Быстрый чек: ждём факт появления позиции (size>0).
-      2) Если исходный ордер filled/partiallyFilled — короткое подтверждение.
-      3) Если cancelled/rejected/new/пусто — серия повторов:
-         - Market без preferSmart.
-         - Market-safe с slip_percent=0.20.
-         - Market-safe с slip_percent=0.30.
-         - Уменьшаем qty до ~75% (не ниже minQty) и ещё раз с 0.30.
-      После каждого шага ждём фактического открытия позиции.
-    """
-    # 0) быстрый чек
-    if await self._wait_position_open(timeout=10.0, interval=0.3):
+    ok = await self._wait_position_open(timeout=10.0, interval=0.3)
+    if ok:
         return True
 
-    # 1) статус исходного ордера
     try:
         st = self.client.get_order_status(self.symbol, order_id)
     except Exception:
         st = {"status": None, "cumExecQty": 0.0, "qty": 0.0}
-
     status = (st.get("status") or "").lower()
     filled = float(st.get("cumExecQty") or 0.0) > 0.0
 
     if filled or status in ("filled", "partiallyfilled"):
-        # короткое подтверждение факта появления позиции
-        return await self._wait_position_open(timeout=5.0, interval=0.3)
+        ok2 = await self._wait_position_open(timeout=5.0, interval=0.3)
+        return ok2
 
-    # 2) если отменён/отклонён/непонятен — запускаем расширенные повторы
-    if status in ("cancelled", "rejected", "new", "") or not status:
-        log.warning(f"[ORDER][RETRY] status={status or 'n/a'} -> start fallback sequence")
+    if status in ("cancelled", "rejected") or not status:
+        log.warning(f"[ORDER][CANCELLED] status={status or 'n/a'} -> retry smart market")
 
-        # вспомогательная функция ожидания с логом
-        async def _await_open(tag: str, t: float = 10.0) -> bool:
-            ok = await self._wait_position_open(timeout=t, interval=0.3)
-            if ok:
-                log.info(f"[ORDER][RETRY][{tag}] position detected")
-            return ok
-
-        # A) Market без preferSmart (иногда Smart даёт авто-cancel)
-        try:
-            r = self.client.place_order(
-                self.symbol,
-                side,
-                qty,
-                order_type="Market",
-                position_idx=0,
-            )
-            if r.get("retCode") == 0 and await _await_open("PLAIN"):
+        r = self.client.place_market_safe(self.symbol, side, qty, position_idx=0, slip_percent=0.10)
+        if r.get("retCode") == 0:
+            if await self._wait_position_open(timeout=10.0, interval=0.3):
                 return True
-        except Exception as e:
-            log.warning(f"[ORDER][RETRY][PLAIN][EXC] {e}")
 
-        # B) Market-safe со slip_percent=0.20
-        try:
-            r = self.client.place_market_safe(self.symbol, side, qty, position_idx=0, slip_percent=0.20)
-            if r.get("retCode") == 0 and await _await_open("SAFE20"):
+        r = self.client.place_market_safe(self.symbol, side, qty, position_idx=0, slip_percent=0.20)
+        if r.get("retCode") == 0:
+            if await self._wait_position_open(timeout=10.0, interval=0.3):
                 return True
-        except Exception as e:
-            log.warning(f"[ORDER][RETRY][SAFE20][EXC] {e}")
 
-        # C) Market-safe со slip_percent=0.30
-        try:
-            r = self.client.place_market_safe(self.symbol, side, qty, position_idx=0, slip_percent=0.30)
-            if r.get("retCode") == 0 and await _await_open("SAFE30"):
-                return True
-        except Exception as e:
-            log.warning(f"[ORDER][RETRY][SAFE30][EXC] {e}")
-
-        # D) Понижаем qty до ~75% (не ниже minQty) и пробуем снова с 0.30
-        try:
-            f = self.ensure_filters()
-            min_qty = float(f.get("minQty", 0.001))
-            step = float(f.get("qtyStep", 0.001))
-        except Exception:
-            min_qty, step = 0.001, 0.001
-
-        adj_qty = qty * 0.75
-        # округление вниз к шагу
-        n = int(max(adj_qty, 0.0) / max(step, 1e-9))
-        adj_qty = max(min_qty, n * step)
-        if adj_qty >= qty:
-            # форсируем уменьшение хотя бы на 1 шаг
-            adj_qty = max(min_qty, (int(qty / max(step, 1e-9)) - 1) * step)
-
-        if adj_qty >= min_qty:
-            log.info(f"[ORDER][RETRY][QTY↓] {self._fmt(qty)} -> {self._fmt(adj_qty)}")
-            try:
-                r = self.client.place_market_safe(self.symbol, side, adj_qty, position_idx=0, slip_percent=0.30)
-                if r.get("retCode") == 0 and await _await_open("SAFE30_Q↓"):
-                    return True
-            except Exception as e:
-                log.warning(f"[ORDER][RETRY][SAFE30_Q↓][EXC] {e}")
-        else:
-            log.warning(f"[ORDER][RETRY][QTY↓][SKIP] adj_qty<{min_qty}")
-
-        log.error("[ORDER][FAIL] no fill after extended retries")
+        log.error("[ORDER][FAIL] no fill after retries")
         return False
 
-    # 3) иначе — ещё короткие попытки дождаться появления позиции
     for _ in range(20):
         if await self._wait_position_open(timeout=1.0, interval=0.3):
             return True
     return False
+
+
 async def _apply_sl_failsafe(self, side: str, sl: float) -> bool:
     """
     Быстрая страховочная установка ТОЛЬКО SL сразу после открытия позиции.
