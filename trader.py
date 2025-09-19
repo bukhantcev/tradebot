@@ -239,14 +239,38 @@ class Trader:
             )
             return
 
-        # Обычный маркет-вход
         # 1) цена/к-во
         last = await self.get_last_price()
-        if qty is None:
+
+        # Если qty пришёл как словарь с контекстом (price/sl/...) — попробуем вытащить
+        # явное значение, а при отсутствии — посчитаем от риска.
+        if isinstance(qty, dict):
+            ctx = qty
+            # сначала попытка вытащить явное поле количества
+            parsed = self._to_float_qty(ctx)
+            if parsed is not None:
+                qty = parsed
+            else:
+                eff_sl = ctx.get("sl", sl)
+                eff_price = ctx.get("price", last)
+                if eff_sl is None:
+                    log.error("[QTY][PARSE][ERR] dict has no 'sl' to compute qty: %r", ctx)
+                    qty = None
+                else:
+                    try:
+                        qty = self.risk.calc_qty(side=side, price=float(eff_price), sl=float(eff_sl))
+                    except Exception as e:
+                        log.error("[QTY][PARSE][ERR] risk.calc_qty failed: %s | ctx=%r", str(e), ctx)
+                        qty = None
+        elif qty is None:
+            # Количество не задано — считаем от риска, нужен SL
             if sl is None:
                 raise ValueError("open_market: 'sl' required to compute risk-based qty")
             qty = self.risk.calc_qty(side=side, price=last, sl=float(sl))
-        qty = self._to_float_qty(qty)
+        else:
+            # Обычная нормализация числа/строки
+            qty = self._to_float_qty(qty)
+
         if qty is None:
             log.info("[ENTER][SKIP] qty is None after normalization")
             return
