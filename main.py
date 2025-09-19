@@ -90,7 +90,18 @@ async def main():
     POLL_SEC = float(os.getenv("STRAT_POLL_SEC", "1.0"))
 
     client = BybitClient()
-    trader = Trader(client=client, notifier=None)
+    # Init trader with required params from env (.env keeps names SYMBOL/LEVERAGE/RISK_PCT — do not rename)
+    symbol = os.getenv("SYMBOL", "BTCUSDT").strip().upper()
+    leverage = int(os.getenv("LEVERAGE", "1"))
+    risk_pct = float(os.getenv("RISK_PCT", "1.0"))
+
+    trader = Trader(
+        client=client,
+        symbol=symbol,
+        leverage=leverage,
+        risk_pct=risk_pct,
+        notifier=None,
+    )
     bot = TgBot(TG_TOKEN, int(TG_CHAT) if TG_CHAT else None, trader=trader)
     strat = StrategyEngine(notifier=bot)
     trader.notifier = bot
