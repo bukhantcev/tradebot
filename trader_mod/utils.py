@@ -111,15 +111,29 @@ async def open_market(self, side: str, signal: Dict[str, Any]):
     tp_r = self._round_step(tp, tick) if side == "Buy" else self._ceil_step(tp, tick)
     sl_r, tp_r = self._fix_tpsl(side, price, sl_r, tp_r, tick)
 
+    # regime-driven mode selection from signal
+    regime = _sg("regime", None)
+    atr = float(_sg_multi(["atr", "atr14"], 0.0) or 0.0)
+
     prev_high = _sg_multi(["prev_high", "prevHigh", "prevH", "previous_high", "prev_high_price"])
     prev_low = _sg_multi(["prev_low", "prevLow", "prevL", "previous_low", "prev_low_price"])
-    use_ext = bool(self.entry_extremes and prev_high and prev_low)
+    trend_mode = (regime == "trend")
+
+    # regime switch (if changed)
+    try:
+        if regime and regime != getattr(self, "_regime", None):
+            await self._switch_regime(regime)
+    except Exception as e:
+        log.warning(f"[REGIME][SWITCH][EXC] {e}")
+
+    # New rule: extremes mode only when regime == 'flat' AND we have both prev_high/prev_low
+    use_ext = bool((regime == "flat") and prev_high and prev_low)
     if use_ext:
         log.info(f"[EXT][MODE] ON  prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} qty={self._fmt(qty)}")
     else:
         reason = []
-        if not self.entry_extremes:
-            reason.append("flag_off")
+        if regime != "flat":
+            reason.append(f"regime={regime or 'n/a'}")
         if not prev_high or not prev_low:
             reason.append("no_prev_hl")
         try:
@@ -130,7 +144,7 @@ async def open_market(self, side: str, signal: Dict[str, Any]):
 
     log.info("[EXT][CHECKPOINT] minute logger set status")
     try:
-        set_minute_status(self, "ext" if use_ext else "normal", float(sl) if sl else None)
+        set_minute_status(self, "ext" if use_ext else ("trend" if trend_mode else "normal"), float(sl) if sl else None)
     except Exception as e:
         log.exception(f"[EXT][LOGGER][EXC] {e}")
 
@@ -160,6 +174,34 @@ async def open_market(self, side: str, signal: Dict[str, Any]):
     if use_ext:
         log.info("[EXT][CHECKPOINT] entering use_ext branch")
         log.info(f"[EXT][LIM][FLOW] side={side} prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} qty={self._fmt(qty)}")
+        # One-at-a-time + flat reversal logic
+        try:
+            pos_side, pos_sz = self._position_side_and_size()
+        except Exception:
+            pos_side, pos_sz = (None, 0.0)
+
+        if pos_side and pos_sz > 0 and pos_side != side:
+            # reverse: close current and clear orders
+            try:
+                await self.close_market(self._opposite(pos_side), pos_sz)
+            except Exception as e:
+                log.warning(f"[EXT][REV][CLOSE][EXC] {e}")
+            try:
+                self._cancel_all_orders()
+            except Exception:
+                pass
+            if self.notifier:
+                try:
+                    await self.notifier.notify(f"↔️ Flat reversal: closed {pos_side} {self._fmt(pos_sz)}, placing {side} limits")
+                except Exception:
+                    pass
+        else:
+            # clean pending orders before placing new limits
+            try:
+                self._cancel_all_orders()
+            except Exception:
+                pass
+
         try:
             await self._enter_extremes_with_limits(side, float(prev_high), float(prev_low), qty, sl=float(sl), tp=float(tp))
             log.info("[EXT][RETURN] _enter_extremes_with_limits finished")
@@ -170,6 +212,12 @@ async def open_market(self, side: str, signal: Dict[str, Any]):
         return
 
     # --- Маркет-вход (обычный) ---
+    # ensure there are no pending orders before market entry
+    try:
+        self._cancel_all_orders()
+        log.info("[CLEANUP] cancel-all before market entry")
+    except Exception:
+        pass
     log.info(f"[ENTER] {side} qty={self._fmt(qty)}")
     attempt_qty = qty
     order_id = None
@@ -256,6 +304,14 @@ async def open_market(self, side: str, signal: Dict[str, Any]):
         await stop_minute_logger(self)
         return
 
+    # cleanup any leftover/conditional orders after market entry in trend mode
+    if trend_mode:
+        try:
+            self._cancel_all_orders()
+            log.info("[CLEANUP] cancel-all after trend market entry")
+        except Exception as e:
+            log.warning(f"[CLEANUP][EXC] {e}")
+
     # --- FAILSAFE SL: отдельная страховка стоп-лосса на бирже ---
     try:
         if sl:
@@ -311,46 +367,68 @@ async def open_market(self, side: str, signal: Dict[str, Any]):
     log.info(f"[TPSL][NORM] side={actual_side} base={self._fmt(base_price)} sl={self._fmt(sl_adj)} tp={self._fmt(tp_adj)} (anchor=Last/base)")
 
     ps1, sz1 = self._position_side_and_size()
-    if not ps1 or sz1 <= 0:
-        log.debug("[TPSL][SKIP] flat before setting final TP/SL")
-    else:
-        r2 = self.client.trading_stop(
-            self.symbol, side=actual_side,
-            stop_loss=sl_adj, take_profit=tp_adj,
-            tpslMode="Full", tpTriggerBy="LastPrice",
-            slTriggerBy="MarkPrice", tpOrderType="Market",
-            positionIdx=0,
-        )
-        rc2 = r2.get("retCode")
-        if rc2 in (0, None, 34040):
-            tag = "OK" if rc2 in (0, None) else "UNCHANGED"
-            log.info(f"[TPSL] sl={self._fmt(sl_adj)} tp={self._fmt(tp_adj)} {tag}")
+    if trend_mode:
+        # In trend regime: only native SL, no TP; start trailing worker
+        try:
+            set_minute_status(self, "trend", float(sl) if sl else None)
+        except Exception:
+            pass
+        try:
+            # Start trailing with ATR; ticks used for discretization inside the worker
+            await self._start_trailing(actual_side, float(atr or 0.0), float(base_price or 0.0), float(tick or 0.0))
+            log.info(f"[TRAIL][START] side={actual_side} atr={atr} anchor={self._fmt(base_price)} tick={self._fmt(tick)}")
             if self.notifier:
                 try:
-                    await self.notifier.notify(f"🎯 TP/SL set: SL {self._fmt(sl_adj)} / TP {self._fmt(tp_adj)}")
+                    await self.notifier.notify(f"🏃‍♂️ Trailing started: {actual_side} (ATR={self._fmt(float(atr or 0.0))})")
                 except Exception:
                     pass
+        except AttributeError:
+            log.warning("[TRAIL][MISS] _start_trailing is not implemented yet")
+        except Exception as e:
+            log.warning(f"[TRAIL][EXC] {e}")
+    else:
+        if not ps1 or sz1 <= 0:
+            log.debug("[TPSL][SKIP] flat before setting final TP/SL")
         else:
-            log.warning(f"[TPSL][FAIL] {r2}")
+            r2 = self.client.trading_stop(
+                self.symbol, side=actual_side,
+                stop_loss=sl_adj, take_profit=tp_adj,
+                tpslMode="Full", tpTriggerBy="LastPrice",
+                slTriggerBy="MarkPrice", tpOrderType="Market",
+                positionIdx=0,
+            )
+            rc2 = r2.get("retCode")
+            if rc2 in (0, None, 34040):
+                tag = "OK" if rc2 in (0, None) else "UNCHANGED"
+                log.info(f"[TPSL] sl={self._fmt(sl_adj)} tp={self._fmt(tp_adj)} {tag}")
+                if self.notifier:
+                    try:
+                        await self.notifier.notify(f"🎯 TP/SL set: SL {self._fmt(sl_adj)} / TP {self._fmt(tp_adj)}")
+                    except Exception:
+                        pass
+            else:
+                log.warning(f"[TPSL][FAIL] {r2}")
 
     # --- FAILSAFE TP/SL: дублируем биржевым брекетом как страховку ---
-    try:
-        ok_fs_bracket = await self._apply_tpsl_failsafe(actual_side, float(base_price), float(sl_adj), float(tp_adj))
-        if ok_fs_bracket:
-            log.info(f"[FAILSAFE][BRACKET] native TP/SL placed (SL {self._fmt(sl_adj)} / TP {self._fmt(tp_adj)})")
-        else:
-            log.warning("[FAILSAFE][BRACKET] native TP/SL not confirmed")
-    except Exception as e:
-        log.warning(f"[FAILSAFE][BRACKET][EXC] {e}")
+    if not trend_mode:
+        try:
+            ok_fs_bracket = await self._apply_tpsl_failsafe(actual_side, float(base_price), float(sl_adj), float(tp_adj))
+            if ok_fs_bracket:
+                log.info(f"[FAILSAFE][BRACKET] native TP/SL placed (SL {self._fmt(sl_adj)} / TP {self._fmt(tp_adj)})")
+            else:
+                log.warning("[FAILSAFE][BRACKET] native TP/SL not confirmed")
+        except Exception as e:
+            log.warning(f"[FAILSAFE][BRACKET][EXC] {e}")
 
     self._cancel_realigner()
-    try:
-        self._realign_task = asyncio.create_task(
-            self._realign_tpsl(actual_side, sl_r, tp_r, tick),
-            name="tpsl_realign"
-        )
-    except Exception:
-        self._realign_task = None
+    if not trend_mode:
+        try:
+            self._realign_task = asyncio.create_task(
+                self._realign_tpsl(actual_side, sl_r, tp_r, tick),
+                name="tpsl_realign"
+            )
+        except Exception:
+            self._realign_task = None
 
 
 async def close_market(self, side: str, qty: float):

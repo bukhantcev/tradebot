@@ -25,6 +25,7 @@ class Signal:
     prev_low: Optional[float] = None
     prev_open: Optional[float] = None
     prev_close: Optional[float] = None
+    regime: Optional[str] = None  # "trend" | "flat"
 
 
 class StrategyEngine:
@@ -74,18 +75,18 @@ class StrategyEngine:
             left = max(0.0, self.cooldown_sec - (time.time() - self._last_trade_time))
             if left > 0:
                 log.debug(f"[ON_CLOSE][COOLDOWN] skip {left:.1f}s remain")
-                return Signal(None, "cooldown", None, None, None, None, None, None, None, None)
+                return Signal(None, "cooldown", None, None, None, None, None, None, None, None, regime=None)
 
         # 1) История только из закрытых минут
         try:
             df = await load_recent_1m(200, symbol=self.symbol)
         except Exception as e:
             log.exception(f"[ON_CLOSE][LOAD_ERR] {e}")
-            return Signal(None, f"load_error:{e}", None, None, None, None)
+            return Signal(None, f"load_error:{e}", None, None, None, None, regime=None)
 
         if df is None or len(df) < 60:
             log.info("[SKIP] warmup (<60 closed 1m bars)")
-            return Signal(None, "warmup", None, None, None, None)
+            return Signal(None, "warmup", None, None, None, None, regime=None)
 
         # Экстремы предыдущей ЗАКРЫТОЙ 1m свечи
         try:
@@ -95,7 +96,7 @@ class StrategyEngine:
             prev_close = float(df.iloc[-1]["close"])
         except Exception as e:
             log.exception(f"[ON_CLOSE][HL_ERR] {e}")
-            return Signal(None, f"prev_hl_error:{e}", None, None, None, None)
+            return Signal(None, f"prev_hl_error:{e}", None, None, None, None, regime=None)
 
         # 2) Признаки
         try:
@@ -103,10 +104,10 @@ class StrategyEngine:
             f0: Dict[str, Any] = last_feature_row(dff)
         except Exception as e:
             log.exception(f"[FEAT][ERR] {e}")
-            return Signal(None, f"features_error:{e}", None, None, None, None, prev_high, prev_low, prev_open, prev_close)
+            return Signal(None, f"features_error:{e}", None, None, None, None, prev_high, prev_low, prev_open, prev_close, regime=None)
 
         if not f0:
-            return Signal(None, "no_features", None, None, None, None, prev_high, prev_low, prev_open, prev_close)
+            return Signal(None, "no_features", None, None, None, None, prev_high, prev_low, prev_open, prev_close, regime=None)
 
         # Ключевой лог «сигнал/срез фич» — компактно
         log.info(f"[SIGNAL] c={f0['close']:.2f} emaF={f0['ema_fast']:.2f} emaS={f0['ema_slow']:.2f} atr={f0['atr14']:.2f} prevH={prev_high:.2f} prevL={prev_low:.2f}")
@@ -161,7 +162,7 @@ class StrategyEngine:
                     await self._notifier.notify(f"⚠️ ИИ ошибка: {e}")
                 except Exception:
                     pass
-            return Signal(None, f"llm_error:{e}", None, None, float(f0.get("atr14", 0.0)), int(f0.get("ts_ms", 0)), prev_high, prev_low, prev_open, prev_close)
+            return Signal(None, f"llm_error:{e}", None, None, float(f0.get("atr14", 0.0)), int(f0.get("ts_ms", 0)), prev_high, prev_low, prev_open, prev_close, regime=None)
 
         action_raw = str(decision.get("decision", "Hold"))
         reason = str(decision.get("reason", "") or "").strip()
@@ -173,7 +174,7 @@ class StrategyEngine:
                     await self._notifier.notify(f"🤖 ИИ: Hold • {reason or 'no reason'}")
                 except Exception:
                     pass
-            return Signal(None, "hold", None, None, float(f0["atr14"]), int(f0["ts_ms"]), prev_high, prev_low, prev_open, prev_close)
+            return Signal(None, "hold", None, None, float(f0["atr14"]), int(f0["ts_ms"]), prev_high, prev_low, prev_open, prev_close, regime=None)
 
         # 5) Построение SL/TP относительно тела предыдущей свечи,
         #    + защита, чтобы TP гарантированно был по правильную сторону от LastPrice.
@@ -223,4 +224,5 @@ class StrategyEngine:
             prev_low=prev_low,
             prev_open=prev_open,
             prev_close=prev_close,
+            regime=decision.get("regime") or None,
         )
