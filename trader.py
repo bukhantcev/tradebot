@@ -290,12 +290,34 @@ class Trader:
         if qty is None:
             log.info("[ENTER][SKIP] qty is None after normalization")
             return
+
         # Небольшая защита от микроскопических значений после округления
-        if 0 < qty < self.qty_step:
-            qty = 0.0
-        if qty < self.qty_step:
-            log.info("[ENTER][SKIP] qty=%s < min step=%s", qty, self.qty_step)
+        if qty <= 0:
+            log.info("[ENTER][SKIP] qty=%s <= 0", qty)
             return
+
+        if qty < self.qty_step:
+            # Попробуем поднять до минимального шага, если хватает маржи
+            try:
+                last_px = await self.get_last_price()
+            except Exception:
+                last_px = None
+            eff_px = float(last_px) if last_px else 0.0
+
+            lev = getattr(self.acct, "leverage", 1) or 1
+            # Примерная требуемая маржа под минимальный лот
+            # USDT-Perp: initial_margin ~= price * qty / leverage (+ небольшой буфер на комиссию)
+            min_qty = self.qty_step
+            fee_buf = 0.001  # 0.1% как запас
+            need_margin = (eff_px * min_qty / max(1.0, float(lev))) * (1.0 + fee_buf)
+            avail = float(getattr(self.acct, "available", 0.0) or 0.0)
+
+            if eff_px > 0 and avail >= need_margin:
+                log.info("[ENTER][ADJUST] qty %s < step %s -> bump to step (affordable): %s", qty, self.qty_step, min_qty)
+                qty = min_qty
+            else:
+                log.info("[ENTER][SKIP] qty=%s < min step=%s (need≈%s, avail=%s, px=%s, lev=%s)", qty, self.qty_step, fmt(need_margin), fmt(avail), fmt(eff_px), lev)
+                return
 
         # 2) маркет-ордер
         log.info("[ENTER] %s qty=%s", side, fmt(qty))
