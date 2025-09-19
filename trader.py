@@ -92,6 +92,12 @@ class Trader:
     async def _wait_position_flat(self, timeout: float = 3600.0, interval: float = 0.5) -> bool:
         return await ts._wait_position_flat(self, timeout, interval)
 
+    async def _apply_sl_failsafe(self, side: str, sl: float) -> bool:
+        return await ts._apply_sl_failsafe(self, side, sl)
+
+    async def _apply_tpsl_failsafe(self, side: str, base_price: float, sl: float, tp: float) -> bool:
+        return await ts._apply_tpsl_failsafe(self, side, base_price, sl, tp)
+
     def _order_status_brief(self, order_id: str) -> str: return ex._order_status_brief(self, order_id)
     def _place_conditional(self, side: str, trigger_price: float, qty: float, trigger_direction: int) -> Dict[str, Any]:
         return ex._place_conditional(self, side, trigger_price, qty, trigger_direction)

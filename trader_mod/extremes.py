@@ -269,6 +269,11 @@ async def enter_extremes_with_limits(self, side: str, prev_high: float, prev_low
 
         sl_final, tp_final = self._normalize_tpsl_with_anchor(actual_side, base_price, sl_adj, tp_adj, tick)
         log.info(f"[EXT][LIM][TPSL] side={actual_side} base={self._fmt(base_price)} sl={self._fmt(sl_final)} tp={self._fmt(tp_final)} (anchor=Last/base)")
+        # --- FAILSAFE: immediate SL as insurance in case trading_stop fails ---
+        try:
+            await self._apply_sl_failsafe(actual_side, float(sl_final))
+        except Exception as e:
+            log.warning(f"[FAILSAFE][SL][EXC] {e}")
 
         ps, sz = self._position_side_and_size()
         if not ps or sz <= 0:
@@ -287,6 +292,11 @@ async def enter_extremes_with_limits(self, side: str, prev_high: float, prev_low
                 log.info(f"[EXT][LIM][TPSL][{tag}] sl={self._fmt(sl_final)} tp={self._fmt(tp_final)}")
             else:
                 log.warning(f"[EXT][LIM][TPSL][FAIL] {tr}")
+            # --- FAILSAFE: bracket order (TP/SL) as exchange-side backup ---
+            try:
+                await self._apply_tpsl_failsafe(actual_side, float(sl_final), float(tp_final))
+            except Exception as e:
+                log.warning(f"[FAILSAFE][BRACKET][EXC] {e}")
 
         self._cancel_realigner()
         try:

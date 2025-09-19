@@ -188,6 +188,120 @@ async def _await_fill_or_retry(self, order_id: str, side: str, qty: float) -> bo
     return False
 
 
+async def _apply_sl_failsafe(self, side: str, sl: float) -> bool:
+    """
+    Быстрая страховочная установка ТОЛЬКО SL сразу после открытия позиции.
+    – Нормализует SL к последней цене с учётом тика.
+    – Ставит через trading_stop(tpslMode=Full, только stop_loss), slTriggerBy=MarkPrice.
+    – Несколько ретраев, подробные логи. Возвращает True при успешной установке или
+      если биржа вернула UNCHANGED (34040), что для нас тоже ок.
+    """
+    try:
+        f = self.ensure_filters()
+        tick = float(f.get("tickSize") or 0.1)
+        side = "Buy" if side == "Buy" else "Sell"
+
+        # Подправим SL относительно текущего якоря (Last/Mark) так, чтобы он был валиден
+        last = 0.0
+        try:
+            last = float(self._last_price()) or 0.0
+        except Exception:
+            last = 0.0
+
+        sl_f = float(sl)
+        if last > 0:
+            if side == "Buy":
+                # для лонга SL должен быть ниже цены
+                if sl_f >= last:
+                    sl_f = last - tick
+                sl_f = self._round_step(sl_f, tick)
+                if sl_f >= last:
+                    sl_f = last - 2 * tick
+            else:
+                # для шорта SL должен быть выше цены
+                if sl_f <= last:
+                    sl_f = last + tick
+                sl_f = self._ceil_step(sl_f, tick)
+                if sl_f <= last:
+                    sl_f = last + 2 * tick
+        else:
+            # нет last — просто приведём к шагу без принуждения
+            if side == "Buy":
+                sl_f = self._round_step(sl_f, tick)
+            else:
+                sl_f = self._ceil_step(sl_f, tick)
+
+        for attempt in range(1, 6):
+            try:
+                r = self.client.trading_stop(
+                    self.symbol,
+                    side=side,
+                    stop_loss=sl_f,
+                    tpslMode="Full",
+                    slTriggerBy="MarkPrice",
+                    positionIdx=0,
+                )
+                rc = r.get("retCode")
+                if rc in (0, None, 34040):
+                    tag = "OK" if rc in (0, None) else "UNCHANGED"
+                    log.info(f"[SL][FAILSAFE][{tag}] SL={self._fmt(sl_f)} (try {attempt})")
+                    return True
+                else:
+                    log.warning(f"[SL][FAILSAFE][RC] rc={rc} msg={r.get('retMsg')} (try {attempt})")
+            except Exception as e:
+                log.warning(f"[SL][FAILSAFE][EXC] {e} (try {attempt})")
+            await asyncio.sleep(0.25 * attempt)
+        log.error("[SL][FAILSAFE][FAIL] cannot set stop-loss after retries")
+        return False
+    except Exception as e:
+        log.warning(f"[SL][FAILSAFE][CRASH] {e}")
+        return False
+
+
+async def _apply_tpsl_failsafe(self, side: str, base_price: float, sl: float, tp: float) -> bool:
+    """
+    Страховочная постановка TP+SL пакетом после появления позиции.
+    – Нормализует цели через _normalize_tpsl_with_anchor(...)
+    – Ставит через trading_stop(..., tpTriggerBy=LastPrice, slTriggerBy=MarkPrice, tpOrderType=Market)
+    – Несколько ретраев. Возвращает True, если удалось поставить или биржа ответила UNCHANGED.
+    """
+    try:
+        f = self.ensure_filters()
+        tick = float(f.get("tickSize") or 0.1)
+        side = "Buy" if side == "Buy" else "Sell"
+
+        sl_n, tp_n = _normalize_tpsl_with_anchor(self, side, base_price=float(base_price or 0.0), sl=float(sl), tp=float(tp), tick=tick)
+
+        for attempt in range(1, 6):
+            try:
+                r = self.client.trading_stop(
+                    self.symbol,
+                    side=side,
+                    stop_loss=sl_n,
+                    take_profit=tp_n,
+                    tpslMode="Full",
+                    tpTriggerBy="LastPrice",
+                    slTriggerBy="MarkPrice",
+                    tpOrderType="Market",
+                    positionIdx=0,
+                )
+                rc = r.get("retCode")
+                if rc in (0, None, 34040):
+                    tag = "OK" if rc in (0, None) else "UNCHANGED"
+                    log.info(f"[TPSL][FAILSAFE][{tag}] SL={self._fmt(sl_n)} TP={self._fmt(tp_n)} (try {attempt})")
+                    return True
+                else:
+                    log.warning(f"[TPSL][FAILSAFE][RC] rc={rc} msg={r.get('retMsg')} (try {attempt})")
+            except Exception as e:
+                log.warning(f"[TPSL][FAILSAFE][EXC] {e} (try {attempt})")
+            await asyncio.sleep(0.25 * attempt)
+        log.error("[TPSL][FAILSAFE][FAIL] cannot set TP/SL after retries")
+        return False
+    except Exception as e:
+        log.warning(f"[TPSL][FAILSAFE][CRASH] {e}")
+        return False
+
+
 async def _watchdog_close_on_lastprice(self, side: str, sl_price: float, tp_price: float, check_interval: float = 0.3, max_wait: float = 3600.0) -> bool:
     deadline = __import__("time").monotonic() + max_wait
     side = "Buy" if side == "Buy" else "Sell"

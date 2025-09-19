@@ -256,6 +256,17 @@ async def open_market(self, side: str, signal: Dict[str, Any]):
         await stop_minute_logger(self)
         return
 
+    # --- FAILSAFE SL: отдельная страховка стоп-лосса на бирже ---
+    try:
+        if sl:
+            ok_fs_sl = await self._apply_sl_failsafe(side, float(sl))
+            if ok_fs_sl:
+                log.info(f"[FAILSAFE][SL] placed native SL for {side} at {self._fmt(float(sl))}")
+            else:
+                log.warning("[FAILSAFE][SL] native SL not confirmed")
+    except Exception as e:
+        log.warning(f"[FAILSAFE][SL][EXC] {e}")
+
     # SL сразу (без TP)
     if sl:
         try:
@@ -321,6 +332,16 @@ async def open_market(self, side: str, signal: Dict[str, Any]):
                     pass
         else:
             log.warning(f"[TPSL][FAIL] {r2}")
+
+    # --- FAILSAFE TP/SL: дублируем биржевым брекетом как страховку ---
+    try:
+        ok_fs_bracket = await self._apply_tpsl_failsafe(actual_side, float(base_price), float(sl_adj), float(tp_adj))
+        if ok_fs_bracket:
+            log.info(f"[FAILSAFE][BRACKET] native TP/SL placed (SL {self._fmt(sl_adj)} / TP {self._fmt(tp_adj)})")
+        else:
+            log.warning("[FAILSAFE][BRACKET] native TP/SL not confirmed")
+    except Exception as e:
+        log.warning(f"[FAILSAFE][BRACKET][EXC] {e}")
 
     self._cancel_realigner()
     try:
