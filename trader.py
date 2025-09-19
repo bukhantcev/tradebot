@@ -38,9 +38,6 @@ class Trader:
         self.leverage = float(leverage)
         self.notifier = notifier
 
-        self._entry_lock = asyncio.Lock()
-        self._last_entry_token: tuple[str, int] | None = None  # (side, ts_ms)
-
         # кэш маркет-фильтров
         self._filters: Optional[Dict[str, float]] = None
         # последняя известная equity (USDT)
@@ -589,10 +586,6 @@ class Trader:
 
         active_oid: str | None = None
         max_cycles = 120  # максимум 2 часа перестановок по 1 минуте
-        try:
-            self._cancel_all_orders()
-        except Exception:
-            pass
 
         for cycle in range(max_cycles):
             # 1) HL предыдущей свечи
@@ -657,11 +650,6 @@ class Trader:
                 if rc == 0:
                     active_oid = r.get("result", {}).get("orderId", "")
                     log.info(f"[EXT][LIM][ORDER] id={active_oid} price={self._fmt(entry_price)} qty={self._fmt(attempt_qty)}")
-                    try:
-                        await asyncio.sleep(0.05)
-                        self._orders_cancel_except(active_oid)
-                    except Exception:
-                        pass
                     break
                 if rc == 110007:
                     new_qty = self._round_down_qty(attempt_qty * 0.75)
@@ -918,352 +906,282 @@ class Trader:
             log.warning(f"[TPSL][FAIL] {r2}")
 
     async def open_market(self, side: str, signal: Dict[str, Any]):
-        async def open_market(self, side: str, signal: Dict[str, Any]):
-            # ---- глобальный замок, чтобы не было параллельных входов ----
-            async with self._entry_lock:
-                # ДЕБАУНС: игнор повторного вызова с тем же side в течение 1200 мс
-                try:
-                    now_ms = int(time.time() * 1000)
-                    if self._last_entry_token and self._last_entry_token[0] == side:
-                        if now_ms - self._last_entry_token[1] < 1200:
-                            log.info(f"[ENTER][DEBOUNCE] skip duplicate {side} call")
-                            return
-                    self._last_entry_token = (side, now_ms)
-                except Exception:
-                    pass
+        """
+        side: "Buy" | "Sell"
+        signal: { 'sl': float, 'tp': float, 'atr': float, 'ts_ms': int, ... }
+        """
+        def _sg(key, default=None):
+            if isinstance(signal, dict):
+                return signal.get(key, default)
+            return getattr(signal, key, default)
 
-                # ----- остальной код open_market ниже без изменений ----
-            """
-            side: "Buy" | "Sell"
-            signal: { 'sl': float, 'tp': float, 'atr': float, 'ts_ms': int, ... }
-            """
-            def _sg(key, default=None):
-                if isinstance(signal, dict):
-                    return signal.get(key, default)
-                return getattr(signal, key, default)
+        def _sg_multi(keys, default=None):
+            for k in keys:
+                v = _sg(k, None)
+                if v is not None:
+                    return v
+            return default
 
-            def _sg_multi(keys, default=None):
-                for k in keys:
-                    v = _sg(k, None)
-                    if v is not None:
-                        return v
-                return default
+        if self.equity <= 0 or self.available <= 0:
+            self.refresh_equity()
+        self.ensure_filters()
+        self.ensure_leverage()
 
-            if self.equity <= 0 or self.available <= 0:
-                self.refresh_equity()
-            self.ensure_filters()
-            self.ensure_leverage()
+        price = float(_sg_multi(["price", "close"]) or 0.0)
+        if price <= 0:
+            price = float(_sg("tp") or 0.0) or 1.0
 
-            price = float(_sg_multi(["price", "close"]) or 0.0)
-            if price <= 0:
-                price = float(_sg("tp") or 0.0) or 1.0
+        sl = float(_sg_multi(["sl", "stop_loss", "stopLoss"]) or 0.0)
+        tp = float(_sg_multi(["tp", "take_profit", "takeProfit"]) or 0.0)
+        if sl <= 0 or tp <= 0:
+            log.info("[ENTER][SKIP] bad SL/TP")
+            self._cancel_realigner()
+            await self._stop_minute_logger()
+            return
 
-            sl = float(_sg_multi(["sl", "stop_loss", "stopLoss"]) or 0.0)
-            tp = float(_sg_multi(["tp", "take_profit", "takeProfit"]) or 0.0)
-            if sl <= 0 or tp <= 0:
-                log.info("[ENTER][SKIP] bad SL/TP")
-                self._cancel_realigner()
-                await self._stop_minute_logger()
-                return
-            # --- ЕДИНСТВЕННЫЙ ОРДЕР/ПОЗИЦИЯ В СТОРОНУ ИИ ---
-            can_enter = await self._enforce_single_exposure(side)
-            if not can_enter:
-                # Уже есть позиция в сторону ИИ — только realign TP/SL и выходим.
-                try:
-                    f = self.ensure_filters()
-                    tick = f["tickSize"]
-                    # Если есть текущая позиция — подтянуть TP/SL к желаемым
-                    ps, sz = self._position_side_and_size()
-                    if ps and sz > 0:
-                        base_price = float(self._last_price()) or float(price)
-                        sl_r = self._ceil_step(sl, tick) if side == "Buy" else self._round_step(sl, tick)
-                        tp_r = self._round_step(tp, tick) if side == "Buy" else self._ceil_step(tp, tick)
-                        sl_adj, tp_adj = self._normalize_tpsl_with_anchor(ps, base_price, sl_r, tp_r, tick)
-                        # попытка применить
-                        r2 = self.client.trading_stop(
-                            self.symbol,
-                            side=ps,
-                            stop_loss=sl_adj,
-                            take_profit=tp_adj,
-                            tpslMode="Full",
-                            tpTriggerBy="LastPrice",
-                            slTriggerBy="MarkPrice",
-                            tpOrderType="Market",
-                            positionIdx=0,
-                        )
-                        rc2 = r2.get("retCode")
-                        tag = "OK" if rc2 in (0, None) else ("UNCHANGED" if rc2 == 34040 else f"RC={rc2}")
-                        log.info(f"[TPSL][REALIGN] sl={self._fmt(sl_adj)} tp={self._fmt(tp_adj)} {tag}")
-                        # запустить мягкий реалайнер
-                        self._cancel_realigner()
-                        try:
-                            self._realign_task = asyncio.create_task(
-                                self._realign_tpsl(ps, sl_r, tp_r, tick),
-                                name="tpsl_realign"
-                            )
-                        except Exception:
-                            self._realign_task = None
-                except Exception as e:
-                    log.warning(f"[ONE][REALIGN][EXC] {e}")
-                return
+        self.set_minute_status("normal", float(sl) if sl else None)
 
-            self.set_minute_status("normal", float(sl) if sl else None)
+        qty = self._calc_qty(side, price, sl)
+        log.info(f"[QTY] risk%={self.risk_pct*100:.2f} stop={abs(price-sl):.2f} equity={self.equity:.2f} avail={self.available:.2f} -> qty={self._fmt(qty)}")
+        if qty <= 0:
+            log.info("[ENTER][SKIP] qty=0")
+            self._cancel_realigner()
+            await self._stop_minute_logger()
+            return
 
-            qty = self._calc_qty(side, price, sl)
-            log.info(f"[QTY] risk%={self.risk_pct*100:.2f} stop={abs(price-sl):.2f} equity={self.equity:.2f} avail={self.available:.2f} -> qty={self._fmt(qty)}")
-            if qty <= 0:
-                log.info("[ENTER][SKIP] qty=0")
-                self._cancel_realigner()
-                await self._stop_minute_logger()
-                return
+        f = self.ensure_filters()
+        tick = f["tickSize"]
+        sl_r = self._ceil_step(sl, tick) if side == "Buy" else self._round_step(sl, tick)
+        tp_r = self._round_step(tp, tick) if side == "Buy" else self._ceil_step(tp, tick)
+        sl_r, tp_r = self._fix_tpsl(side, price, sl_r, tp_r, tick)
 
-            f = self.ensure_filters()
-            tick = f["tickSize"]
-            sl_r = self._ceil_step(sl, tick) if side == "Buy" else self._round_step(sl, tick)
-            tp_r = self._round_step(tp, tick) if side == "Buy" else self._ceil_step(tp, tick)
-            sl_r, tp_r = self._fix_tpsl(side, price, sl_r, tp_r, tick)
-
-            prev_high = _sg_multi(["prev_high", "prevHigh", "prevH", "previous_high", "prev_high_price"])
-            prev_low = _sg_multi(["prev_low", "prevLow", "prevL", "previous_low", "prev_low_price"])
-            use_ext = bool(self.entry_extremes and prev_high and prev_low)
-            if use_ext:
-                log.info(f"[EXT][MODE] ON  prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} qty={self._fmt(qty)}")
-            else:
-                reason = []
-                if not self.entry_extremes:
-                    reason.append("flag_off")
-                if not prev_high or not prev_low:
-                    reason.append("no_prev_hl")
-                try:
-                    fields = list(signal.keys()) if isinstance(signal, dict) else list(vars(signal).keys())
-                except Exception:
-                    fields = ["?"]
-                log.info(f"[EXT][MODE] OFF ({','.join(reason) if reason else 'n/a'}) fields={fields}")
-
-            log.info("[EXT][CHECKPOINT] minute logger set status")
+        prev_high = _sg_multi(["prev_high", "prevHigh", "prevH", "previous_high", "prev_high_price"])
+        prev_low = _sg_multi(["prev_low", "prevLow", "prevL", "previous_low", "prev_low_price"])
+        use_ext = bool(self.entry_extremes and prev_high and prev_low)
+        if use_ext:
+            log.info(f"[EXT][MODE] ON  prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} qty={self._fmt(qty)}")
+        else:
+            reason = []
+            if not self.entry_extremes:
+                reason.append("flag_off")
+            if not prev_high or not prev_low:
+                reason.append("no_prev_hl")
             try:
-                self.set_minute_status("ext" if use_ext else "normal", float(sl) if sl else None)
-            except Exception as e:
-                log.exception(f"[EXT][LOGGER][EXC] {e}")
-
-            if not use_ext:
-                try:
-                    ps, sz = self._position_side_and_size()
-                    if ps and sz > 0:
-                        log.info(f"[ENTER][FLAT] close existing {ps} size={self._fmt(sz)} before new entry")
-                        await self.close_market(self._opposite(ps), sz)
-                        for _ in range(20):
-                            p2, s2 = self._position_side_and_size()
-                            if not p2 or s2 <= 0:
-                                break
-                            await asyncio.sleep(0.25)
-                    log.info("[EXT][CHECKPOINT] after flat enforcement")
-                except Exception as e:
-                    log.exception(f"[EXT][FLAT][EXC] {e}")
-                    log.info("[EXT][CHECKPOINT] after flat enforcement (with exception)")
-            else:
-                log.info("[ENTER][FLAT] skip in ext mode (only pending limits will be replaced)")
-
-            try:
-                log.info(f"[EXT][CHECKPOINT] before branch use_ext={use_ext}")
+                fields = list(signal.keys()) if isinstance(signal, dict) else list(vars(signal).keys())
             except Exception:
-                log.exception("[EXT][CHECKPOINT][EXC] before branch")
+                fields = ["?"]
+            log.info(f"[EXT][MODE] OFF ({','.join(reason) if reason else 'n/a'}) fields={fields}")
 
-            if use_ext:
-                log.info("[EXT][CHECKPOINT] entering use_ext branch")
-                # жёстко соблюдаем «один ордер» и «в сторону ИИ»
-                can_enter_ext = await self._enforce_single_exposure(side)
-                if not can_enter_ext:
-                    log.info("[EXT][SKIP] already in AI side; no new limit order")
-                    await self._stop_minute_logger()
-                    return
+        log.info("[EXT][CHECKPOINT] minute logger set status")
+        try:
+            self.set_minute_status("ext" if use_ext else "normal", float(sl) if sl else None)
+        except Exception as e:
+            log.exception(f"[EXT][LOGGER][EXC] {e}")
 
-                log.info(
-                    f"[EXT][LIM][FLOW] side={side} prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} qty={self._fmt(qty)}")
-                try:
-                    await self._enter_extremes_with_limits(side, float(prev_high), float(prev_low), qty, sl=float(sl), tp=float(tp))
-                    log.info("[EXT][RETURN] _enter_extremes_with_limits finished")
-                except Exception as e:
-                    log.exception(f"[EXT][CRASH] _enter_extremes_with_limits exception: {e}")
-                finally:
-                    await self._stop_minute_logger()
-                return
+        if not use_ext:
+            try:
+                ps, sz = self._position_side_and_size()
+                if ps and sz > 0:
+                    log.info(f"[ENTER][FLAT] close existing {ps} size={self._fmt(sz)} before new entry")
+                    await self.close_market(self._opposite(ps), sz)
+                    for _ in range(20):
+                        p2, s2 = self._position_side_and_size()
+                        if not p2 or s2 <= 0:
+                            break
+                        await asyncio.sleep(0.25)
+                log.info("[EXT][CHECKPOINT] after flat enforcement")
+            except Exception as e:
+                log.exception(f"[EXT][FLAT][EXC] {e}")
+                log.info("[EXT][CHECKPOINT] after flat enforcement (with exception)")
+        else:
+            log.info("[ENTER][FLAT] skip in ext mode (only pending limits will be replaced)")
 
-            # --- Маркет-вход (обычный) ---
-            log.info(f"[ENTER] {side} qty={self._fmt(qty)}")
-            attempt_qty = qty
-            order_id = None
-            for attempt in range(6):
-                r = self.client.place_order(
-                    self.symbol,
-                    side,
-                    attempt_qty,
-                    order_type="Market",
-                    preferSmart=True,
-                )
-                rc = r.get("retCode")
-                if rc == 0:
-                    order_id = r.get("result", {}).get("orderId", "")
-                    log.info(f"[ORDER←] OK id={order_id}")
-                    # оставить только наш ордер
+        try:
+            log.info(f"[EXT][CHECKPOINT] before branch use_ext={use_ext}")
+        except Exception:
+            log.exception("[EXT][CHECKPOINT][EXC] before branch")
+
+        if use_ext:
+            log.info("[EXT][CHECKPOINT] entering use_ext branch")
+            log.info(f"[EXT][LIM][FLOW] side={side} prevH={self._fmt(prev_high)} prevL={self._fmt(prev_low)} qty={self._fmt(qty)}")
+            try:
+                await self._enter_extremes_with_limits(side, float(prev_high), float(prev_low), qty, sl=float(sl), tp=float(tp))
+                log.info("[EXT][RETURN] _enter_extremes_with_limits finished")
+            except Exception as e:
+                log.exception(f"[EXT][CRASH] _enter_extremes_with_limits exception: {e}")
+            finally:
+                await self._stop_minute_logger()
+            return
+
+        # --- Маркет-вход (обычный) ---
+        log.info(f"[ENTER] {side} qty={self._fmt(qty)}")
+        attempt_qty = qty
+        order_id = None
+        for attempt in range(6):
+            r = self.client.place_order(
+                self.symbol,
+                side,
+                attempt_qty,
+                order_type="Market",
+                preferSmart=True,
+            )
+            rc = r.get("retCode")
+            if rc == 0:
+                order_id = r.get("result", {}).get("orderId", "")
+                log.info(f"[ORDER←] OK id={order_id}")
+                if self.notifier:
                     try:
-                        await asyncio.sleep(0.05)  # дать бирже обновить /realtime
-                        self._orders_cancel_except(order_id)
+                        await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(attempt_qty)} (id {order_id})")
                     except Exception:
                         pass
-                    if self.notifier:
-                        try:
-                            await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(attempt_qty)} (id {order_id})")
-                        except Exception:
-                            pass
-                    break
-                if rc == 110007:
-                    f2 = self.ensure_filters()
-                    step = f2.get("qtyStep", 0.001)
-                    min_qty = f2.get("minQty", 0.001)
-                    new_qty = self._round_down_qty(attempt_qty * 0.75)
-                    if new_qty >= attempt_qty:
-                        new_qty = self._round_down_qty(attempt_qty - step)
-                    if new_qty < min_qty:
-                        log.error(f"[ENTER][FAIL] insufficient balance for minimal qty; last={self._fmt(attempt_qty)}")
-                        self._cancel_realigner()
-                        await self._stop_minute_logger()
-                        return
-                    log.info(f"[ENTER][RETRY_QTY] 110007 -> {self._fmt(attempt_qty)} -> {self._fmt(new_qty)}")
-                    attempt_qty = new_qty
-                    continue
-                if rc == 30208:
-                    log.warning("[ENTER][RETRY] 30208: add slippage Percent=0.05")
-                    r2 = self.client.place_order(
-                        self.symbol, side, attempt_qty, order_type="Market",
-                        slippageToleranceType="Percent", slippageTolerance="0.05"
-                    )
-                    if r2.get("retCode") == 0:
-                        order_id = r2.get("result", {}).get("orderId", "")
-                        log.info(f"[ORDER←] OK id={order_id} (slip 0.05%)")
-                        if self.notifier:
-                            try:
-                                await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(attempt_qty)} (id {order_id}, slip 0.05%)")
-                            except Exception:
-                                pass
-                        break
-                    log.warning("[ENTER][RETRY] 30208: add slippage TickSize=5")
-                    r3 = self.client.place_order(
-                        self.symbol, side, attempt_qty, order_type="Market",
-                        slippageToleranceType="TickSize", slippageTolerance="5"
-                    )
-                    if r3.get("retCode") == 0:
-                        order_id = r3.get("result", {}).get("orderId", "")
-                        log.info(f"[ORDER←] OK id={order_id} (slip 5 ticks)")
-                        if self.notifier:
-                            try:
-                                await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(attempt_qty)} (id {order_id}, slip 5 ticks)")
-                            except Exception:
-                                pass
-                        break
-                    log.error(f"[ENTER][FAIL] {r3}")
+                break
+            if rc == 110007:
+                f2 = self.ensure_filters()
+                step = f2.get("qtyStep", 0.001)
+                min_qty = f2.get("minQty", 0.001)
+                new_qty = self._round_down_qty(attempt_qty * 0.75)
+                if new_qty >= attempt_qty:
+                    new_qty = self._round_down_qty(attempt_qty - step)
+                if new_qty < min_qty:
+                    log.error(f"[ENTER][FAIL] insufficient balance for minimal qty; last={self._fmt(attempt_qty)}")
                     self._cancel_realigner()
                     await self._stop_minute_logger()
                     return
-                log.error(f"[ENTER][FAIL] {r}")
-                self._cancel_realigner()
-                await self._stop_minute_logger()
-                return
-
-            if not order_id:
-                log.error("[ENTER][FAIL] no orderId")
-                self._cancel_realigner()
-                await self._stop_minute_logger()
-                return
-
-            if not await self._await_fill_or_retry(order_id, side, attempt_qty):
-                log.warning("[ENTER][ABORT] no fill")
-                self._cancel_realigner()
-                await self._stop_minute_logger()
-                return
-
-            # Сразу SL в Full-режиме (без TP) — но только если позиция реально открыта
-            if sl:
-                try:
-                    ps0, sz0 = self._position_side_and_size()
-                    if not ps0 or sz0 <= 0:
-                        log.debug("[SL][NORM][SKIP] flat right after entry")
-                    else:
-                        tr = self.client.trading_stop(
-                            self.symbol,
-                            side=side,
-                            stop_loss=float(sl),
-                            tpslMode="Full",
-                            slTriggerBy="MarkPrice",
-                            positionIdx=0,
-                        )
-                        rc = tr.get("retCode")
-                        if rc in (0, None, 34040):
-                            tag = "OK" if rc in (0, None) else "UNCHANGED"
-                            log.info(f"[SL][NORM] set SL={self._fmt(sl)} {tag}")
-                        else:
-                            log.warning(f"[SL][NORM][FAIL] {tr}")
-                except Exception as e:
-                    log.warning(f"[SL][NORM][EXC] {e}")
-
-            qty = attempt_qty
-
-            actual_side = side
-            base_price = None
-            try:
-                pos = self.client.position_list(self.symbol)
-                items = pos.get("result", {}).get("list", [])
-                if items:
-                    it = items[0]
-                    actual_side = it.get("side") or actual_side
-                    base_price = float(it.get("avgPrice") or it.get("entryPrice") or 0.0)
-            except Exception:
-                pass
-
-            f3 = self.ensure_filters()
-            tick = f3["tickSize"]
-            if not base_price or base_price <= 0:
-                base_price = float(self._last_price()) or price
-
-            sl_adj, tp_adj = self._normalize_tpsl_with_anchor(actual_side, base_price, sl_r, tp_r, tick)
-
-            log.info(f"[TPSL][NORM] side={actual_side} base={self._fmt(base_price)} sl={self._fmt(sl_adj)} tp={self._fmt(tp_adj)} (anchor=Last/base)")
-
-            ps1, sz1 = self._position_side_and_size()
-            if not ps1 or sz1 <= 0:
-                log.debug("[TPSL][SKIP] flat before setting final TP/SL")
-            else:
-                r2 = self.client.trading_stop(
-                    self.symbol,
-                    side=actual_side,
-                    stop_loss=sl_adj,
-                    take_profit=tp_adj,
-                    tpslMode="Full",
-                    tpTriggerBy="LastPrice",
-                    slTriggerBy="MarkPrice",
-                    tpOrderType="Market",
-                    positionIdx=0,
+                log.info(f"[ENTER][RETRY_QTY] 110007 -> {self._fmt(attempt_qty)} -> {self._fmt(new_qty)}")
+                attempt_qty = new_qty
+                continue
+            if rc == 30208:
+                log.warning("[ENTER][RETRY] 30208: add slippage Percent=0.05")
+                r2 = self.client.place_order(
+                    self.symbol, side, attempt_qty, order_type="Market",
+                    slippageToleranceType="Percent", slippageTolerance="0.05"
                 )
-                rc2 = r2.get("retCode")
-                if rc2 in (0, None, 34040):
-                    tag = "OK" if rc2 in (0, None) else "UNCHANGED"
-                    log.info(f"[TPSL] sl={self._fmt(sl_adj)} tp={self._fmt(tp_adj)} {tag}")
+                if r2.get("retCode") == 0:
+                    order_id = r2.get("result", {}).get("orderId", "")
+                    log.info(f"[ORDER←] OK id={order_id} (slip 0.05%)")
                     if self.notifier:
                         try:
-                            await self.notifier.notify(f"🎯 TP/SL set: SL {self._fmt(sl_adj)} / TP {self._fmt(tp_adj)}")
+                            await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(attempt_qty)} (id {order_id}, slip 0.05%)")
                         except Exception:
                             pass
-                else:
-                    log.warning(f"[TPSL][FAIL] {r2}")
-            # Start background realigner to migrate TP/SL toward desired values as the anchor allows
-            self._cancel_realigner()
-            try:
-                self._realign_task = asyncio.create_task(
-                    self._realign_tpsl(actual_side, sl_r, tp_r, tick),
-                    name="tpsl_realign"
+                    break
+                log.warning("[ENTER][RETRY] 30208: add slippage TickSize=5")
+                r3 = self.client.place_order(
+                    self.symbol, side, attempt_qty, order_type="Market",
+                    slippageToleranceType="TickSize", slippageTolerance="5"
                 )
-            except Exception:
-                self._realign_task = None
+                if r3.get("retCode") == 0:
+                    order_id = r3.get("result", {}).get("orderId", "")
+                    log.info(f"[ORDER←] OK id={order_id} (slip 5 ticks)")
+                    if self.notifier:
+                        try:
+                            await self.notifier.notify(f"✅ {side} {self.symbol} qty={self._fmt(attempt_qty)} (id {order_id}, slip 5 ticks)")
+                        except Exception:
+                            pass
+                    break
+                log.error(f"[ENTER][FAIL] {r3}")
+                self._cancel_realigner()
+                await self._stop_minute_logger()
+                return
+            log.error(f"[ENTER][FAIL] {r}")
+            self._cancel_realigner()
+            await self._stop_minute_logger()
+            return
+
+        if not order_id:
+            log.error("[ENTER][FAIL] no orderId")
+            self._cancel_realigner()
+            await self._stop_minute_logger()
+            return
+
+        if not await self._await_fill_or_retry(order_id, side, attempt_qty):
+            log.warning("[ENTER][ABORT] no fill")
+            self._cancel_realigner()
+            await self._stop_minute_logger()
+            return
+
+        # Сразу SL в Full-режиме (без TP) — но только если позиция реально открыта
+        if sl:
+            try:
+                ps0, sz0 = self._position_side_and_size()
+                if not ps0 or sz0 <= 0:
+                    log.debug("[SL][NORM][SKIP] flat right after entry")
+                else:
+                    tr = self.client.trading_stop(
+                        self.symbol,
+                        side=side,
+                        stop_loss=float(sl),
+                        tpslMode="Full",
+                        slTriggerBy="MarkPrice",
+                        positionIdx=0,
+                    )
+                    rc = tr.get("retCode")
+                    if rc in (0, None, 34040):
+                        tag = "OK" if rc in (0, None) else "UNCHANGED"
+                        log.info(f"[SL][NORM] set SL={self._fmt(sl)} {tag}")
+                    else:
+                        log.warning(f"[SL][NORM][FAIL] {tr}")
+            except Exception as e:
+                log.warning(f"[SL][NORM][EXC] {e}")
+
+        qty = attempt_qty
+
+        actual_side = side
+        base_price = None
+        try:
+            pos = self.client.position_list(self.symbol)
+            items = pos.get("result", {}).get("list", [])
+            if items:
+                it = items[0]
+                actual_side = it.get("side") or actual_side
+                base_price = float(it.get("avgPrice") or it.get("entryPrice") or 0.0)
+        except Exception:
+            pass
+
+        f3 = self.ensure_filters()
+        tick = f3["tickSize"]
+        if not base_price or base_price <= 0:
+            base_price = float(self._last_price()) or price
+
+        sl_adj, tp_adj = self._normalize_tpsl_with_anchor(actual_side, base_price, sl_r, tp_r, tick)
+
+        log.info(f"[TPSL][NORM] side={actual_side} base={self._fmt(base_price)} sl={self._fmt(sl_adj)} tp={self._fmt(tp_adj)} (anchor=Last/base)")
+
+        ps1, sz1 = self._position_side_and_size()
+        if not ps1 or sz1 <= 0:
+            log.debug("[TPSL][SKIP] flat before setting final TP/SL")
+        else:
+            r2 = self.client.trading_stop(
+                self.symbol,
+                side=actual_side,
+                stop_loss=sl_adj,
+                take_profit=tp_adj,
+                tpslMode="Full",
+                tpTriggerBy="LastPrice",
+                slTriggerBy="MarkPrice",
+                tpOrderType="Market",
+                positionIdx=0,
+            )
+            rc2 = r2.get("retCode")
+            if rc2 in (0, None, 34040):
+                tag = "OK" if rc2 in (0, None) else "UNCHANGED"
+                log.info(f"[TPSL] sl={self._fmt(sl_adj)} tp={self._fmt(tp_adj)} {tag}")
+                if self.notifier:
+                    try:
+                        await self.notifier.notify(f"🎯 TP/SL set: SL {self._fmt(sl_adj)} / TP {self._fmt(tp_adj)}")
+                    except Exception:
+                        pass
+            else:
+                log.warning(f"[TPSL][FAIL] {r2}")
+        # Start background realigner to migrate TP/SL toward desired values as the anchor allows
+        self._cancel_realigner()
+        try:
+            self._realign_task = asyncio.create_task(
+                self._realign_tpsl(actual_side, sl_r, tp_r, tick),
+                name="tpsl_realign"
+            )
+        except Exception:
+            self._realign_task = None
 
     async def close_market(self, side: str, qty: float):
         """
@@ -1283,7 +1201,6 @@ class Trader:
         if r.get("retCode") == 0:
             oid = r.get("result", {}).get("orderId", "")
             log.info(f"[ORDER←] CLOSE OK id={oid}")
-
             if self.notifier:
                 try:
                     await self.notifier.notify(f"❌ Close {side} {self.symbol} qty={self._fmt(qty)} (id {oid})")
@@ -1311,72 +1228,3 @@ class Trader:
                 log.error(f"[ORDER][FAIL] {r}")
         else:
             log.error(f"[ORDER][FAIL] {r}")
-
-    # ---- SINGLE-EXPOSURE HELPERS ----
-    def _active_orders_count(self) -> int:
-        """Сколько активных (и conditional) ордеров по символу."""
-        try:
-            r = self.client._request("GET", "/v5/order/realtime", params={"category": "linear", "symbol": self.symbol})
-            lst = (r.get("result", {}) or {}).get("list", []) or []
-            return len(lst)
-        except Exception:
-            return 0
-
-    async def _enforce_single_exposure(self, ai_side: str) -> bool:
-        """
-        Гарантирует: нет лишних ордеров и позиция либо плоская, либо совпадает со стороной ИИ.
-        True  -> можно ставить НОВЫЙ вход (flat либо была противоположная — мы её закрыли).
-        False -> уже есть позиция в сторону ИИ: ничего не ставим, только realign.
-        """
-        # 1) снять все ордера
-        try:
-            ca = self._cancel_all_orders()
-            rc = ca.get("retCode")
-            if rc not in (0, None):
-                log.warning(f"[ONE][CANCEL_ALL][WARN] rc={rc} msg={ca.get('retMsg')}")
-            else:
-                log.info("[ONE][CANCEL_ALL][OK]")
-        except Exception as e:
-            log.warning(f"[ONE][CANCEL_ALL][EXC] {e}")
-
-        # 2) привести позицию к flat/совпадающей
-        ps, sz = self._position_side_and_size()
-        if ps and sz > 0:
-            if ps == ai_side:
-                log.info(f"[ONE][KEEP] already in {ps} size={self._fmt(sz)}")
-                return False
-            log.info(f"[ONE][FLIP] have {ps} size={self._fmt(sz)} -> close")
-            await self.close_market(self._opposite(ps), sz)
-            await self._wait_position_flat(timeout=30.0, interval=0.25)
-
-        # 3) убедиться, что ордеров больше нет
-        for _ in range(20):
-            if self._active_orders_count() == 0:
-                break
-            await asyncio.sleep(0.1)
-        return True
-    def _active_orders(self) -> list[dict]:
-        try:
-            r = self.client._request("GET", "/v5/order/realtime",
-                                     params={"category": "linear", "symbol": self.symbol})
-            return (r.get("result", {}) or {}).get("list", []) or []
-        except Exception:
-            return []
-
-    def _active_orders_count(self) -> int:
-        return len(self._active_orders())
-
-    def _orders_cancel_except(self, keep_order_id: str | None) -> None:
-        """Снять все активные заявки, кроме указанной (если задана)."""
-        try:
-            lst = self._active_orders()
-            for it in lst:
-                oid = it.get("orderId")
-                if keep_order_id and oid == keep_order_id:
-                    continue
-                try:
-                    self._cancel_order(order_id=oid)
-                except Exception:
-                    pass
-        except Exception:
-            pass
