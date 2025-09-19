@@ -176,6 +176,32 @@ class Trader:
         return False
 
     # -----------------------------
+    # Внутренние утилиты
+    # -----------------------------
+    def _to_float_qty(self, q: Any) -> Optional[float]:
+        """
+        Нормализует qty, если пришёл словарь (например, {'qty': 0.003, ...}).
+        Возвращает float или None если q пустой.
+        """
+        if q is None:
+            return None
+        if isinstance(q, (int, float)):
+            return float(q)
+        if isinstance(q, dict):
+            for k in ("qty", "quantity", "value", "amount", "size"):
+                if k in q and q[k] is not None:
+                    try:
+                        return float(q[k])
+                    except Exception:
+                        pass
+        # Последняя попытка — прямое приведение
+        try:
+            return float(q)  # может быть строка
+        except Exception:
+            log.error("[QTY][PARSE][ERR] cannot parse qty from %r", q)
+            return None
+
+    # -----------------------------
     # Вход
     # -----------------------------
     async def open_market(
@@ -200,11 +226,12 @@ class Trader:
         # Экстрем-режим (лимитки у экстремумов)
         if use_ext and prev_high is not None and prev_low is not None:
             log.info("[EXT][MODE] ON  prevH=%s prevL=%s qty=%s", fmt(prev_high), fmt(prev_low), fmt(qty or 0))
+            qty_norm = self._to_float_qty(qty)
             await self.ext.run_limits(
                 side=side,
                 prev_high=float(prev_high),
                 prev_low=float(prev_low),
-                qty=qty,
+                qty=qty_norm,
                 sl=sl,
                 tp=tp,
                 tick=self.tick,
@@ -219,6 +246,10 @@ class Trader:
             if sl is None:
                 raise ValueError("open_market: 'sl' required to compute risk-based qty")
             qty = self.risk.calc_qty(side=side, price=last, sl=float(sl))
+        qty = self._to_float_qty(qty)
+        if qty is None:
+            log.info("[ENTER][SKIP] qty is None after normalization")
+            return
         if qty < self.qty_step:
             log.info("[ENTER][SKIP] qty=%s < min step=%s", qty, self.qty_step)
             return
