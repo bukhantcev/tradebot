@@ -21,6 +21,35 @@ class Extremes:
         self.stop_realign_task = stop_realign_task
         self.notifier = notifier
 
+    def _coerce_qty(self, q) -> float | None:
+        try:
+            if q is None:
+                return None
+            if isinstance(q, (int, float)):
+                return float(q)
+            # tolerate strings like "0.003"
+            if isinstance(q, str):
+                q = q.strip()
+                if not q:
+                    return None
+                return float(q)
+            # sometimes a dict gets passed accidentally
+            if isinstance(q, dict):
+                for key in ("qty", "size", "amount", "value"):
+                    if key in q:
+                        try:
+                            return float(q[key])
+                        except Exception:
+                            continue
+                # try to extract from nested structure (common fields we saw)
+                for key in ("close", "price"):
+                    if key in q and isinstance(q[key], (int, float)):
+                        # cannot deduce quantity from price-only dict
+                        continue
+                return None
+        except Exception:
+            return None
+
     async def _prev_hl_rest(self) -> tuple[float | None, float | None]:
         try:
             r = self.client._request(
@@ -43,6 +72,13 @@ class Extremes:
             return (None, None)
 
     async def run_limits(self, side: str, prev_high: float, prev_low: float, qty: float, sl: float, tp: float, close_market, wait_position_open, wait_position_flat, normalize_with_anchor):
+        raw_qty = qty
+        qty = self._coerce_qty(qty)
+        if qty is None or qty <= 0:
+            log.error(f"[EXT][LIM][QTY][ERR] cannot parse qty from {raw_qty!r}")
+            self.stop_realign_task()
+            return
+
         if qty <= 0:
             log.info("[EXT][LIM][SKIP] qty<=0")
             self.stop_realign_task()
@@ -79,7 +115,7 @@ class Extremes:
             if self.account.available <= 0 or self.account.equity <= 0:
                 self.account.refresh_equity()
 
-            attempt_qty = min(qty, self.risk.calc_qty(side, entry, sl_adj))
+            attempt_qty = min(float(qty), self.risk.calc_qty(side, entry, sl_adj))
             min_qty = float(f.get("minQty", 0.001))
             if attempt_qty < min_qty:
                 affordable = (self.account.available / (entry / max(self.account.leverage, 1.0))) >= min_qty
@@ -105,9 +141,16 @@ class Extremes:
                     log.info(f"[EXT][LIM][ORDER] id={active_oid} price={fmt(entry)} qty={fmt(attempt_qty)}")
                     break
                 if rc == 110007:
-                    new_qty = self.risk.round_down_qty(attempt_qty * 0.75)
-                    if new_qty >= attempt_qty:
-                        new_qty = self.risk.round_down_qty(attempt_qty - float(f.get('qtyStep', 0.001)))
+                    try:
+                        new_qty = float(self.risk.round_down_qty(float(attempt_qty) * 0.75))
+                    except Exception:
+                        new_qty = float(attempt_qty) * 0.75
+                    if new_qty >= float(attempt_qty):
+                        new_qty = self.risk.round_down_qty(float(attempt_qty) - float(f.get('qtyStep', 0.001)))
+                        try:
+                            new_qty = float(new_qty)
+                        except Exception:
+                            pass
                     if new_qty < min_qty:
                         log.error(f"[EXT][LIM][FAIL] 110007: insufficient balance, last qty={fmt(attempt_qty)} < min {fmt(min_qty)}")
                         active_oid = None
@@ -167,9 +210,9 @@ class Extremes:
                 tag = "OK" if rc in (0, None) else ("UNCHANGED" if rc == 34040 else f"RC{rc}")
                 log.info(f"[EXT][LIM][TPSL][{tag}] sl={fmt(sl_final)} tp={fmt(tp_final)}")
 
-            # запустить реалайнер
+            # запустить реалайнер на финальных уровнях (после нормализации якорем)
             self.stop_realign_task()
-            self.set_realign_task(actual_side, sl_adj, tp_adj, tick)
+            self.set_realign_task(actual_side, sl_final, tp_final, tick)
 
             # сторож до закрытия
             log.info("[EXT][LIM][WATCH] arming TP/SL watchdog (LastPrice cross)")
