@@ -1,7 +1,7 @@
 # app/trader.py
 import asyncio
 import logging
-from typing import Optional, Tuple, Callable, Any
+from typing import Optional, Tuple, Callable, Any, Coroutine, Awaitable
 
 # Ожидаемые подмодули (реализация лежит в trader_mod/*)
 from trader_mod.account import Account
@@ -301,11 +301,17 @@ class Trader:
     # -----------------------------
     # Реалайнер TP/SL
     # -----------------------------
-    def _set_realign_task(self, coro: asyncio.coroutine) -> None:
+    def _set_realign_task(self, coro: Optional[Coroutine[Any, Any, Any] | Awaitable[Any] | asyncio.Task]) -> None:
+        """Register (or replace) background realigner task.
+        Accepts a coroutine/awaitable or an already created asyncio.Task.
+        """
         self._stop_realign_task()
         if coro is None:
             return
-        self._realign_task = asyncio.create_task(coro, name="tpsl_realign")
+        if isinstance(coro, asyncio.Task):
+            self._realign_task = coro
+        else:
+            self._realign_task = asyncio.create_task(coro, name="tpsl_realign")
 
     def _stop_realign_task(self) -> None:
         if self._realign_task and not self._realign_task.done():
