@@ -138,6 +138,33 @@ class BybitClient:
     def instruments_info(self, category="linear", symbol="BTCUSDT"):
         return self._request("GET", "/v5/market/instruments-info", params={"category": category, "symbol": symbol})
 
+    async def ticker(self, symbol: str, category: str = "linear") -> Dict[str, float]:
+        """
+        Lightweight helper to get current prices.
+        Returns: {"last": float|0.0, "mark": float|0.0, "bid": float|0.0, "ask": float|0.0}
+        Note: This is async for compatibility with caller code; internally uses the sync HTTP client.
+        """
+        try:
+            data = self._request("GET", "/v5/market/tickers", params={"category": category, "symbol": symbol})
+            lst = data.get("result", {}).get("list", [])
+            if lst:
+                it = lst[0]
+                def _f(x):
+                    try:
+                        return float(x)
+                    except Exception:
+                        return 0.0
+                return {
+                    "last": _f(it.get("lastPrice")),
+                    "mark": _f(it.get("markPrice")),
+                    "bid": _f(it.get("bestBidPrice")),
+                    "ask": _f(it.get("bestAskPrice")),
+                }
+        except Exception as e:
+            log.warning(f"[TICKER][ERR] {e}")
+
+        return {"last": 0.0, "mark": 0.0, "bid": 0.0, "ask": 0.0}
+
     def orderbook_top(self, symbol: str, category: str = "linear"):
         # depth=1 returns best bid/ask
         params = {"category": category, "symbol": symbol, "limit": 1}
