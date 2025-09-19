@@ -4,10 +4,11 @@ import time
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
 import asyncio
+import math
+
 from config import SYMBOL, RISK_PCT
 from features import load_recent_1m, compute_features, last_feature_row
 from llm import ask_model
-import math
 
 log = logging.getLogger("STRATEGY")
 
@@ -32,7 +33,7 @@ class StrategyEngine:
     - Берёт закрытые 1m бары из БД
     - Считает базовые фичи
     - Делает запрос к LLM и по ответу формирует сигнал
-    - SL/TP — из ATR (настраиваемые множители)
+    - SL/TP — из ATR и/или тела предыдущей свечи
     Логи только по факту: [SIGNAL] и [DECIDE] (сам запрос/ответ ЛЛМ логируются в llm.py).
     """
     def __init__(
@@ -54,6 +55,7 @@ class StrategyEngine:
         self._last_trade_time = 0.0
         self._notifier = notifier
 
+    # --- ticks helpers
     def _to_tick_down(self, price: float) -> float:
         t = self.tick_size or 0.1
         return math.floor(price / t) * t
@@ -67,53 +69,43 @@ class StrategyEngine:
 
     async def on_kline_closed(self) -> Signal:
         log.debug("[ON_CLOSE][ENTER]")
-        try:
-            _bars_dbg_len = "n/a"
-            _bars_dbg_ts = "n/a"
-            df_peek = await load_recent_1m(1, symbol=self.symbol)
-            if df_peek is not None and len(df_peek) > 0:
-                _bars_dbg_len = "≥1"
-                _bars_dbg_ts = str(int(df_peek.iloc[-1].get("ts_ms", 0)))
-            log.debug(f"[ON_CLOSE][BARS] peek ts={_bars_dbg_ts}")
-        except Exception as _e:
-            log.debug(f"[ON_CLOSE][BARS][ERR] {type(_e).__name__}: {_e}")
+        # Cooldown (если задан)
+        if self.cooldown_sec > 0:
+            left = max(0.0, self.cooldown_sec - (time.time() - self._last_trade_time))
+            if left > 0:
+                log.debug(f"[ON_CLOSE][COOLDOWN] skip {left:.1f}s remain")
+                return Signal(None, "cooldown", None, None, None, None, None, None, None, None)
 
         # 1) История только из закрытых минут
-        df = await load_recent_1m(200, symbol=self.symbol)
         try:
-            last_ts = int(df.iloc[-1]["ts_ms"]) if len(df) else -1
-            log.debug(f"[ON_CLOSE][LOADED] closed_1m_bars={len(df)} last_ts={last_ts}")
-        except Exception as _e:
-            log.debug(f"[ON_CLOSE][LOADED][ERR] {type(_e).__name__}: {_e}")
+            df = await load_recent_1m(200, symbol=self.symbol)
+        except Exception as e:
+            log.exception(f"[ON_CLOSE][LOAD_ERR] {e}")
+            return Signal(None, f"load_error:{e}", None, None, None, None)
 
-        prev_high = None
-        prev_low = None
-        prev_open = None
-        prev_close = None
-        if len(df) < 60:
-            # короткий факт-лог — без шума
+        if df is None or len(df) < 60:
             log.info("[SKIP] warmup (<60 closed 1m bars)")
-            log.debug(f"[SIGNAL][HL] prevH={prev_high} prevL={prev_low}")
-            log.debug("[ON_CLOSE][EXIT] reason=warmup")
-            return Signal(None, "warmup", None, None, None, None, prev_high, prev_low, None, None)
+            return Signal(None, "warmup", None, None, None, None)
 
         # Экстремы предыдущей ЗАКРЫТОЙ 1m свечи
-        prev_high = float(df.iloc[-1]["high"])
-        prev_low = float(df.iloc[-1]["low"])
-        prev_open = float(df.iloc[-1]["open"])
-        prev_close = float(df.iloc[-1]["close"])
+        try:
+            prev_high = float(df.iloc[-1]["high"])
+            prev_low = float(df.iloc[-1]["low"])
+            prev_open = float(df.iloc[-1]["open"])
+            prev_close = float(df.iloc[-1]["close"])
+        except Exception as e:
+            log.exception(f"[ON_CLOSE][HL_ERR] {e}")
+            return Signal(None, f"prev_hl_error:{e}", None, None, None, None)
 
         # 2) Признаки
-        dff = compute_features(df)
-        f0: Dict[str, Any] = last_feature_row(dff)
-        if f0:
-            log.debug(f"[FEAT][ROW] ts={int(f0.get('ts_ms',0))} c={float(f0.get('close',0)):.2f} emaF={float(f0.get('ema_fast',0)):.2f} emaS={float(f0.get('ema_slow',0)):.2f} atr={float(f0.get('atr14',0)):.2f}")
-        else:
-            log.debug("[FEAT][ROW] none")
+        try:
+            dff = compute_features(df)
+            f0: Dict[str, Any] = last_feature_row(dff)
+        except Exception as e:
+            log.exception(f"[FEAT][ERR] {e}")
+            return Signal(None, f"features_error:{e}", None, None, None, None, prev_high, prev_low, prev_open, prev_close)
 
         if not f0:
-            log.debug(f"[SIGNAL][HL] prevH={prev_high} prevL={prev_low}")
-            log.debug("[ON_CLOSE][EXIT] reason=no_features")
             return Signal(None, "no_features", None, None, None, None, prev_high, prev_low, prev_open, prev_close)
 
         # Ключевой лог «сигнал/срез фич» — компактно
@@ -126,13 +118,8 @@ class StrategyEngine:
             except Exception:
                 pass
 
-        # 4) Вызов LLM (добавлены подробные DEBUG-логи на каждом этапе)
-        ctx = {
-            "symbol": self.symbol,
-            "risk_pct": self.risk_pct,
-        }
-
-        # Подготовим компактные строки для логов
+        # 4) Вызов LLM (подробные DEBUG — собираем запрос, отправляем, парсим)
+        ctx = {"symbol": self.symbol, "risk_pct": self.risk_pct}
         feats_dbg = (
             f"ts={int(f0.get('ts_ms', 0))} "
             f"c={float(f0.get('close', 0)):.2f} "
@@ -144,7 +131,6 @@ class StrategyEngine:
             f"vol={float(f0.get('vol_roll', 0)):.5f}"
         )
         log.debug(f"[LLM][PREP] ctx={ctx} | feats=({feats_dbg})")
-
         log.info("[LLM][CALL] start")
         t0 = time.time()
         try:
@@ -162,24 +148,20 @@ class StrategyEngine:
                 ctx=ctx,
             )
             dt_ms = (time.time() - t0) * 1000.0
-            # компактный ответ в лог (не более ~300 символов)
             resp_str = str(decision)
             if len(resp_str) > 300:
                 resp_str = resp_str[:300] + "…"
             log.debug(f"[LLM][OK] {dt_ms:.1f} ms | resp={resp_str}")
-            log.info(f"[LLM][CALL][OK] { (time.time() - t0) * 1000.0:.1f} ms decision={str(decision.get('decision','')).strip() or 'n/a'}")
+            log.info(f"[LLM][CALL][OK] {dt_ms:.1f} ms decision={str(decision.get('decision','')).strip() or 'n/a'}")
         except Exception as e:
             dt_ms = (time.time() - t0) * 1000.0
             log.exception(f"[LLM][ERR] {dt_ms:.1f} ms | {e}")
-            log.warning(f"[LLM][CALL][FAIL] {type(e).__name__}: {e}")
-            # Фоллбек: удерживаем позицию, но сигнал формируем как hold с причиной
             if self._notifier:
                 try:
                     await self._notifier.notify(f"⚠️ ИИ ошибка: {e}")
                 except Exception:
                     pass
-            log.debug("[ON_CLOSE][EXIT] reason=llm_error")
-            return Signal(None, f"llm_error: {e}", None, None, float(f0["atr14"]), int(f0["ts_ms"]), prev_high, prev_low, prev_open, prev_close)
+            return Signal(None, f"llm_error:{e}", None, None, float(f0.get("atr14", 0.0)), int(f0.get("ts_ms", 0)), prev_high, prev_low, prev_open, prev_close)
 
         action_raw = str(decision.get("decision", "Hold"))
         reason = str(decision.get("reason", "") or "").strip()
@@ -191,8 +173,6 @@ class StrategyEngine:
                     await self._notifier.notify(f"🤖 ИИ: Hold • {reason or 'no reason'}")
                 except Exception:
                     pass
-            log.debug(f"[SIGNAL][HL] prevH={prev_high} prevL={prev_low}")
-            log.debug("[ON_CLOSE][EXIT] reason=hold")
             return Signal(None, "hold", None, None, float(f0["atr14"]), int(f0["ts_ms"]), prev_high, prev_low, prev_open, prev_close)
 
         # 5) Построение SL/TP относительно тела предыдущей свечи,
@@ -204,7 +184,7 @@ class StrategyEngine:
         body_high = max(prev_open, prev_close)
         body_low = min(prev_open, prev_close)
         tick = max(self.tick_size, 1e-9)
-        tp_nudges = 4 * tick  # смещаем TP на 4 тика внутрь тела
+        tp_nudges = 4 * tick  # смещаем TP на 4 тика внутрь тела — по просьбе
 
         if action == "Buy":
             sl = close - sl_mult * atr
@@ -232,8 +212,6 @@ class StrategyEngine:
         # фиксируем кулдаун
         self._last_trade_time = time.time()
 
-        log.debug(f"[SIGNAL][HL] prevH={prev_high} prevL={prev_low}")
-        log.debug(f"[ON_CLOSE][EXIT] action={action} sl={sl:.2f} tp={tp:.2f} ts={int(f0.get('ts_ms',0))}")
         return Signal(
             side=action,
             reason=reason or "llm",
