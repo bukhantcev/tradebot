@@ -86,6 +86,12 @@ class Trader:
     async def _watchdog_close_on_lastprice(self, side: str, sl_price: float, tp_price: float, check_interval: float = 0.3, max_wait: float = 3600.0) -> bool:
         return await ts._watchdog_close_on_lastprice(self, side, sl_price, tp_price, check_interval, max_wait)
 
+    async def _wait_position_open(self, timeout: float = 10.0, interval: float = 0.3) -> bool:
+        return await ts._wait_position_open(self, timeout, interval)
+
+    async def _wait_position_flat(self, timeout: float = 3600.0, interval: float = 0.5) -> bool:
+        return await ts._wait_position_flat(self, timeout, interval)
+
     def _order_status_brief(self, order_id: str) -> str: return ex._order_status_brief(self, order_id)
     def _place_conditional(self, side: str, trigger_price: float, qty: float, trigger_direction: int) -> Dict[str, Any]:
         return ex._place_conditional(self, side, trigger_price, qty, trigger_direction)

@@ -1,6 +1,7 @@
 # trader_mod/tpsl.py
 import asyncio
 import logging
+import time
 
 log = logging.getLogger("TRADER")
 
@@ -101,6 +102,52 @@ async def _realign_tpsl(self, side: str, desired_sl: float, desired_tp: float, t
         log.debug(f"[REALIGN][STOP] {e}")
     finally:
         self._realign_task = None
+
+
+async def _wait_position_open(self, timeout: float = 10.0, interval: float = 0.3) -> bool:
+    """
+    Короткое ожидание появления позиции (size>0), чтобы fallback trading-stop не падал rc=10001.
+    Возвращает True, если позиция открылась в течение timeout.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            pl = self.client.position_list(self.symbol)
+            lst = pl.get("result", {}).get("list", [])
+            for it in lst:
+                size_str = it.get("size") or it.get("positionValue") or ""
+                try:
+                    size = float(size_str) if size_str != "" else 0.0
+                except Exception:
+                    size = 0.0
+                if size > 0:
+                    return True
+        except Exception:
+            pass
+        await asyncio.sleep(interval)
+    return False
+
+
+async def _wait_position_flat(self, timeout: float = 3600.0, interval: float = 0.5) -> bool:
+    """
+    Ждём, пока позиция станет плоской (size == 0).
+    Возвращает True, если успели за timeout.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            pl = self.client.position_list(self.symbol)
+            lst = pl.get("result", {}).get("list", [])
+            any_size = 0.0
+            for it in lst:
+                sz = float(it.get("size") or 0.0)
+                any_size += sz
+            if any_size <= 0:
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(interval)
+    return False
 
 
 async def _await_fill_or_retry(self, order_id: str, side: str, qty: float) -> bool:
