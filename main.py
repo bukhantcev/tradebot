@@ -513,14 +513,14 @@ async def do_trend(md: MarketData, dec: AIDecision):
         # if order exists, we just wait next tick
         return
 
-    # If position exists → maintain/update SL (trailing per ticks)
+    # If position exists → maintain/update SL (от средней цены позиции, как во FLAT)
     sl_ticks = dec.sl_ticks if dec.sl_ticks is not None else SL_TICKS
     fresh = read_market(symbol, 1)
     if fresh.position.size > 0:
         if fresh.position.side == Side.BUY:
-            sl_price = normalize_price(fresh.last_price - sl_ticks * f.tick_size, f.tick_size)
+            sl_price = normalize_price(fresh.position.avg_price - sl_ticks * f.tick_size, f.tick_size)
         else:
-            sl_price = normalize_price(fresh.last_price + sl_ticks * f.tick_size, f.tick_size)
+            sl_price = normalize_price(fresh.position.avg_price + sl_ticks * f.tick_size, f.tick_size)
         await ensure_sl_tp(symbol, sl_price=sl_price, tp_price=None)
         log.info("[TREND] SL set/update at %f (ticks=%d)", sl_price, sl_ticks)
 
