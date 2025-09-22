@@ -8,7 +8,7 @@ from enum import Enum
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
 from typing import Optional, Dict, Any, Tuple, List
-
+from prompt import prompt as pr
 import pandas as pd
 import time
 import re
@@ -300,7 +300,7 @@ def read_market(symbol: str, bootstrap_hours: int) -> MarketData:
     return MarketData(last, filters, kl, pos, bal)
 
 # ------------------ AI ------------------
-def ai_prompt(symbol: str, df: pd.DataFrame, md: MarketData) -> str:
+def ai_prompt(symbol: str, df: pd.DataFrame, md: MarketData, txt: str) -> str:
     # Last rows: prev(−2) and curr(−1)
     prev = df.iloc[-2]
     curr = df.iloc[-1]
@@ -327,10 +327,8 @@ def ai_prompt(symbol: str, df: pd.DataFrame, md: MarketData) -> str:
         f"Market snapshot:\n{json.dumps(p, ensure_ascii=False)}\n\n"
         "JSON schema:\n"
         "{ \"regime\": \"trend|flat|hold\", \"side\": \"Buy|Sell|None\", \"sl_ticks\": int|null, \"comment\": string }\n"
-        "Если флэт и тело последней закрытой свечи меньше 2500 тиков - возвращай hold."
-        "Сигнал на тренд даем только если тренд подтвержден двумя последними закрытыми свечами."
-        "Если флэт и сторона buy и нижняя тень последней закрытой свечи больше 2500 тиков - возвращай hold."
-        "Если флэт и сторона sell и верхняя тень последней закрытой свечи больше 2500 тиков - возвращай hold."
+        f"{txt}"
+
     )
 
 def _extract_json_block(text: str) -> str:
@@ -370,7 +368,7 @@ def pretty_ai_decision(dec: AIDecision) -> str:
     return "🤖 Обновление от ИИ:\n" + "\n".join(parts)
 
 async def ask_ai(symbol: str, df: pd.DataFrame, md: MarketData) -> AIDecision:
-    prompt = ai_prompt(symbol, df, md)
+    prompt = ai_prompt(symbol, df, md, txt=pr)
     log.info("[AI] request: %s", prompt.replace("\n", " ")[:500])
     try:
         resp = await asyncio.to_thread(
