@@ -512,7 +512,7 @@ async def do_trend(md: MarketData, dec: AIDecision):
         return
 
     # If position exists → maintain/update SL (от средней цены позиции, как во FLAT)
-    sl_ticks = dec.sl_ticks if dec.sl_ticks is not None else SL_TICKS
+    sl_ticks = dec.sl_ticks if dec.sl_ticks is not None else SL_TICKS*2
     fresh = read_market(symbol, 1)
     if fresh.position.size > 0:
         if fresh.position.side == Side.BUY:
@@ -689,15 +689,27 @@ async def trading_loop():
                     # Done with FLAT special flow; don't run generic switch below
                 else:
                     if regime_changed or side_changed:
-                        await tg_send("🔁 Переключение режима/направления → Закрываю позиции")
-                        try:
-                            await bybit_cancel_all(symbol)
-                        except Exception:
-                            pass
-                        await market_close_all(symbol)
-                        STATE.current_regime = dec_new.regime
-                        STATE.current_side = dec_new.side
-                        await tg_send(pretty_ai_decision(dec_new))
+                        if dec_new.regime == Regime.HOLD:
+                            # ▶ Переход в HOLD: позиции НЕ закрываем
+                            await tg_send("⏸ Переход в HOLD → оставляю открытые позиции, отменяю заявки")
+                            try:
+                                await bybit_cancel_all(symbol)  # снимаем только неисполненные ордера
+                            except Exception:
+                                pass
+                            STATE.current_regime = Regime.HOLD
+                            STATE.current_side = Side.NONE
+                            await tg_send(pretty_ai_decision(dec_new))
+                        else:
+                            # Обычный свитч для TREND/FLAT
+                            await tg_send("🔁 Переключение режима/направления → Закрываю позиции")
+                            try:
+                                await bybit_cancel_all(symbol)
+                            except Exception:
+                                pass
+                            await market_close_all(symbol)
+                            STATE.current_regime = dec_new.regime
+                            STATE.current_side = dec_new.side
+                            await tg_send(pretty_ai_decision(dec_new))
                     last_ai_time = now_monotonic
 
             # Per-tick execution according to current regime
