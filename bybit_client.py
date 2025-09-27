@@ -272,38 +272,109 @@ async def market_close_all(symbol: str):
         symbol=symbol, side=side, order_type="Market", qty=qty, time_in_force="IOC", reduce_only=True
     ), descr="close_position_market")
 
-async def ensure_sl_tp(symbol: str, sl_price: Optional[float], tp_price: Optional[float]) -> None:
+# --- SL/TP advanced setter with self-healing ---
+async def ensure_sl_tp(symbol: str, sl_price: Optional[float], tp_price: Optional[float],
+                       fallback_pct: float = 2.5) -> None:
     """
-    Ставит SL/TP через /position/trading-stop в режиме Full.
-    Обязательно делает верификацию: читает позицию и сверяет, что SL/TP появились.
-    Обрабатывает 'not modified' как успех.
+    Ставит SL/TP через /position/trading-stop (Full). Встроенная самопочинка:
+    - если пришёл кривой SL (<=0 или не на своей стороне) — пересчитываем от avg/last с запасом fallback_pct.
+    - если TP на «не своей стороне» — сдвигаем минимум на 1 тик в правильную сторону.
+    - если биржа отвечает 'not modified' — считаем успехом.
+    - если позиции нет — выходим тихо.
+    После каждого успешного вызова сверяем фактические SL/TP на бирже.
     """
+
     if sl_price is None and tp_price is None:
         return
 
-    def call_once():
-        return bybit_trading_stop(symbol, take_profit=tp_price, stop_loss=sl_price)
+    def _side_ok_sl(side: Side, avg: float, last: float, px: float, tick: float) -> bool:
+        """SL на правильной стороне? BUY — строго ниже min(avg,last); SELL — строго выше max(avg,last)."""
+        if px is None or tick <= 0:
+            return False
+        if side == Side.BUY:
+            return px < min(avg, last) - tick * 0.9999
+        if side == Side.SELL:
+            return px > max(avg, last) + tick * 0.9999
+        return False
+
+    def _fix_tp(side: Side, avg: float, last: float, px: Optional[float], tick: float) -> Optional[float]:
+        """
+        Гарантирует, что TP на «своей стороне» минимум на 1 тик от базы:
+        BUY: ≥ base + 1*tick, base = max(avg,last)
+        SELL: ≤ base - 1*tick, base = min(avg,last)
+        """
+        if px is None:
+            return None
+        try:
+            p = float(px)
+        except Exception:
+            return None
+        base = max(avg, last) if side == Side.BUY else min(avg, last)
+        if side == Side.BUY:
+            p = max(p, base + tick)
+        else:
+            p = min(p, base - tick)
+        return normalize_price(p, tick)
 
     tries = 0
+    last_err: Optional[Exception] = None
+
     while tries < 3:
+        tries += 1
         try:
-            r = call_once()
+            # свежий снапшот на каждую попытку
+            md = read_market(STATE.symbol, 1)
+            f = md.filters
+            pos = md.position
+            last = md.last_price
+            tick = f.tick_size if f.tick_size > 0 else 0.1
+
+            # если позиции нет — ставить нечего
+            if pos.size <= 0:
+                log.info("[SLTP] позиция = 0 → ничего не ставлю")
+                return
+
+            # -- починка SL при необходимости --
+            sl_fix = sl_price
+            if sl_fix is not None:
+                try:
+                    sl_fix = float(sl_fix)
+                except Exception:
+                    sl_fix = None
+
+            if sl_fix is not None:
+                if sl_fix <= 0 or not _side_ok_sl(pos.side, pos.avg_price, last, sl_fix, tick):
+                    base = min(pos.avg_price, last) if pos.side == Side.BUY else max(pos.avg_price, last)
+                    # запас в процентах от базы → в тики
+                    dist_abs = max(tick, abs(base) * (fallback_pct / 100.0))
+                    dist_ticks = max(1, int(round(dist_abs / tick)))
+                    sl_fix = base - dist_ticks * tick if pos.side == Side.BUY else base + dist_ticks * tick
+                # кламп к правилам биржи + нормализация
+                sl_fix = clamp_sl_for_exchange(pos.side, pos.avg_price, last, sl_fix, tick)
+                sl_fix = normalize_price(sl_fix, tick)
+
+            # -- безопасный TP (на своей стороне, минимум 1 тик) --
+            tp_fix = _fix_tp(pos.side, pos.avg_price, last, tp_price, tick)
+
+            r = bybit_trading_stop(symbol, take_profit=tp_fix, stop_loss=sl_fix)
             log.info("[SLTP] set_trading_stop ok: %s", r.get("result", {}))
             got_sl, got_tp, got_sl_act = bybit_position_sltp(symbol)
             log.info("[SLTP] verify on exchange: SL=%s TP=%s (slActive=%s)", got_sl, got_tp, got_sl_act)
             return
         except Exception as e:
             msg = str(e)
+            # not modified / already set — трактуем как успех
             if "34040" in msg or "not modified" in msg.lower():
                 log.info("[SLTP] not modified → already set; ok")
                 got_sl, got_tp, got_sl_act = bybit_position_sltp(symbol)
                 log.info("[SLTP] verify on exchange (not modified): SL=%s TP=%s (slActive=%s)", got_sl, got_tp, got_sl_act)
                 return
-            tries += 1
+            last_err = e
             log.warning("[SLTP] set_trading_stop retry %d: %s", tries, e)
             await asyncio.sleep(0.5)
 
-    log.error("[SLTP] failed to set_trading_stop after retries; keeping position. sl=%s tp=%s", sl_price, tp_price)
+    log.error("[SLTP] failed to set_trading_stop after retries; keeping position. sl=%s tp=%s | last_err=%s",
+              sl_price, tp_price, last_err)
 # --- Жёсткий энфорсер SL: 10 секунд или закрываем позицию
 async def enforce_sl_must_have(symbol: str, side: Side, f: MdFilters, *, sl_ticks: int, timeout_sec: int = 10) -> None:
     """

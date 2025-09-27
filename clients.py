@@ -71,3 +71,6 @@ REENTER_AFTER_SL_SEC = int(os.getenv("REENTER_AFTER_SL_SEC", "10"))
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 USE_LOCAL_DECIDER = os.getenv("USE_LOCAL_DECIDER", "true").lower() == "true"  # default: local
+
+FLAT_CHANNEL_BARS = int(os.getenv("FLAT_CHANNEL_BARS", "20"))
+SL_FLAT_CHANNEL_PCT = float(os.getenv("SL_FLAT_CHANNEL_PCT", "2.5"))

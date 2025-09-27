@@ -81,6 +81,7 @@ def parse_ai(text: str) -> AIDecision:
         comment=data.get("comment", "")
     )
 
+
 def parse_local_decision(obj) -> AIDecision:
     """
     Принимает как dict, так и объект (например, dataclass Decision из local_ai).
@@ -107,6 +108,26 @@ def parse_local_decision(obj) -> AIDecision:
     comment = get_field("comment", "")
 
     return AIDecision(regime=regime, side=side, sl_ticks=sl_ticks, comment=comment)
+
+# --- Helper: ignore HOLD if in position ---
+def _ignore_hold_if_in_position(dec: AIDecision, md: MarketData) -> AIDecision:
+    """If there is an open position, ignore HOLD decisions entirely.
+    When HOLD is returned but position.size>0, we keep the current regime/side
+    so that the trading loop continues trailing etc., and we do not trigger any
+    hold-related side effects.
+    """
+    try:
+        if md.position and md.position.size > 0 and dec.regime == Regime.HOLD:
+            # preserve current regime and the actual position side
+            return AIDecision(
+                regime=STATE.current_regime,
+                side=md.position.side,
+                sl_ticks=dec.sl_ticks,
+                comment=(dec.comment + " | HOLD ignored due to open position"),
+            )
+    except Exception:
+        pass
+    return dec
 
 async def ask_ai(symbol: str, df: pd.DataFrame, md: MarketData) -> AIDecision:
     prompt = ai_prompt(symbol, df, md, txt=pr)
@@ -137,10 +158,13 @@ async def get_decision(symbol: str, df: pd.DataFrame, md: MarketData) -> AIDecis
             obj = await asyncio.to_thread(local_decide, symbol, df, md)
             dec = parse_local_decision(obj)
             log.info("[LOCAL] %s", dec)
+            dec = _ignore_hold_if_in_position(dec, md)
             return dec
         except Exception as e:
             log.error("[LOCAL] error: %s", e)
             await tg_send(f"🧠 Локальная решалка дала ошибку, переключаюсь в HOLD. {e}")
             return AIDecision(regime=Regime.HOLD, side=Side.NONE, comment="local error")
     else:
-        return await ask_ai(symbol, df, md)
+        dec = await ask_ai(symbol, df, md)
+        dec = _ignore_hold_if_in_position(dec, md)
+        return dec

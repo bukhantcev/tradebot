@@ -6,7 +6,7 @@ from bybit_client import market_close_all, bybit_open_orders, read_market, retry
     clamp_sl_for_exchange, clamp_tp_min_distance
 from clients import \
     SL_TICKS, TREND_SL_MULT, LOT_SIZE_USDT, MARKET_BAND_EXTRA_TICKS, FLAT_ENTRY_TICKS, TP_BODY_OFFSET_TICKS, \
-    MIN_TP_TICKS, TREND_CONFIRM_BARS, REVERSE_HYSTERESIS_SEC
+    MIN_TP_TICKS, TREND_CONFIRM_BARS, REVERSE_HYSTERESIS_SEC, FLAT_CHANNEL_BARS, SL_FLAT_CHANNEL_PCT
 from helpers import normalize_qty, tg_send, normalize_price
 from models import MarketData, AIDecision, STATE, Side, Regime
 from logger import log
@@ -17,8 +17,6 @@ if os.getenv("BYBIT_VERIFY_SSL", "true").lower() == "false":
 from dotenv import load_dotenv
 
 load_dotenv()
-
-
 
 
 # ------------------ Regime executors ------------------
@@ -170,18 +168,15 @@ async def do_trend(md: MarketData, dec: AIDecision):
             STATE.last_sl_price = desired_sl
             log.info("[TREND] TRAIL SELL sl→ %.6f (anchor=%.6f, ticks=%d)", desired_sl, STATE.trail_anchor, sl_ticks)
 
+
 async def do_flat(md: MarketData, dec: AIDecision):
     """
     FLAT:
-    - Если позиции нет: на каждой новой закрытой минуте отменяем старую лимитку и ставим новую:
-      BUY  → entry = prev_low  + 6*tick (внутрь диапазона)
-      SELL → entry = prev_high - 6*tick (внутрь диапазона)
-    - Если позиция есть: ставим SL от avg_price, TP от «края тела» предыдущей свечи
-      (плюс клампы: TP минимум 2500 тиков от базы).
-    - Если пришёл новый сигнал:
-       * FLAT остаётся и направление совпадает с позицией → ничего не делаем.
-       * Направление не совпадает → отменяем ордера, закрываем позицию и продолжаем.
-      (Логика переключения — в основном цикле; тут только постановка заявок/SLTP.)
+    - Если позиции нет: на каждой новой закрытой минуте отменяем старую лимитку и ставим новую
+      на границу канала, но чуть внутри (± FLAT_ENTRY_TICKS * tick от границы).
+    - Если позиция есть: TP — ровно на противоположной границе канала, SL — на X% (SL_FLAT_CHANNEL_PCT)
+      за внешней границей канала, плюс биржевые клампы/нормализация.
+    - Смена стороны при открытой позиции → закрытие и короткий кулдаун.
     """
     symbol = STATE.symbol
     f = md.filters
@@ -199,6 +194,13 @@ async def do_flat(md: MarketData, dec: AIDecision):
     prev_low = float(prev["low"])
     body_low, body_high = _body_edges(prev)
 
+    # === Канал флэта по последним закрытым барам ===
+    win = max(2, int(FLAT_CHANNEL_BARS))
+    # Берём только ЗАКРЫТЫЕ бары: [-win-1 : -1] (исключая текущий формирующийся)
+    window_df = df.iloc[-(win + 1):-1] if len(df) >= win + 1 else df.iloc[:-1]
+    chan_high = float(window_df["high"].max()) if not window_df.empty else prev_high
+    chan_low = float(window_df["low"].min()) if not window_df.empty else prev_low
+
     # Противоположная позиция → закрыть
     if md.position.size > 0 and md.position.side != desired:
         await market_close_all(symbol)
@@ -214,7 +216,7 @@ async def do_flat(md: MarketData, dec: AIDecision):
     open_orders = bybit_open_orders(symbol)
     need_requote = (STATE.last_flat_prev_ts is None) or (prev_ts != STATE.last_flat_prev_ts)
 
-    # Позиции нет → лимитки
+    # Позиции нет → лимитки на границу канала, но немного внутри
     if md.position.size == 0:
         if need_requote and open_orders:
             try:
@@ -225,10 +227,13 @@ async def do_flat(md: MarketData, dec: AIDecision):
             open_orders = []
 
         if not open_orders:
+            ts = f.tick_size if f.tick_size > 0 else 0.1
             if desired == Side.BUY:
-                entry_price = normalize_price(prev_low + FLAT_ENTRY_TICKS * f.tick_size, f.tick_size)
+                # вход от нижней границы внутрь канала
+                entry_price = normalize_price(chan_low + FLAT_ENTRY_TICKS * ts, ts)
             else:
-                entry_price = normalize_price(prev_high - FLAT_ENTRY_TICKS * f.tick_size, f.tick_size)
+                # вход от верхней границы внутрь канала
+                entry_price = normalize_price(chan_high - FLAT_ENTRY_TICKS * ts, ts)
             qty = normalize_qty(LOT_SIZE_USDT / max(entry_price, 1e-8), f.qty_step, f.min_qty)
             await retry_place(lambda: bybit_place_order(
                 symbol=symbol, side=desired, order_type="Limit", qty=qty,
@@ -238,28 +243,35 @@ async def do_flat(md: MarketData, dec: AIDecision):
         STATE.last_flat_prev_ts = prev_ts
         return
 
-    # Позиция есть → SL/TP
+    # Позиция есть → SL/TP (TP на противоположной границе канала, SL за каналом на %)
     fresh = read_market(symbol, 1)
-    base_ticks = dec.sl_ticks if dec.sl_ticks is not None else SL_TICKS
+    ts = f.tick_size if f.tick_size > 0 else 0.1
+    pct = max(0.0, float(SL_FLAT_CHANNEL_PCT)) / 100.0
 
-    if desired == Side.BUY:
-        sl_price_raw = fresh.position.avg_price - base_ticks * f.tick_size
-        tp_edge = body_high
-        tp_price_raw = tp_edge - TP_BODY_OFFSET_TICKS * f.tick_size
-    else:
-        sl_price_raw = fresh.position.avg_price + base_ticks * f.tick_size
-        tp_edge = body_low
-        tp_price_raw = tp_edge + TP_BODY_OFFSET_TICKS * f.tick_size
-
-    # нормализация
-    sl_price = normalize_price(sl_price_raw, f.tick_size)
-    tp_price = normalize_price(tp_price_raw, f.tick_size)
-
-    # клампы
     avg = fresh.position.avg_price
     last = fresh.last_price
-    sl_price = clamp_sl_for_exchange(desired, avg, last, sl_price, f.tick_size)
-    tp_price = clamp_tp_min_distance(desired, avg, last, tp_price, f.tick_size, MIN_TP_TICKS)
+
+    if desired == Side.BUY:
+        # TP — ровно на верхней границе канала, SL — на % ниже нижней границы (вне канала)
+        tp_raw = chan_high
+        sl_raw = chan_low * (1.0 - pct)
+        # Биржевое правило: SL для BUY ниже базы минимум на 1 тик
+        sl_raw = min(sl_raw, min(avg, last) - ts)
+    else:  # SELL
+        # TP — ровно на нижней границе канала, SL — на % выше верхней границы (вне канала)
+        tp_raw = chan_low
+        sl_raw = chan_high * (1.0 + pct)
+        # Биржевое правило: SL для SELL выше базы минимум на 1 тик
+        sl_raw = max(sl_raw, max(avg, last) + ts)
+
+    # Нормализация/клампы
+    sl_price = normalize_price(sl_raw, ts)
+    tp_price = normalize_price(tp_raw, ts)
+
+    sl_price = clamp_sl_for_exchange(desired, avg, last, sl_price, ts)
+
+    # Страховка: TP должен остаться внутри канала
+    tp_price = max(min(tp_price, chan_high), chan_low)
 
     await ensure_sl_tp(symbol, sl_price=sl_price, tp_price=tp_price)
     STATE.last_sl_price = sl_price
@@ -274,7 +286,6 @@ async def do_hold(md: MarketData, dec: AIDecision):
 
 # ======== Тонкая настройка распознавания разворота тренда ========
 
-
 def _ensure_trend_state_fields():
     # Ленивая инициализация полей состояния
     if not hasattr(STATE, "_trend_queue"):
@@ -282,6 +293,7 @@ def _ensure_trend_state_fields():
         STATE._trend_queue = deque(maxlen=TREND_CONFIRM_BARS)
     if not hasattr(STATE, "last_flip_at"):
         STATE.last_flip_at = 0.0
+
 
 async def _flip_to_trend(symbol: str, side: Side, now_mono: float):
     """Жёсткое переключение на тренд side с закрытием встречной позиции и гистерезисом."""
@@ -299,6 +311,7 @@ async def _flip_to_trend(symbol: str, side: Side, now_mono: float):
         "🤖 Обновление:\n"
         f"Режим: <b>{STATE.current_regime.value}</b>\nНаправление: <b>{STATE.current_side.value}</b>"
     )
+
 
 async def apply_trend_confirmation(dec_new: AIDecision, md: MarketData, now_mono: float) -> bool:
     """
@@ -344,4 +357,3 @@ async def apply_trend_confirmation(dec_new: AIDecision, md: MarketData, now_mono
     # Позиции нет или она совпадает по стороне, но режим другой → просто переключаем режим/сторону
     await _flip_to_trend(STATE.symbol, confirmed_side, now_mono)
     return True
-
